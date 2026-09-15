@@ -141,6 +141,7 @@ def status_cmd(
         ("migrations_received", str(data.get("migrations_received"))),
         ("migrations_passed", str(data.get("migrations_passed"))),
         ("migrations_rejected", str(data.get("migrations_rejected"))),
+        ("backlog_pending", str(data.get("backlog_pending"))),
         ("migrations_buffered", str(data.get("migrations_buffered"))),
         ("pumpportal_last_error", str(data.get("pumpportal_last_error"))),
         ("active_context_db", data.get("active_context_db")),
@@ -251,6 +252,51 @@ def migrations_cmd(
             time.sleep(1.0)
     except KeyboardInterrupt:
         console.print("\n[dim]stopped following[/dim]")
+
+
+@app.command("backlog")
+def backlog_cmd(
+    limit: int = typer.Option(50, "--limit", "-n", help="max pending items to show"),
+    json_out: bool = typer.Option(False, "--json", help="raw json"),
+) -> None:
+    """list pending migration backlog (FIFO, oldest first)."""
+    resp = _get(f"/backlog?limit={limit}")
+    if resp.status_code != 200:
+        console.print(f"[red]failed:[/red] HTTP {resp.status_code}")
+        raise typer.Exit(code=1)
+    data = resp.json()
+    if json_out:
+        console.print_json(data=data)
+        return
+    items = data.get("items") or []
+    console.print(f"[bold]BACKLOG[/bold]  pending={data.get('count', 0)}")
+    if not items:
+        console.print("[dim]empty — waiting for filter PASSes[/dim]")
+        return
+    table = Table(title="Migration backlog (oldest → newest)")
+    table.add_column("#", style="cyan")
+    table.add_column("queued")
+    table.add_column("name")
+    table.add_column("mcap$")
+    table.add_column("feesSOL")
+    table.add_column("socials")
+    table.add_column("mint")
+    for it in items:
+        info = it.get("coin_info") or {}
+        ts = str(it.get("timestamp") or "")[:19]
+        mcap = info.get("market_cap_usd")
+        fees = info.get("estimated_global_fees_sol")
+        socials = ",".join(info.get("socials_present") or [])
+        table.add_row(
+            str(it.get("id", "")),
+            ts,
+            str(info.get("name") or "")[:20],
+            f"{mcap:,.0f}" if isinstance(mcap, (int, float)) else "",
+            f"{fees:.2f}" if isinstance(fees, (int, float)) else "",
+            socials,
+            str(it.get("mint") or ""),
+        )
+    console.print(table)
 
 
 @app.command("stop")

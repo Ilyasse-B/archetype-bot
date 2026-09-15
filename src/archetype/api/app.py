@@ -9,12 +9,14 @@ import os
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
 from archetype import __version__
+from archetype.backlog import dequeue_fifo, enqueue_passed, list_pending, pending_count
 from archetype.config import Settings, get_settings
 from archetype.db import db_exists_and_ok
 from archetype.filters import run_full_filters
@@ -42,6 +44,7 @@ class StatusResponse(BaseModel):
     migrations_buffered: int
     migrations_passed: int
     migrations_rejected: int
+    backlog_pending: int = 0
     pumpportal_last_error: str | None = None
 
 
@@ -52,6 +55,19 @@ class MigrationsResponse(BaseModel):
     migrations: list[MigrationEvent] = Field(default_factory=list)
 
 
+class BacklogItemResponse(BaseModel):
+    id: int
+    mint: str
+    coin_info: dict[str, Any] = Field(default_factory=dict)
+    timestamp: str
+    consumed: bool = False
+
+
+class BacklogResponse(BaseModel):
+    count: int
+    items: list[BacklogItemResponse] = Field(default_factory=list)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     buffer = MigrationBuffer(maxlen=200)
@@ -59,7 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ledger = settings.resolved_trading_ledger_db()
 
     async def _filter_hook(event: MigrationEvent) -> MigrationEvent:
-        """run deterministic filters off the event loop."""
+        """run deterministic filters off the event loop; enqueue PASS."""
         if not rpc.enabled:
             event.filter_passed = False
             event.filter_reasons = ["helius api key missing — cannot filter"]
@@ -70,6 +86,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             event.filter_passed = result.passed
             event.filter_reasons = list(result.reasons)
             event.filter_metrics = dict(result.metrics)
+            if result.passed:
+                enqueue_passed(ledger, event)
             return event
 
         return await asyncio.to_thread(_run)
@@ -109,7 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         pp_ok = bool(s.pumpportal_api_key.strip())
         helius_ok = bool(s.helius_api_key.strip())
         ok = active_ok and ledger_ok
-        msg = "daemon up; migrations + on-chain/socials filters active"
+        msg = "daemon up; migrations + filters + backlog active"
         if not pp_ok:
             msg = "daemon up; pumpportal key missing"
         elif not helius_ok:
@@ -126,7 +144,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             trading_ledger_db=str(ledger_p),
             active_context_ok=active_ok,
             trading_ledger_ok=ledger_ok,
-            phase="2-metadata",
+            phase="2-backlog",
             message=msg,
             server_time=datetime.now(timezone.utc).isoformat(),
             pumpportal_configured=pp_ok,
@@ -136,6 +154,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             migrations_buffered=int(feed_status.get("buffered") or 0),
             migrations_passed=int(feed_status.get("filtered_pass_count") or 0),
             migrations_rejected=int(feed_status.get("filtered_reject_count") or 0),
+            backlog_pending=pending_count(ledger_p),
             pumpportal_last_error=(
                 str(feed_status["last_error"]) if feed_status.get("last_error") else None
             ),
@@ -161,6 +180,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             filtered=filtered,
             migrations=items,
         )
+
+    @app.get("/backlog", response_model=BacklogResponse)
+    def backlog(
+        limit: int = Query(50, ge=1, le=200),
+    ) -> BacklogResponse:
+        """list pending (unconsumed) backlog items, oldest first."""
+        ledger_p: Path = app.state.settings.resolved_trading_ledger_db()
+        items = list_pending(ledger_p, limit=limit)
+        return BacklogResponse(
+            count=len(items),
+            items=[
+                BacklogItemResponse(
+                    id=i.id,
+                    mint=i.mint,
+                    coin_info=i.coin_info,
+                    timestamp=i.timestamp,
+                    consumed=i.consumed,
+                )
+                for i in items
+            ],
+        )
+
+    @app.post("/backlog/pop")
+    def backlog_pop() -> dict[str, Any]:
+        """manual FIFO pop (for testing / later agent). marks consumed."""
+        ledger_p: Path = app.state.settings.resolved_trading_ledger_db()
+        item = dequeue_fifo(ledger_p)
+        if item is None:
+            return {"ok": True, "item": None, "message": "backlog empty"}
+        return {"ok": True, "item": item.to_dict()}
 
     @app.post("/shutdown")
     async def shutdown() -> dict[str, Any]:

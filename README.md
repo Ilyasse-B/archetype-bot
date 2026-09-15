@@ -4,7 +4,7 @@ Local Solana memecoin trading agent (paper-first). Design docs live in `docs/`.
 
 ## Phase 2 (current)
 
-PumpPortal migrations + on-chain filters + metadata/socials gate.
+PumpPortal migrations → on-chain filters → metadata/socials gate → **persisted FIFO backlog**.
 
 ### Setup
 
@@ -26,7 +26,7 @@ uv run archetype status
 uv run archetype migrations              # RAW unfiltered
 uv run archetype migrations --filtered   # PASS only (on-chain + socials)
 uv run archetype migrations --follow
-uv run archetype migrations --follow --filtered
+uv run archetype backlog                 # pending agent queue (FIFO)
 uv run archetype stop
 ```
 
