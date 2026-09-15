@@ -76,6 +76,10 @@ def main() -> None:
     write_pidfile(pid_path)
     log.info("pidfile -> %s (pid %s)", pid_path, pid_path.read_text().strip())
     log.info("starting fastapi on %s:%s", settings.host, settings.port)
+    if settings.pumpportal_api_key.strip():
+        log.info("pumpportal migration feed: enabled")
+    else:
+        log.warning("pumpportal migration feed: DISABLED (set ARCHETYPE_PUMPPORTAL_API_KEY)")
 
     try:
         server.run()
