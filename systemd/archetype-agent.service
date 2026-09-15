@@ -1,0 +1,16 @@
+[Unit]
+Description=Archetype memecoin agent daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ilyasse/Archetype/archetype-bot
+# adjust User= if you install system-wide
+ExecStart=/home/ilyasse/Archetype/archetype-bot/.venv/bin/python -m archetype.daemon
+Restart=on-failure
+RestartSec=5
+Environment=ARCHETYPE_HOST=127.0.0.1
+Environment=ARCHETYPE_PORT=8765
+
+[Install]
+WantedBy=multi-user.target

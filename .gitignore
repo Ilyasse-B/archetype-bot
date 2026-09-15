@@ -157,6 +157,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# Archetype local data / sqlite
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Spyder project settings
 .spyderproject
 .spyproject

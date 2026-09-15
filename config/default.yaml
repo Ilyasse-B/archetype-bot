@@ -1,0 +1,11 @@
+# default local config — env vars (ARCHETYPE_*) override these
+
+api:
+  host: "127.0.0.1"
+  port: 8765
+
+# idle | searching | locked  (phase 1 stub)
+agent_state: idle
+
+# sqlite files land under data/ by default
+# data_dir: ./data
