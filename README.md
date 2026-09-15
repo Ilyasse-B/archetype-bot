@@ -23,11 +23,11 @@ uv run python -m archetype.daemon
 
 ```bash
 uv run archetype status
-uv run archetype health
-uv run archetype version
-uv run archetype migrations          # recent buffer
-uv run archetype migrations --follow # live tail
-uv run archetype stop                # clean shutdown — frees the port
+uv run archetype migrations              # RAW unfiltered
+uv run archetype migrations --filtered   # PASS only
+uv run archetype migrations --follow
+uv run archetype migrations --follow --filtered
+uv run archetype stop
 ```
 
 If you see `address already in use`, an old daemon is still running:

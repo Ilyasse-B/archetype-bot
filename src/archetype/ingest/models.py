@@ -21,6 +21,10 @@ class MigrationEvent(BaseModel):
     name: str | None = None
     received_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     raw: dict[str, Any] = Field(default_factory=dict)
+    # filled after deterministic filters (None = not filtered yet)
+    filter_passed: bool | None = None
+    filter_reasons: list[str] = Field(default_factory=list)
+    filter_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 def parse_pumpportal_message(payload: Any) -> list[MigrationEvent]:

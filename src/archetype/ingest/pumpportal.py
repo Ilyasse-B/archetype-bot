@@ -1,7 +1,5 @@
 """
-pumpportal websocket — subscribeMigration only (phase 2 step 1).
-
-reconnects forever until cancelled; never logs the api key.
+pumpportal websocket — subscribeMigration + optional on-chain filter hook.
 """
 
 from __future__ import annotations
@@ -9,21 +7,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode
 
 import websockets
 
 from archetype.ingest.buffer import MigrationBuffer
-from archetype.ingest.models import parse_pumpportal_message
+from archetype.ingest.models import MigrationEvent, parse_pumpportal_message
 
 log = logging.getLogger("archetype.pumpportal")
 
 DEFAULT_WS_BASE = "wss://pumpportal.fun/api/data"
 
+FilterHook = Callable[[MigrationEvent], Awaitable[MigrationEvent]]
+
 
 class PumpPortalMigrationFeed:
-    """background feed: migrations → buffer + daemon logs."""
+    """background feed: migrations → buffer → optional filter → logs."""
 
     def __init__(
         self,
@@ -31,24 +32,23 @@ class PumpPortalMigrationFeed:
         buffer: MigrationBuffer,
         ws_base: str = DEFAULT_WS_BASE,
         reconnect_sec: float = 3.0,
+        on_migration: FilterHook | None = None,
     ) -> None:
         self._api_key = api_key.strip()
         self._buffer = buffer
         self._ws_base = ws_base.rstrip("?")
         self._reconnect_sec = reconnect_sec
+        self._on_migration = on_migration
         self._task: asyncio.Task[None] | None = None
 
     @property
     def enabled(self) -> bool:
-        """false if no key configured."""
         return bool(self._api_key)
 
     def _uri(self) -> str:
-        """ws url with api key query param (not logged)."""
         return f"{self._ws_base}?{urlencode({'api-key': self._api_key})}"
 
     async def start(self) -> None:
-        """spawn the listen loop as a task."""
         if not self.enabled:
             self._buffer.connected = False
             self._buffer.last_error = "ARCHETYPE_PUMPPORTAL_API_KEY not set"
@@ -59,7 +59,6 @@ class PumpPortalMigrationFeed:
         self._task = asyncio.create_task(self._run_forever(), name="pumpportal-migrations")
 
     async def stop(self) -> None:
-        """cancel the listen loop."""
         if self._task is None:
             return
         self._task.cancel()
@@ -72,20 +71,18 @@ class PumpPortalMigrationFeed:
         log.info("pumpportal feed stopped")
 
     async def _run_forever(self) -> None:
-        """reconnect loop."""
         while True:
             try:
                 await self._connect_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 — keep feed alive
+            except Exception as exc:  # noqa: BLE001
                 self._buffer.connected = False
                 self._buffer.last_error = str(exc)
                 log.warning("pumpportal disconnected: %s — retry in %.1fs", exc, self._reconnect_sec)
                 await asyncio.sleep(self._reconnect_sec)
 
     async def _connect_once(self) -> None:
-        """one ws session until it drops."""
         log.info("connecting to pumpportal (subscribeMigration)…")
         async with websockets.connect(
             self._uri(),
@@ -102,7 +99,6 @@ class PumpPortalMigrationFeed:
                 await self._handle_message(raw)
 
     async def _handle_message(self, raw: str | bytes) -> None:
-        """parse one ws frame."""
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         try:
@@ -111,12 +107,9 @@ class PumpPortalMigrationFeed:
             log.debug("non-json pumpportal frame: %s", raw[:200])
             return
 
-        # surface server errors / acks instead of silently dropping
         if isinstance(payload, dict) and "mint" not in payload and "token" not in payload:
             if "errors" in payload:
                 err = str(payload.get("errors"))
-                # pumpportal often nags about wallet balance even for free
-                # migration streams — warn but dont treat as fatal disconnect
                 if "balance" in err.lower() or "minimum" in err.lower():
                     log.warning("pumpportal notice: %s", err)
                 else:
@@ -138,15 +131,19 @@ class PumpPortalMigrationFeed:
         for event in events:
             stored = await self._buffer.add(event)
             bits = [f"MIGRATION #{stored.id} mint={stored.mint}"]
-            if stored.symbol:
-                bits.append(f"symbol={stored.symbol}")
-            if stored.name:
-                bits.append(f"name={stored.name!r}")
-            if stored.pool:
-                bits.append(f"pool={stored.pool}")
             if stored.signature:
                 bits.append(f"sig={stored.signature[:16]}…")
-            tx_type = stored.raw.get("txType")
-            if tx_type:
-                bits.append(f"txType={tx_type}")
             log.info(" | ".join(bits))
+
+            if self._on_migration is not None:
+                try:
+                    # copy so buffer still has filter_passed=None until update
+                    # (in-place mutate would break pass/reject counters)
+                    updated = await self._on_migration(stored.model_copy(deep=True))
+                    await self._buffer.update(updated)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("filter hook failed for %s: %s", stored.mint, exc)
+                    failed = stored.model_copy(deep=True)
+                    failed.filter_passed = False
+                    failed.filter_reasons = [f"filter error: {exc}"]
+                    await self._buffer.update(failed)

@@ -50,7 +50,7 @@ def _get(path: str, timeout: float = 5.0) -> httpx.Response:
         raise typer.Exit(code=1) from None
 
 
-def _print_migration_rows(migrations: list[dict]) -> None:
+def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> None:
     """pretty table for migration events."""
     if not migrations:
         console.print("[dim]no migrations in buffer yet[/dim]")
@@ -58,22 +58,31 @@ def _print_migration_rows(migrations: list[dict]) -> None:
     table = Table(title="Recent migrations")
     table.add_column("#", style="cyan")
     table.add_column("received")
-    table.add_column("symbol")
-    table.add_column("name")
+    table.add_column("filter")
+    table.add_column("mcap$")
+    table.add_column("feesSOL")
     table.add_column("mint")
-    table.add_column("pool")
+    table.add_column("reasons")
     for m in migrations:
         received = m.get("received_at") or ""
         if isinstance(received, str) and "T" in received:
-            # trim to local-ish short form
             received = received.replace("T", " ")[:19]
+        passed = m.get("filter_passed")
+        filt = "PASS" if passed is True else ("FAIL" if passed is False else "…")
+        metrics = m.get("filter_metrics") or {}
+        mcap = metrics.get("market_cap_usd")
+        fees = metrics.get("estimated_global_fees_sol")
+        mcap_s = f"{mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
+        fees_s = f"{fees:.2f}" if isinstance(fees, (int, float)) else ""
+        reasons = "; ".join(m.get("filter_reasons") or [])[:60]
         table.add_row(
             str(m.get("id", "")),
             str(received),
-            str(m.get("symbol") or ""),
-            str(m.get("name") or "")[:24],
+            filt,
+            mcap_s,
+            fees_s,
             str(m.get("mint") or ""),
-            str(m.get("pool") or "")[:20],
+            reasons,
         )
     console.print(table)
 
@@ -121,7 +130,10 @@ def status_cmd(
         ("listen", f"{data.get('host')}:{data.get('port')}"),
         ("pumpportal_configured", str(data.get("pumpportal_configured"))),
         ("pumpportal_connected", str(data.get("pumpportal_connected"))),
+        ("helius_configured", str(data.get("helius_configured"))),
         ("migrations_received", str(data.get("migrations_received"))),
+        ("migrations_passed", str(data.get("migrations_passed"))),
+        ("migrations_rejected", str(data.get("migrations_rejected"))),
         ("migrations_buffered", str(data.get("migrations_buffered"))),
         ("pumpportal_last_error", str(data.get("pumpportal_last_error"))),
         ("active_context_db", data.get("active_context_db")),
@@ -158,11 +170,17 @@ def migrations_cmd(
         "-f",
         help="keep polling and print new migrations as they arrive",
     ),
+    filtered: bool = typer.Option(
+        False,
+        "--filtered",
+        help="only show migrations that passed on-chain filters",
+    ),
     json_out: bool = typer.Option(False, "--json", help="raw json"),
 ) -> None:
-    """show recent PumpPortal migrations (from daemon buffer)."""
+    """show recent PumpPortal migrations (raw or filtered)."""
+    q = f"limit={limit}&filtered={'true' if filtered else 'false'}"
     if not follow:
-        resp = _get(f"/migrations?limit={limit}")
+        resp = _get(f"/migrations?{q}")
         if resp.status_code != 200:
             console.print(f"[red]failed:[/red] HTTP {resp.status_code}")
             raise typer.Exit(code=1)
@@ -170,19 +188,22 @@ def migrations_cmd(
         if json_out:
             console.print_json(data=data)
             return
-        connected = data.get("connected")
+        mode = "FILTERED" if filtered else "RAW (unfiltered)"
         console.print(
-            f"pumpportal connected={connected}  showing {data.get('count', 0)} event(s)"
+            f"[bold]{mode}[/bold]  connected={data.get('connected')}  "
+            f"showing {data.get('count', 0)} event(s)"
         )
-        _print_migration_rows(data.get("migrations") or [])
+        _print_migration_rows(data.get("migrations") or [], show_filter=True)
         return
 
-    # follow mode — poll every second for id > last
-    console.print("[dim]following migrations (ctrl+c to stop)…[/dim]")
+    console.print(
+        f"[dim]following {'filtered' if filtered else 'raw'} migrations "
+        f"(ctrl+c to stop)…[/dim]"
+    )
     last_id = 0
     try:
         while True:
-            resp = _get(f"/migrations?after_id={last_id}&limit={limit}")
+            resp = _get(f"/migrations?after_id={last_id}&{q}")
             if resp.status_code != 200:
                 console.print(f"[red]poll failed[/red] HTTP {resp.status_code}")
                 time.sleep(2)
@@ -192,14 +213,26 @@ def migrations_cmd(
             for m in events:
                 last_id = max(last_id, int(m.get("id") or 0))
                 ts = datetime.now().strftime("%H:%M:%S")
-                symbol = m.get("symbol") or "?"
-                name = m.get("name") or ""
                 mint = m.get("mint")
-                pool = m.get("pool") or ""
+                passed = m.get("filter_passed")
+                tag = (
+                    "[green]PASS[/green]"
+                    if passed is True
+                    else ("[red]FAIL[/red]" if passed is False else "[dim]…[/dim]")
+                )
+                reasons = m.get("filter_reasons") or []
+                reason_s = ("; ".join(reasons))[:80] if reasons else ""
+                metrics = m.get("filter_metrics") or {}
+                mcap = metrics.get("market_cap_usd")
+                fees = metrics.get("estimated_global_fees_sol")
+                extra = ""
+                if mcap is not None:
+                    extra += f" mcap=${mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
+                if fees is not None:
+                    extra += f" fees~{fees:.2f}SOL" if isinstance(fees, (int, float)) else ""
                 console.print(
-                    f"[green]{ts}[/green] #{m.get('id')} "
-                    f"[bold]{symbol}[/bold] {name} "
-                    f"mint={mint} pool={pool}"
+                    f"[green]{ts}[/green] #{m.get('id')} {tag} mint={mint}{extra}"
+                    + (f" — {reason_s}" if reason_s and passed is False else "")
                 )
             time.sleep(1.0)
     except KeyboardInterrupt:

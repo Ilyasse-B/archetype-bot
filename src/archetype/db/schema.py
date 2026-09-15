@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS blacklist (
     reason TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS blacklist_deployers (
+    deployer TEXT PRIMARY KEY,
+    reason TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
