@@ -59,6 +59,8 @@ def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> 
     table.add_column("#", style="cyan")
     table.add_column("received")
     table.add_column("filter")
+    table.add_column("name")
+    table.add_column("socials")
     table.add_column("mcap$")
     table.add_column("feesSOL")
     table.add_column("mint")
@@ -70,6 +72,9 @@ def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> 
         passed = m.get("filter_passed")
         filt = "PASS" if passed is True else ("FAIL" if passed is False else "…")
         metrics = m.get("filter_metrics") or {}
+        meta = m.get("metadata") or metrics.get("metadata") or {}
+        name = (m.get("name") or meta.get("name") or "")[:20]
+        socials = ",".join(meta.get("socials_present") or metrics.get("socials_present") or [])
         mcap = metrics.get("market_cap_usd")
         fees = metrics.get("estimated_global_fees_sol")
         mcap_s = f"{mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
@@ -79,6 +84,8 @@ def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> 
             str(m.get("id", "")),
             str(received),
             filt,
+            name,
+            socials,
             mcap_s,
             fees_s,
             str(m.get("mint") or ""),
@@ -223,9 +230,16 @@ def migrations_cmd(
                 reasons = m.get("filter_reasons") or []
                 reason_s = ("; ".join(reasons))[:80] if reasons else ""
                 metrics = m.get("filter_metrics") or {}
+                meta = m.get("metadata") or metrics.get("metadata") or {}
                 mcap = metrics.get("market_cap_usd")
                 fees = metrics.get("estimated_global_fees_sol")
+                name = m.get("name") or meta.get("name")
+                socials = ",".join(meta.get("socials_present") or metrics.get("socials_present") or [])
                 extra = ""
+                if name:
+                    extra += f" name={name[:24]}"
+                if socials:
+                    extra += f" socials={socials}"
                 if mcap is not None:
                     extra += f" mcap=${mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
                 if fees is not None:

@@ -73,13 +73,30 @@ class HeliusRpc:
         return last
 
     def get_token_account_balance(self, pubkey: str) -> dict[str, Any] | None:
-        """token balance value dict."""
-        result = self.call("getTokenAccountBalance", [pubkey])
+        """
+        token balance value dict, or None if account isn't visible yet.
+
+        helius throws -32602 "could not find account" during migrate races —
+        treat that as missing, not a hard crash.
+        """
+        try:
+            result = self.call("getTokenAccountBalance", [pubkey])
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "could not find account" in msg or "-32602" in msg:
+                return None
+            raise
         return (result or {}).get("value")
 
     def get_token_largest_accounts(self, mint: str) -> list[dict[str, Any]]:
-        """largest holders of a mint."""
-        result = self.call("getTokenLargestAccounts", [mint])
+        """largest holders of a mint (empty list if not ready yet)."""
+        try:
+            result = self.call("getTokenLargestAccounts", [mint])
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "could not find account" in msg or "-32602" in msg:
+                return []
+            raise
         return (result or {}).get("value") or []
 
     def get_asset(self, asset_id: str) -> dict[str, Any] | None:

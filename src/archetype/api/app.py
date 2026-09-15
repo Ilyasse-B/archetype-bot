@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from archetype import __version__
 from archetype.config import Settings, get_settings
 from archetype.db import db_exists_and_ok
-from archetype.filters import run_onchain_filters
+from archetype.filters import run_full_filters
 from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
 
@@ -66,7 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return event
 
         def _run() -> MigrationEvent:
-            result = run_onchain_filters(event, rpc, ledger)
+            result = run_full_filters(event, rpc, ledger)
             event.filter_passed = result.passed
             event.filter_reasons = list(result.reasons)
             event.filter_metrics = dict(result.metrics)
@@ -109,7 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         pp_ok = bool(s.pumpportal_api_key.strip())
         helius_ok = bool(s.helius_api_key.strip())
         ok = active_ok and ledger_ok
-        msg = "daemon up; migrations + on-chain filters active"
+        msg = "daemon up; migrations + on-chain/socials filters active"
         if not pp_ok:
             msg = "daemon up; pumpportal key missing"
         elif not helius_ok:
@@ -126,7 +126,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             trading_ledger_db=str(ledger_p),
             active_context_ok=active_ok,
             trading_ledger_ok=ledger_ok,
-            phase="2-filters",
+            phase="2-metadata",
             message=msg,
             server_time=datetime.now(timezone.utc).isoformat(),
             pumpportal_configured=pp_ok,

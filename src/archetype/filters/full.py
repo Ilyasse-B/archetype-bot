@@ -1,0 +1,73 @@
+"""
+run on-chain filters then (if pass) metadata + socials gate.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from archetype.filters.blacklist import log_filter_reject
+from archetype.filters.helius import HeliusRpc
+from archetype.filters.pipeline import FilterResult, run_onchain_filters
+from archetype.filters.thresholds import DEFAULT_THRESHOLDS, FilterThresholds
+from archetype.ingest.models import MigrationEvent
+from archetype.metadata.fetch import fetch_token_metadata
+from archetype.metadata.socials import apply_socials_gate
+
+log = logging.getLogger("archetype.filters")
+
+
+def run_full_filters(
+    event: MigrationEvent,
+    rpc: HeliusRpc,
+    ledger_path: Path,
+    thresholds: FilterThresholds = DEFAULT_THRESHOLDS,
+) -> FilterResult:
+    """
+    phase 2 pipeline: on-chain → (only if pass) metadata uri → socials gate.
+
+    socials rule: need ≥1 of twitter / telegram / website.
+    """
+    result = run_onchain_filters(
+        event, rpc, ledger_path, thresholds, finalize=False
+    )
+
+    if not result.passed:
+        reason = "; ".join(result.reasons)
+        log_filter_reject(ledger_path, event.mint, reason)
+        log.info("FILTER REJECT %s — %s", event.mint, reason)
+        return result
+
+    # on-chain passed → pull off-chain metadata + socials
+    meta = fetch_token_metadata(event.mint, rpc)
+    meta_dict = meta.to_dict()
+    raw = meta_dict.pop("raw_uri", {})
+    meta_dict["raw_uri_keys"] = sorted(raw.keys()) if isinstance(raw, dict) else []
+    result.metrics["metadata"] = meta_dict
+
+    event.name = meta.name or event.name
+    event.symbol = meta.symbol or event.symbol
+    event.metadata = meta_dict
+
+    gate = apply_socials_gate(meta)
+    result.metrics["socials_present"] = gate.socials_present
+    result.metrics["socials_gate_passed"] = gate.passed
+
+    if not gate.passed:
+        for reason in gate.reasons:
+            result.fail(reason)
+        reason = "; ".join(result.reasons)
+        log_filter_reject(ledger_path, event.mint, reason)
+        log.info("FILTER REJECT %s — %s", event.mint, reason)
+        return result
+
+    log.info(
+        "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL socials=%s name=%s",
+        event.mint,
+        float(result.metrics.get("market_cap_usd") or 0),
+        float(result.metrics.get("estimated_global_fees_sol") or 0),
+        ",".join(gate.socials_present) or "-",
+        (meta.name or "?")[:32],
+    )
+    return result

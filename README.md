@@ -2,9 +2,9 @@
 
 Local Solana memecoin trading agent (paper-first). Design docs live in `docs/`.
 
-## Phase 1 (current)
+## Phase 2 (current)
 
-Scaffold only: `uv` env, FastAPI daemon on localhost, Typer CLI, SQLite stubs.
+PumpPortal migrations + on-chain filters + metadata/socials gate.
 
 ### Setup
 
@@ -24,7 +24,7 @@ uv run python -m archetype.daemon
 ```bash
 uv run archetype status
 uv run archetype migrations              # RAW unfiltered
-uv run archetype migrations --filtered   # PASS only
+uv run archetype migrations --filtered   # PASS only (on-chain + socials)
 uv run archetype migrations --follow
 uv run archetype migrations --follow --filtered
 uv run archetype stop

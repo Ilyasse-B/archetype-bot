@@ -65,11 +65,15 @@ def run_onchain_filters(
     rpc: HeliusRpc,
     ledger_path: Path,
     thresholds: FilterThresholds = DEFAULT_THRESHOLDS,
+    *,
+    finalize: bool = True,
 ) -> FilterResult:
     """
-    evaluate one migration.
+    evaluate one migration (on-chain only).
 
-    order: cheap blacklist → mint → curve → tx/pool → mcap/fees.
+    order: cheap blacklist → mint → (fast-fail) → tx/pool → curve/fees → mcap.
+    hard mint fails / obvious junk bail before expensive polls.
+    set finalize=False if a caller (e.g. socials gate) will log the final outcome.
     """
     ensure_blacklist_tables(ledger_path)
     result = FilterResult(passed=True, mint=event.mint)
@@ -78,16 +82,18 @@ def run_onchain_filters(
     # --- blacklist ---
     bad, why = is_mint_blacklisted(ledger_path, mint)
     if bad:
-        return _reject(result, ledger_path, f"mint blacklisted: {why or 'no reason'}")
+        return _reject(
+            result, ledger_path, f"mint blacklisted: {why or 'no reason'}", finalize=finalize
+        )
 
     # --- mint account (retry — pumpportal can beat rpc visibility) ---
     mint_acct = _wait_account(rpc, mint, encoding="jsonParsed", attempts=12, delay=0.4)
     if not mint_acct:
-        return _reject(result, ledger_path, "mint account missing")
+        return _reject(result, ledger_path, "mint account missing", finalize=finalize)
     try:
         mint_info = parse_mint_json_parsed(mint, mint_acct)
     except Exception as exc:  # noqa: BLE001
-        return _reject(result, ledger_path, f"mint parse failed: {exc}")
+        return _reject(result, ledger_path, f"mint parse failed: {exc}", finalize=finalize)
 
     result.metrics.update(
         {
@@ -128,6 +134,10 @@ def run_onchain_filters(
         if mint_info.token_program != TOKEN_PROGRAM:
             result.fail(f"unknown token program: {mint_info.token_program}")
 
+    # hard mint fails → bail before getTransaction / pool poll / fee poll
+    if not result.passed:
+        return _done(result, ledger_path, finalize=finalize)
+
     # --- migrate tx first (this is the graduation proof) ---
     pool_addr: str | None = None
     quote_sol = 0.0
@@ -157,35 +167,74 @@ def run_onchain_filters(
         result.fail("could not resolve pumpswap pool from migrate tx")
     else:
         result.metrics["pool"] = pool_addr
-        # pool account can lag a bit after the migrate notice
-        pool_acct = _wait_account(rpc, pool_addr, encoding="base64", attempts=12, delay=0.4)
-        if not pool_acct:
-            result.fail("pool account missing")
-        elif pool_acct.get("owner") != PUMP_AMM_PROGRAM:
-            result.fail(f"pool owner not Pump AMM: {pool_acct.get('owner')}")
+
+    # already dead from migrate snapshot → skip 7s pool poll + fee poll
+    if not result.passed:
+        result.metrics["pool_poll_skipped"] = "already failing after migrate snapshot"
+        return _done(result, ledger_path, finalize=finalize)
+
+    # poll pool account only while still a candidate
+    pool_attempts = max(
+        1, int(thresholds.pool_poll_sec / max(thresholds.pool_poll_interval_sec, 0.1)) + 1
+    )
+    assert pool_addr is not None
+    pool_acct = _wait_account(
+        rpc,
+        pool_addr,
+        encoding="base64",
+        attempts=pool_attempts,
+        delay=thresholds.pool_poll_interval_sec,
+    )
+    if not pool_acct:
+        result.metrics["pool_account_pending"] = True
+        result.metrics["lp_burn_check"] = "skipped (pool account not visible after poll)"
+        log.info(
+            "pool account still missing after %.1fs for %s (%s…) — using migrate tx snapshot",
+            thresholds.pool_poll_sec,
+            mint,
+            pool_addr[:8],
+        )
+    elif pool_acct.get("owner") != PUMP_AMM_PROGRAM:
+        result.fail(f"pool owner not Pump AMM: {pool_acct.get('owner')}")
+        return _done(result, ledger_path, finalize=finalize)
+    else:
+        result.metrics["pool_account_pending"] = False
+        try:
+            pool = parse_pool(pool_addr, pool_acct["data"][0])
+        except Exception as exc:  # noqa: BLE001
+            result.fail(f"pool parse failed: {exc}")
+            return _done(result, ledger_path, finalize=finalize)
         else:
-            try:
-                pool = parse_pool(pool_addr, pool_acct["data"][0])
-            except Exception as exc:  # noqa: BLE001
-                result.fail(f"pool parse failed: {exc}")
+            result.metrics["pool_creator"] = pool.creator
+            result.metrics["coin_creator"] = pool.coin_creator
+            result.metrics["lp_mint"] = pool.lp_mint
+            result.metrics["lp_supply"] = pool.lp_supply
+
+            if pool.base_mint != mint:
+                result.fail("pool base_mint mismatch")
+            if pool.quote_mint != WSOL_MINT:
+                result.fail(f"quote mint not WSOL: {pool.quote_mint}")
+            if not result.passed:
+                return _done(result, ledger_path, finalize=finalize)
+
+            lp_ok, lp_note = _check_lp_burned(rpc, pool.lp_mint)
+            result.metrics["lp_burn_check"] = lp_note
+            if not lp_ok:
+                result.fail(lp_note)
+                return _done(result, ledger_path, finalize=finalize)
+
+            base_bal, quote_bal = _poll_token_balances(
+                rpc,
+                pool.pool_base_token_account,
+                pool.pool_quote_token_account,
+                timeout_sec=min(4.0, thresholds.pool_poll_sec),
+                interval_sec=0.5,
+            )
+            if base_bal is None and quote_bal is None:
+                result.metrics["live_vaults_note"] = (
+                    "skipped (vault accounts not visible after poll)"
+                )
             else:
-                result.metrics["pool_creator"] = pool.creator
-                result.metrics["coin_creator"] = pool.coin_creator
-                result.metrics["lp_mint"] = pool.lp_mint
-                result.metrics["lp_supply"] = pool.lp_supply
-
-                if pool.base_mint != mint:
-                    result.fail("pool base_mint mismatch")
-                if pool.quote_mint != WSOL_MINT:
-                    result.fail(f"quote mint not WSOL: {pool.quote_mint}")
-
-                lp_ok, lp_note = _check_lp_burned(rpc, pool.lp_mint)
-                result.metrics["lp_burn_check"] = lp_note
-                if not lp_ok:
-                    result.fail(lp_note)
-
-                base_bal = rpc.get_token_account_balance(pool.pool_base_token_account)
-                quote_bal = rpc.get_token_account_balance(pool.pool_quote_token_account)
                 live_base = float((base_bal or {}).get("uiAmount") or 0)
                 live_quote = int((quote_bal or {}).get("amount") or 0) / 1e9
                 result.metrics["live_pool_base_ui"] = live_base
@@ -193,8 +242,6 @@ def run_onchain_filters(
 
     # --- bonding curve (deployer + fees only) ---
     # NOTE: we do NOT gate on curve.complete anymore.
-    # pumpportal can fire before the complete bit flips; a successful migrate tx
-    # is the real graduation proof.
     curve_addr = bonding_curve_pda(mint)
     curve = None
     curve_acct = _wait_account(rpc, curve_addr, encoding="base64", attempts=10, delay=0.4)
@@ -202,7 +249,9 @@ def run_onchain_filters(
         try:
             curve = parse_bonding_curve(curve_addr, curve_acct["data"][0])
         except Exception as exc:  # noqa: BLE001
-            return _reject(result, ledger_path, f"bonding curve parse failed: {exc}")
+            return _reject(
+                result, ledger_path, f"bonding curve parse failed: {exc}", finalize=finalize
+            )
 
     if curve is not None:
         result.metrics["bonding_curve"] = curve_addr
@@ -212,16 +261,24 @@ def run_onchain_filters(
         bad, why = is_deployer_blacklisted(ledger_path, curve.creator)
         if bad:
             result.fail(f"deployer blacklisted: {why or 'no reason'}")
+            return _done(result, ledger_path, finalize=finalize)
 
         vault_addr = creator_vault_pda(curve.creator)
-        vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
-        vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
-        # axiom "fees" is indexed total; we estimate from unclaimed creator vault
         share = max(thresholds.creator_fee_share, 0.05)
-        estimated_fees_sol = vault_sol / share if vault_sol > 0 else 0.0
+        vault_sol, estimated_fees_sol, fee_samples = _poll_creator_fees(
+            rpc,
+            vault_addr,
+            share=share,
+            min_fees=thresholds.min_global_fees_sol,
+            timeout_sec=thresholds.fees_poll_sec,
+            interval_sec=thresholds.fees_poll_interval_sec,
+        )
         result.metrics["creator_vault_sol"] = vault_sol
         result.metrics["estimated_global_fees_sol"] = estimated_fees_sol
-        result.metrics["fees_method"] = "creator_vault / creator_fee_share (best-effort)"
+        result.metrics["fees_samples"] = fee_samples
+        result.metrics["fees_method"] = (
+            "creator_vault / creator_fee_share (polled post-migrate, best-effort)"
+        )
 
         if estimated_fees_sol < thresholds.min_global_fees_sol:
             result.fail(
@@ -229,11 +286,16 @@ def run_onchain_filters(
                 f"(min {thresholds.min_global_fees_sol})"
             )
     elif migrate_ok:
-        # no curve but migrate worked — can't do fees/deployer checks
         result.metrics["fees_method"] = "skipped (no bonding curve)"
         result.fail("could not read bonding curve for fees/deployer checks")
     else:
-        return _reject(result, ledger_path, "bonding curve account missing")
+        return _reject(
+            result, ledger_path, "bonding curve account missing", finalize=finalize
+        )
+
+    # fees already failed → skip coingecko/mcap
+    if not result.passed:
+        return _done(result, ledger_path, finalize=finalize)
 
     # --- market cap (prefer migrate snapshot so we filter at graduation) ---
     try:
@@ -255,19 +317,7 @@ def run_onchain_filters(
     except Exception as exc:  # noqa: BLE001
         result.fail(f"market cap calc failed: {exc}")
 
-    if not result.passed:
-        reason = "; ".join(result.reasons)
-        log_filter_reject(ledger_path, mint, reason)
-        log.info("FILTER REJECT %s — %s", mint, reason)
-    else:
-        log.info(
-            "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL pool=%.2fSOL",
-            mint,
-            float(result.metrics.get("market_cap_usd") or 0),
-            float(result.metrics.get("estimated_global_fees_sol") or 0),
-            float(result.metrics.get("pool_sol_at_migrate") or 0),
-        )
-    return result
+    return _done(result, ledger_path, finalize=finalize)
 
 
 def _wait_account(
@@ -290,6 +340,64 @@ def _wait_account(
         if i + 1 < attempts:
             time.sleep(delay)
     return last
+
+
+def _poll_creator_fees(
+    rpc: HeliusRpc,
+    vault_addr: str,
+    *,
+    share: float,
+    min_fees: float,
+    timeout_sec: float,
+    interval_sec: float,
+) -> tuple[float, float, list[float]]:
+    """
+    re-read creator vault for a few seconds; take the max fee estimate.
+
+    early-exit once we clear min_fees.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    samples: list[float] = []
+    best_vault = 0.0
+    best_fees = 0.0
+    while True:
+        vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
+        vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
+        fees = vault_sol / share if vault_sol > 0 and share > 0 else 0.0
+        samples.append(round(fees, 6))
+        if fees >= best_fees:
+            best_fees = fees
+            best_vault = vault_sol
+        if best_fees >= min_fees:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.05, interval_sec))
+    return best_vault, best_fees, samples
+
+
+def _poll_token_balances(
+    rpc: HeliusRpc,
+    base_ata: str,
+    quote_ata: str,
+    *,
+    timeout_sec: float,
+    interval_sec: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """wait briefly for pool vault ATAs to show up."""
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    base_bal: dict[str, Any] | None = None
+    quote_bal: dict[str, Any] | None = None
+    while True:
+        if base_bal is None:
+            base_bal = rpc.get_token_account_balance(base_ata)
+        if quote_bal is None:
+            quote_bal = rpc.get_token_account_balance(quote_ata)
+        if base_bal is not None and quote_bal is not None:
+            return base_bal, quote_bal
+        if time.monotonic() >= deadline:
+            return base_bal, quote_bal
+        time.sleep(max(0.05, interval_sec))
 
 
 def _check_lp_burned(rpc: HeliusRpc, lp_mint: str) -> tuple[bool, str]:
@@ -336,8 +444,37 @@ def _check_lp_burned(rpc: HeliusRpc, lp_mint: str) -> tuple[bool, str]:
     return True, "lp burn heuristic passed"
 
 
-def _reject(result: FilterResult, ledger_path: Path, reason: str) -> FilterResult:
-    result.fail(reason)
-    log_filter_reject(ledger_path, result.mint, reason)
-    log.info("FILTER REJECT %s — %s", result.mint, reason)
+def _done(
+    result: FilterResult,
+    ledger_path: Path,
+    *,
+    finalize: bool,
+) -> FilterResult:
+    """optionally log final pass/fail (skip when caller will log)."""
+    if not finalize:
+        return result
+    if not result.passed:
+        reason = "; ".join(result.reasons)
+        log_filter_reject(ledger_path, result.mint, reason)
+        log.info("FILTER REJECT %s — %s", result.mint, reason)
+    else:
+        log.info(
+            "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL pool=%.2fSOL",
+            result.mint,
+            float(result.metrics.get("market_cap_usd") or 0),
+            float(result.metrics.get("estimated_global_fees_sol") or 0),
+            float(result.metrics.get("pool_sol_at_migrate") or 0),
+        )
     return result
+
+
+def _reject(
+    result: FilterResult,
+    ledger_path: Path,
+    reason: str,
+    *,
+    finalize: bool = True,
+) -> FilterResult:
+    """fail with one reason and optionally log."""
+    result.fail(reason)
+    return _done(result, ledger_path, finalize=finalize)

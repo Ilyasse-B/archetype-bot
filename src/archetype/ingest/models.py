@@ -25,6 +25,8 @@ class MigrationEvent(BaseModel):
     filter_passed: bool | None = None
     filter_reasons: list[str] = Field(default_factory=list)
     filter_metrics: dict[str, Any] = Field(default_factory=dict)
+    # off-chain metadata snapshot (after uri fetch)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def parse_pumpportal_message(payload: Any) -> list[MigrationEvent]:
