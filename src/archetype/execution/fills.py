@@ -12,13 +12,16 @@ from archetype.execution.wallet import (
     delete_position,
     get_balance,
     get_position,
+    list_positions,
     record_closed_trade,
     set_balance,
     upsert_position,
 )
 from archetype.filters.helius import HeliusRpc
+from archetype.filters.sol_price import get_sol_usd
 from archetype.price.models import PriceTick
-from archetype.price.snapshot import fetch_price_tick
+from archetype.price.resolve import ResolvedPool
+from archetype.price.snapshot import fetch_price_tick, fetch_price_tick_resolved
 
 # dust leftover → treat as full close
 _DUST_TOKENS = 1e-9
@@ -41,6 +44,7 @@ class FillResult:
     name: str | None = None
     symbol: str | None = None
     mode: str = "full"  # full | percent | sol | init
+    resolved: ResolvedPool | None = None
 
 
 @dataclass
@@ -57,6 +61,16 @@ class MarkedPosition:
     symbol: str | None
 
 
+def _price_kwargs(ledger_path: Path, pos: Position | None = None) -> dict:
+    """shared resolve hints from an open position / ledger cache."""
+    return {
+        "ledger_path": ledger_path,
+        "known_pool": pos.pool if pos else None,
+        "name": pos.name if pos else None,
+        "symbol": pos.symbol if pos else None,
+    }
+
+
 def buy(
     ledger_path: Path,
     rpc: HeliusRpc,
@@ -64,6 +78,7 @@ def buy(
     size_sol: float,
     *,
     tick: PriceTick | None = None,
+    resolved: ResolvedPool | None = None,
 ) -> FillResult:
     """
     spend size_sol of mock cash at current price.
@@ -80,12 +95,18 @@ def buy(
             f"insufficient balance: need {size_sol:.4f} SOL, have {bal:.4f} SOL"
         )
 
-    tick = tick or fetch_price_tick(rpc, mint)
+    existing = get_position(ledger_path, mint)
+    if tick is None:
+        tick, resolved = fetch_price_tick_resolved(
+            rpc,
+            mint,
+            resolved=resolved,
+            **_price_kwargs(ledger_path, existing),
+        )
     if tick.price_sol <= 0:
         raise ValueError("invalid price")
 
     tokens_bought = size_sol / tick.price_sol
-    existing = get_position(ledger_path, mint)
 
     if existing:
         new_tokens = existing.tokens + tokens_bought
@@ -93,7 +114,6 @@ def buy(
         entry_price = new_cost / new_tokens if new_tokens > 0 else tick.price_sol
         name = tick.name or existing.name
         symbol = tick.symbol or existing.symbol
-        # cost-weighted avg entry FDV across fills
         if existing.entry_fdv_usd is not None and existing.cost_sol > 0:
             entry_fdv = (
                 existing.entry_fdv_usd * existing.cost_sol + tick.fdv_usd * size_sol
@@ -121,6 +141,7 @@ def buy(
         entry_price_sol=entry_price,
         entry_fdv_usd=entry_fdv,
         initial_cost_sol=initial_cost,
+        pool=tick.pool,
     )
     return FillResult(
         side="buy",
@@ -133,6 +154,7 @@ def buy(
         wallet_sol=new_bal,
         name=name,
         symbol=symbol,
+        resolved=resolved,
     )
 
 
@@ -145,6 +167,7 @@ def sell(
     sol_amount: float | None = None,
     initials: bool = False,
     tick: PriceTick | None = None,
+    resolved: ResolvedPool | None = None,
 ) -> FillResult:
     """
     sell open position (full / % / SOL out / initials).
@@ -168,7 +191,13 @@ def sell(
     if pos is None:
         raise ValueError(f"no open position for {mint}")
 
-    tick = tick or fetch_price_tick(rpc, mint)
+    if tick is None:
+        tick, resolved = fetch_price_tick_resolved(
+            rpc,
+            mint,
+            resolved=resolved,
+            **_price_kwargs(ledger_path, pos),
+        )
     if tick.price_sol <= 0:
         raise ValueError("invalid price")
 
@@ -194,7 +223,6 @@ def sell(
         if tokens_sold > pos.tokens:
             tokens_sold = pos.tokens
         proceeds = tokens_sold * tick.price_sol
-        # attribute the recovered capital as cost on this leg (~0 pnl)
         cost_sold = min(init, pos.cost_sol)
         new_initial = 0.0
     elif sol_amount is not None:
@@ -267,6 +295,7 @@ def sell(
             entry_price_sol=entry_price,
             entry_fdv_usd=pos.entry_fdv_usd,
             initial_cost_sol=max(0.0, new_initial),
+            pool=tick.pool or pos.pool,
         )
         record_closed_trade(
             ledger_path,
@@ -293,6 +322,7 @@ def sell(
         name=tick.name or pos.name,
         symbol=tick.symbol or pos.symbol,
         mode=mode,
+        resolved=resolved,
     )
 
 
@@ -301,9 +331,18 @@ def mark_position(
     pos: Position,
     *,
     tick: PriceTick | None = None,
+    ledger_path: Path | None = None,
 ) -> MarkedPosition:
     """one-shot mark-to-market for balance display."""
-    tick = tick or fetch_price_tick(rpc, pos.mint)
+    if tick is None:
+        tick = fetch_price_tick(
+            rpc,
+            pos.mint,
+            known_pool=pos.pool,
+            name=pos.name,
+            symbol=pos.symbol,
+            ledger_path=ledger_path,
+        )
     value_sol = pos.tokens * tick.price_sol
     pnl_sol = value_sol - pos.cost_sol
     pnl_pct = (pnl_sol / pos.cost_sol * 100.0) if pos.cost_sol > 0 else 0.0
@@ -317,3 +356,31 @@ def mark_position(
         name=tick.name or pos.name,
         symbol=tick.symbol or pos.symbol,
     )
+
+
+def mark_all_positions(
+    ledger_path: Path,
+    rpc: HeliusRpc,
+) -> list[MarkedPosition]:
+    """
+    mark every open position — shared SOL/USD + cached resolves.
+
+    cheaper than N independent mark_position calls.
+    """
+    positions = list_positions(ledger_path)
+    if not positions:
+        return []
+    sol_usd = get_sol_usd(rpc)
+    out: list[MarkedPosition] = []
+    for pos in positions:
+        tick = fetch_price_tick(
+            rpc,
+            pos.mint,
+            sol_usd=sol_usd,
+            known_pool=pos.pool,
+            name=pos.name,
+            symbol=pos.symbol,
+            ledger_path=ledger_path,
+        )
+        out.append(mark_position(rpc, pos, tick=tick, ledger_path=ledger_path))
+    return out

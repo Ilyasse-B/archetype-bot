@@ -55,10 +55,10 @@ class FilterThresholds:
     # from unclaimed creator vault. axiom "fees" is indexed; this is best-effort.
     creator_fee_share: float = 0.25
     # post-migrate races: fees / pool accounts often land a few seconds late
-    fees_poll_sec: float = 7.0
-    fees_poll_interval_sec: float = 1.0
-    pool_poll_sec: float = 7.0
-    pool_poll_interval_sec: float = 0.7
+    fees_poll_sec: float = 6.0
+    fees_poll_interval_sec: float = 1.2
+    pool_poll_sec: float = 6.0
+    pool_poll_interval_sec: float = 0.9
 
 
 DEFAULT_THRESHOLDS = FilterThresholds()

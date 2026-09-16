@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
@@ -14,6 +15,7 @@ from rich.text import Text
 from archetype.execution.wallet import Position
 from archetype.filters.helius import HeliusRpc
 from archetype.price.models import PriceTick
+from archetype.price.resolve import ResolvedPool
 from archetype.price.stream import aiter_price_ticks_ws
 
 
@@ -50,6 +52,9 @@ async def _watch_loop(
     mint: str,
     console: Console,
     pos: Position | None,
+    *,
+    resolved: ResolvedPool | None,
+    ledger_path: Path | None,
 ) -> None:
     """ws loop — overwrite one Live line each tick."""
     first = True
@@ -59,7 +64,15 @@ async def _watch_loop(
         refresh_per_second=8,
         transient=False,
     ) as live:
-        async for tick in aiter_price_ticks_ws(rpc, mint):
+        async for tick in aiter_price_ticks_ws(
+            rpc,
+            mint,
+            resolved=resolved,
+            known_pool=pos.pool if pos else None,
+            name=pos.name if pos else None,
+            symbol=pos.symbol if pos else None,
+            ledger_path=ledger_path,
+        ):
             if first:
                 bits = [
                     f"[bold]watching[/bold] "
@@ -94,6 +107,8 @@ def run_inline_watch(
     console: Console,
     *,
     position: Position | None = None,
+    resolved: ResolvedPool | None = None,
+    ledger_path: Path | None = None,
 ) -> None:
     """
     block and update FDV (and PnL if position) in-place until ctrl+c.
@@ -103,7 +118,16 @@ def run_inline_watch(
     hint = "live position PnL" if position else "live FDV"
     console.print(f"[dim]{hint} (ctrl+c to stop)…[/dim]")
     try:
-        asyncio.run(_watch_loop(rpc, mint, console, position))
+        asyncio.run(
+            _watch_loop(
+                rpc,
+                mint,
+                console,
+                position,
+                resolved=resolved,
+                ledger_path=ledger_path,
+            )
+        )
     except KeyboardInterrupt:
         msg = (
             "stopped watching (position still open)"
@@ -113,7 +137,6 @@ def run_inline_watch(
         console.print(f"\n[dim]{msg}[/dim]")
 
 
-# back-compat alias used by buy
 def run_inline_pnl(rpc: HeliusRpc, pos: Position, console: Console) -> None:
     """inline live PnL for an open position."""
     run_inline_watch(rpc, pos.mint, console, position=pos)

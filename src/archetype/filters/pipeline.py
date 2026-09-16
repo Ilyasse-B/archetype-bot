@@ -25,6 +25,7 @@ from archetype.filters.decode import (
     parse_bonding_curve,
     parse_mint_json_parsed,
     parse_pool,
+    PoolInfo,
 )
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
@@ -87,7 +88,7 @@ def run_onchain_filters(
         )
 
     # --- mint account (retry — pumpportal can beat rpc visibility) ---
-    mint_acct = _wait_account(rpc, mint, encoding="jsonParsed", attempts=12, delay=0.4)
+    mint_acct = _wait_account(rpc, mint, encoding="jsonParsed", attempts=8, delay=0.35)
     if not mint_acct:
         return _reject(result, ledger_path, "mint account missing", finalize=finalize)
     try:
@@ -217,18 +218,37 @@ def run_onchain_filters(
             if not result.passed:
                 return _done(result, ledger_path, finalize=finalize)
 
-            lp_ok, lp_note = _check_lp_burned(rpc, pool.lp_mint)
+            lp_ok, lp_note = _check_lp_burned(pool)
             result.metrics["lp_burn_check"] = lp_note
             if not lp_ok:
                 result.fail(lp_note)
                 return _done(result, ledger_path, finalize=finalize)
 
+            # stash pool for later price resolves (cache)
+            try:
+                from archetype.price.cache import cache_put
+                from archetype.price.resolve import ResolvedPool
+
+                cache_put(
+                    ResolvedPool(
+                        mint=mint,
+                        pool=pool,
+                        decimals=mint_info.decimals,
+                        supply_ui=mint_info.supply_ui,
+                        name=event.name,
+                        symbol=event.symbol,
+                    ),
+                    ledger_path=ledger_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("pool cache put skipped: %s", exc)
+
             base_bal, quote_bal = _poll_token_balances(
                 rpc,
                 pool.pool_base_token_account,
                 pool.pool_quote_token_account,
-                timeout_sec=min(4.0, thresholds.pool_poll_sec),
-                interval_sec=0.5,
+                timeout_sec=min(3.0, thresholds.pool_poll_sec),
+                interval_sec=0.6,
             )
             if base_bal is None and quote_bal is None:
                 result.metrics["live_vaults_note"] = (
@@ -244,7 +264,7 @@ def run_onchain_filters(
     # NOTE: we do NOT gate on curve.complete anymore.
     curve_addr = bonding_curve_pda(mint)
     curve = None
-    curve_acct = _wait_account(rpc, curve_addr, encoding="base64", attempts=10, delay=0.4)
+    curve_acct = _wait_account(rpc, curve_addr, encoding="base64", attempts=6, delay=0.4)
     if curve_acct:
         try:
             curve = parse_bonding_curve(curve_addr, curve_acct["data"][0])
@@ -328,8 +348,9 @@ def _wait_account(
     attempts: int = 10,
     delay: float = 0.4,
 ) -> dict[str, Any] | None:
-    """poll getAccountInfo until it shows up (or we give up)."""
+    """poll getAccountInfo until it shows up (or we give up) — backoff."""
     last: dict[str, Any] | None = None
+    wait = delay
     for i in range(max(1, attempts)):
         if encoding == "jsonParsed":
             last = rpc.get_account_json_parsed(pubkey)
@@ -338,7 +359,8 @@ def _wait_account(
         if last is not None:
             return last
         if i + 1 < attempts:
-            time.sleep(delay)
+            time.sleep(wait)
+            wait = min(wait * 1.4, 2.0)
     return last
 
 
@@ -354,12 +376,13 @@ def _poll_creator_fees(
     """
     re-read creator vault for a few seconds; take the max fee estimate.
 
-    early-exit once we clear min_fees.
+    early-exit once we clear min_fees. backoff between polls.
     """
     deadline = time.monotonic() + max(0.0, timeout_sec)
     samples: list[float] = []
     best_vault = 0.0
     best_fees = 0.0
+    wait = max(0.05, interval_sec)
     while True:
         vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
         vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
@@ -372,7 +395,8 @@ def _poll_creator_fees(
             break
         if time.monotonic() >= deadline:
             break
-        time.sleep(max(0.05, interval_sec))
+        time.sleep(wait)
+        wait = min(wait * 1.3, 2.0)
     return best_vault, best_fees, samples
 
 
@@ -384,64 +408,36 @@ def _poll_token_balances(
     timeout_sec: float,
     interval_sec: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """wait briefly for pool vault ATAs to show up."""
+    """wait briefly for pool vault ATAs (batched read each try)."""
     deadline = time.monotonic() + max(0.0, timeout_sec)
     base_bal: dict[str, Any] | None = None
     quote_bal: dict[str, Any] | None = None
+    wait = max(0.05, interval_sec)
     while True:
-        if base_bal is None:
-            base_bal = rpc.get_token_account_balance(base_ata)
-        if quote_bal is None:
-            quote_bal = rpc.get_token_account_balance(quote_ata)
+        b, q = rpc.get_token_balances_pair(base_ata, quote_ata)
+        if b is not None:
+            base_bal = b
+        if q is not None:
+            quote_bal = q
         if base_bal is not None and quote_bal is not None:
             return base_bal, quote_bal
         if time.monotonic() >= deadline:
             return base_bal, quote_bal
-        time.sleep(max(0.05, interval_sec))
+        time.sleep(wait)
+        wait = min(wait * 1.3, 2.0)
 
 
-def _check_lp_burned(rpc: HeliusRpc, lp_mint: str) -> tuple[bool, str]:
+def _check_lp_burned(pool: PoolInfo) -> tuple[bool, str]:
     """
-    pump migrate burns LP — largest accounts should not be a normal wallet with big share.
+    use already-fetched pool.lp_supply — no extra helius call.
 
-    heuristic: if top holder is the burn/null-ish or total in top accounts is tiny vs supply, ok.
-    if a single non-system wallet holds a large LP share, fail.
+    pump migrate burns LP; lp_supply 0 (or tiny) is the usual signal.
     """
-    try:
-        largest = rpc.get_token_largest_accounts(lp_mint)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"lp largest accounts failed: {exc}"
-
-    if not largest:
-        return True, "lp largest empty (treat as burned/ok)"
-
-    # burn addresses commonly used
-    burn_like = {
-        "1nc1nerator11111111111111111111111111111111",
-        "DeadDeadDeadDeadDeadDeadDeadDeadDeadDeadD",
-    }
-    top = largest[0]
-    addr = top.get("address") or ""
-    # getTokenLargestAccounts returns token accounts not owners — check amount share
-    amounts = [int(x.get("amount") or 0) for x in largest]
-    total_top = sum(amounts) or 1
-    # if the biggest chunk is overwhelming and we can resolve owner later — soft check:
-    # for pump, LP is burned so top accounts often show 0 balance token accounts
-    ui = top.get("uiAmount")
-    if ui is None:
-        raw = int(top.get("amount") or 0)
-        # no decimals easy here; if raw is 0, ok
-        if raw == 0:
-            return True, "top lp amount 0"
-    elif float(ui) == 0:
-        return True, "top lp uiAmount 0"
-
-    # if top account holds almost all LP and isn't obviously a pool/burn, flag it
-    top_amt = amounts[0]
-    if top_amt / total_top > 0.95 and total_top > 0:
-        # still likely the burned escrow representation — pass with note
-        return True, f"lp top-heavy (ok for burned LP mint); top_account={addr[:8]}…"
-    return True, "lp burn heuristic passed"
+    lp_supply = int(pool.lp_supply or 0)
+    if lp_supply == 0:
+        return True, "lp_supply=0 (burned/ok)"
+    # soft pass — historical heuristic always passed after largest-accounts too
+    return True, f"lp_supply={lp_supply} (ok; no extra rpc)"
 
 
 def _done(

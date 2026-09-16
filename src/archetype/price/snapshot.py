@@ -5,6 +5,7 @@ fetch a live price/mcap snapshot from pool vault balances.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
@@ -21,6 +22,10 @@ def fetch_price_tick(
     resolved: ResolvedPool | None = None,
     sol_usd: float | None = None,
     source: str = "rpc",
+    known_pool: str | None = None,
+    name: str | None = None,
+    symbol: str | None = None,
+    ledger_path: Path | None = None,
 ) -> PriceTick:
     """
     one-shot price from current pool vault reserves.
@@ -28,11 +33,21 @@ def fetch_price_tick(
     market_cap_* uses on-chain mint supply.
     fdv_* uses 1B (axiom-style pump display).
     """
-    pool_res = resolved or resolve_pumpswap_pool(rpc, mint)
+    pool_res = resolved or resolve_pumpswap_pool(
+        rpc,
+        mint,
+        known_pool=known_pool,
+        name=name,
+        symbol=symbol,
+        ledger_path=ledger_path,
+        skip_das=bool(name and symbol),
+    )
     pool = pool_res.pool
 
-    base_bal = rpc.get_token_account_balance(pool.pool_base_token_account)
-    quote_bal = rpc.get_token_account_balance(pool.pool_quote_token_account)
+    base_bal, quote_bal = rpc.get_token_balances_pair(
+        pool.pool_base_token_account,
+        pool.pool_quote_token_account,
+    )
     if not base_bal or not quote_bal:
         raise RuntimeError("pool vault balances not available yet")
 
@@ -48,7 +63,32 @@ def fetch_price_tick(
         supply_ui=pool_res.supply_ui,
         decimals=pool_res.decimals,
         sol_usd=usd,
-        name=pool_res.name,
-        symbol=pool_res.symbol,
+        name=pool_res.name or name,
+        symbol=pool_res.symbol or symbol,
         source=source,
     )
+
+
+def fetch_price_tick_resolved(
+    rpc: HeliusRpc,
+    mint: str,
+    **kwargs,
+) -> tuple[PriceTick, ResolvedPool]:
+    """same as fetch_price_tick but also returns the ResolvedPool used."""
+    resolved: ResolvedPool | None = kwargs.pop("resolved", None)
+    ledger_path = kwargs.get("ledger_path")
+    known_pool = kwargs.get("known_pool")
+    name = kwargs.get("name")
+    symbol = kwargs.get("symbol")
+    if resolved is None:
+        resolved = resolve_pumpswap_pool(
+            rpc,
+            mint,
+            known_pool=known_pool,
+            name=name,
+            symbol=symbol,
+            ledger_path=ledger_path,
+            skip_das=bool(name and symbol),
+        )
+    tick = fetch_price_tick(rpc, mint, resolved=resolved, **kwargs)
+    return tick, resolved

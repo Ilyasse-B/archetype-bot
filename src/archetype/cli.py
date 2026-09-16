@@ -334,7 +334,14 @@ def watch_cmd(
 
     try:
         if once:
-            tick = fetch_price_tick(rpc, mint)
+            tick = fetch_price_tick(
+                rpc,
+                mint,
+                known_pool=pos.pool if pos else None,
+                name=pos.name if pos else None,
+                symbol=pos.symbol if pos else None,
+                ledger_path=ledger,
+            )
             label = tick.name or tick.symbol or mint[:8]
             console.print(
                 f"[bold]watching[/bold] {label}  mint={mint}"
@@ -353,7 +360,13 @@ def watch_cmd(
             console.print(format_watch_line(tick, pos))
             return
 
-        run_inline_watch(rpc, mint, console, position=pos)
+        run_inline_watch(
+            rpc,
+            mint,
+            console,
+            position=pos,
+            ledger_path=ledger,
+        )
     except KeyboardInterrupt:
         console.print("\n[dim]stopped watching[/dim]")
     except Exception as exc:  # noqa: BLE001
@@ -416,7 +429,14 @@ def buy_cmd(
         f"avg entry FDV={entry_fdv}[/dim]"
     )
     if not no_track and fill.position is not None:
-        run_inline_watch(rpc, mint, console, position=fill.position)
+        run_inline_watch(
+            rpc,
+            mint,
+            console,
+            position=fill.position,
+            resolved=fill.resolved,
+            ledger_path=ledger,
+        )
 
 
 @app.command("sell")
@@ -525,15 +545,15 @@ def balance_cmd(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
-    from archetype.execution import get_balance, list_positions, mark_position
+    from archetype.execution import get_balance, mark_all_positions
 
     settings, rpc = _require_helius()
     ledger = settings.resolved_trading_ledger_db()
     cash = get_balance(ledger)
-    positions = list_positions(ledger)
+    marks = mark_all_positions(ledger, rpc)
 
     console.print(f"[bold]paper wallet[/bold]  cash=[cyan]{cash:.4f} SOL[/cyan]")
-    if not positions:
+    if not marks:
         console.print("[dim]no open positions[/dim]")
         return
 
@@ -546,30 +566,17 @@ def balance_cmd(ctx: typer.Context) -> None:
     table.add_column("cost SOL", justify="right")
     table.add_column("FDV$", justify="right")
 
-    for pos in positions:
-        try:
-            mark = mark_position(rpc, pos)
-            pnl_s = f"{mark.pnl_pct:+.2f}%"
-            table.add_row(
-                mark.symbol or pos.symbol or "?",
-                (mark.name or pos.name or "")[:20],
-                pos.mint,
-                f"{mark.value_sol:.4f}",
-                pnl_s,
-                f"{pos.cost_sol:.4f}",
-                f"{mark.fdv_usd:,.0f}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            table.add_row(
-                pos.symbol or "?",
-                (pos.name or "")[:20],
-                pos.mint,
-                "?",
-                f"[red]err[/red]",
-                f"{pos.cost_sol:.4f}",
-                "?",
-            )
-            console.print(f"[yellow]mark failed {pos.mint[:8]}…:[/yellow] {exc}")
+    for mark in marks:
+        pos = mark.position
+        table.add_row(
+            mark.symbol or pos.symbol or "?",
+            (mark.name or pos.name or "")[:20],
+            pos.mint,
+            f"{mark.value_sol:.4f}",
+            f"{mark.pnl_pct:+.2f}%",
+            f"{pos.cost_sol:.4f}",
+            f"{mark.fdv_usd:,.0f}",
+        )
 
     console.print(table)
 

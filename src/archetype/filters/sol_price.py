@@ -16,16 +16,25 @@ if TYPE_CHECKING:
 log = logging.getLogger("archetype.sol_price")
 
 _cache: dict[str, float] = {"price": 0.0, "ts": 0.0}
-_CACHE_TTL = 60.0
+# fdv moves with token price far more than sol — 5 min is fine
+_CACHE_TTL = 300.0
+_cg_fail_until = 0.0
 
 
 def get_sol_usd(rpc: HeliusRpc | None = None) -> float:
     """cached SOL/USD."""
+    global _cg_fail_until
     now = time.time()
     if _cache["price"] > 0 and now - _cache["ts"] < _CACHE_TTL:
         return _cache["price"]
 
-    price = _from_coingecko()
+    price = None
+    if now >= _cg_fail_until:
+        price = _from_coingecko()
+        if price is None:
+            # back off CG briefly so we dont hammer it
+            _cg_fail_until = now + 60.0
+
     if price is None and rpc is not None:
         price = _from_helius_das(rpc)
     if price is None or price <= 0:

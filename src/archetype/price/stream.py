@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import websockets
@@ -16,7 +17,7 @@ import websockets
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
 from archetype.price.models import PriceTick, build_tick
-from archetype.price.resolve import resolve_pumpswap_pool
+from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
 from archetype.price.snapshot import fetch_price_tick
 
 log = logging.getLogger("archetype.price")
@@ -26,7 +27,12 @@ async def aiter_price_ticks_ws(
     rpc: HeliusRpc,
     mint: str,
     *,
-    sol_refresh_sec: float = 30.0,
+    resolved: ResolvedPool | None = None,
+    known_pool: str | None = None,
+    name: str | None = None,
+    symbol: str | None = None,
+    ledger_path: Path | None = None,
+    sol_refresh_sec: float = 300.0,
 ) -> AsyncIterator[PriceTick]:
     """
     subscribe to base + quote vault ATAs; emit a tick on every reserve change.
@@ -35,7 +41,15 @@ async def aiter_price_ticks_ws(
     if not rpc.enabled:
         raise RuntimeError("ARCHETYPE_HELIUS_API_KEY not set")
 
-    resolved = resolve_pumpswap_pool(rpc, mint)
+    resolved = resolved or resolve_pumpswap_pool(
+        rpc,
+        mint,
+        known_pool=known_pool,
+        name=name,
+        symbol=symbol,
+        ledger_path=ledger_path,
+        skip_das=bool(name and symbol),
+    )
     pool = resolved.pool
     base_ata = pool.pool_base_token_account
     quote_ata = pool.pool_quote_token_account
@@ -49,7 +63,14 @@ async def aiter_price_ticks_ws(
 
     sol_usd = get_sol_usd(rpc)
     # seed balances via RPC so first tick is immediate
-    tick0 = fetch_price_tick(rpc, mint, resolved=resolved, sol_usd=sol_usd, source="ws")
+    tick0 = fetch_price_tick(
+        rpc,
+        mint,
+        resolved=resolved,
+        sol_usd=sol_usd,
+        source="ws",
+        ledger_path=ledger_path,
+    )
     base_ui = tick0.pool_base_ui
     quote_sol = tick0.pool_sol
     yield tick0
@@ -79,7 +100,6 @@ async def aiter_price_ticks_ws(
                     }
                 )
             )
-            # map reply id → kind temporarily; subscription id comes in result
             sub_to_kind[mid] = kind
 
         id_to_kind: dict[int, str] = {}
@@ -93,7 +113,6 @@ async def aiter_price_ticks_ws(
             except json.JSONDecodeError:
                 continue
 
-            # subscription ack: {"result": <sub_id>, "id": <req_id>}
             if "result" in msg and "id" in msg and "method" not in msg:
                 kind = sub_to_kind.pop(int(msg["id"]), None)
                 if kind is not None:

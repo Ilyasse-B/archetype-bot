@@ -87,7 +87,27 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     entry_price_sol REAL NOT NULL,
     entry_fdv_usd REAL,
     initial_cost_sol REAL NOT NULL DEFAULT 0,
+    pool TEXT,
     opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pool_cache (
+    mint TEXT PRIMARY KEY,
+    pool TEXT NOT NULL,
+    base_ata TEXT NOT NULL,
+    quote_ata TEXT NOT NULL,
+    decimals INTEGER NOT NULL,
+    supply_ui REAL NOT NULL,
+    name TEXT,
+    symbol TEXT,
+    creator TEXT NOT NULL,
+    base_mint TEXT NOT NULL,
+    quote_mint TEXT NOT NULL,
+    lp_mint TEXT NOT NULL,
+    lp_supply INTEGER NOT NULL,
+    coin_creator TEXT,
+    pool_index INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS blacklist (
