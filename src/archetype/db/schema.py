@@ -69,6 +69,26 @@ CREATE TABLE IF NOT EXISTS trades (
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- paper wallet (singleton row id=1)
+CREATE TABLE IF NOT EXISTS paper_wallet (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    sol_balance REAL NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- open paper positions (one row per mint while open)
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL UNIQUE,
+    name TEXT,
+    symbol TEXT,
+    tokens REAL NOT NULL,
+    cost_sol REAL NOT NULL,
+    entry_price_sol REAL NOT NULL,
+    entry_fdv_usd REAL,
+    opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS blacklist (
     mint TEXT PRIMARY KEY,
     reason TEXT,

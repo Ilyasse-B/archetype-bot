@@ -309,15 +309,15 @@ def watch_cmd(
     ),
 ) -> None:
     """
-    stream live PumpSwap FDV for a mint (no daemon needed).
+    live PumpSwap FDV for a mint (inline).
 
-    FDV = price × 1B (axiom-style). ticks only on vault changes via Helius WS.
+    if you hold an open paper position on that mint, also shows value + PnL.
     """
-    import asyncio
     import logging
 
+    from archetype.execution import format_watch_line, get_position, run_inline_watch
     from archetype.filters.helius import HeliusRpc
-    from archetype.price import aiter_price_ticks_ws, fetch_price_tick
+    from archetype.price import fetch_price_tick
 
     settings = get_settings()
     if not settings.helius_api_key.strip():
@@ -329,43 +329,224 @@ def watch_cmd(
 
     rpc = HeliusRpc(settings.helius_api_key)
     mint = mint.strip()
-
-    def _print_tick(tick, *, first: bool = False) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        label = tick.name or tick.symbol or mint[:8]
-        if first:
-            console.print(
-                f"[bold]watching[/bold] {label}  mint={mint}  [ws]\n"
-                f"[dim]pool={tick.pool}  FDV supply={tick.fdv_supply:,.0f}  "
-                f"SOL=${tick.sol_usd:,.2f}[/dim]"
-            )
-        console.print(
-            f"[green]{ts}[/green]  "
-            f"FDV=[bold cyan]${tick.fdv_usd:,.0f}[/bold cyan]  "
-            f"price={tick.price_sol:.10g} SOL (${tick.price_usd:.8g})  "
-            f"pool={tick.pool_sol:.2f} SOL / {tick.pool_base_ui:,.0f} tok"
-        )
+    ledger = settings.resolved_trading_ledger_db()
+    pos = get_position(ledger, mint)
 
     try:
         if once:
             tick = fetch_price_tick(rpc, mint)
-            _print_tick(tick, first=True)
+            label = tick.name or tick.symbol or mint[:8]
+            console.print(
+                f"[bold]watching[/bold] {label}  mint={mint}"
+                + ("  [position]" if pos else "")
+            )
+            if pos is not None:
+                entry_fdv = (
+                    f"${pos.entry_fdv_usd:,.0f}"
+                    if pos.entry_fdv_usd is not None
+                    else "?"
+                )
+                console.print(
+                    f"[dim]cost={pos.cost_sol:.4f} SOL  "
+                    f"avg entry FDV={entry_fdv}[/dim]"
+                )
+            console.print(format_watch_line(tick, pos))
             return
 
-        console.print("[dim]Helius WS vault subscribe (ctrl+c to stop)…[/dim]")
-
-        async def _run_ws() -> None:
-            first = True
-            async for tick in aiter_price_ticks_ws(rpc, mint):
-                _print_tick(tick, first=first)
-                first = False
-
-        asyncio.run(_run_ws())
+        run_inline_watch(rpc, mint, console, position=pos)
     except KeyboardInterrupt:
         console.print("\n[dim]stopped watching[/dim]")
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]watch failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+
+def _require_helius() -> tuple:
+    """settings + rpc, or exit if no key."""
+    import logging
+
+    from archetype.filters.helius import HeliusRpc
+
+    settings = get_settings()
+    if not settings.helius_api_key.strip():
+        console.print("[red]ARCHETYPE_HELIUS_API_KEY not set[/red]")
+        raise typer.Exit(code=1)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    return settings, HeliusRpc(settings.helius_api_key)
+
+
+@app.command("buy")
+def buy_cmd(
+    mint: str = typer.Argument(..., help="token mint to buy"),
+    sol: float = typer.Argument(..., help="SOL to spend (paper)"),
+    no_track: bool = typer.Option(
+        False,
+        "--no-track",
+        help="skip live watch after fill",
+    ),
+) -> None:
+    """paper-buy at current PumpSwap price, then live inline FDV/PnL."""
+    from archetype.execution import buy, run_inline_watch
+
+    settings, rpc = _require_helius()
+    ledger = settings.resolved_trading_ledger_db()
+    mint = mint.strip()
+
+    try:
+        fill = buy(ledger, rpc, mint, sol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]buy failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    label = fill.symbol or fill.name or mint[:8]
+    console.print(
+        f"[green]BOUGHT[/green] {label}  "
+        f"spent={fill.sol:.4f} SOL  tokens={fill.tokens:,.4f}  "
+        f"@ {fill.price_sol:.10g} SOL  FDV=${fill.fdv_usd:,.0f}"
+    )
+    entry_fdv = (
+        f"${fill.position.entry_fdv_usd:,.0f}"
+        if fill.position.entry_fdv_usd is not None
+        else "?"
+    )
+    console.print(
+        f"[dim]wallet={fill.wallet_sol:.4f} SOL  "
+        f"position cost={fill.position.cost_sol:.4f} SOL  "
+        f"avg entry FDV={entry_fdv}[/dim]"
+    )
+    if not no_track and fill.position is not None:
+        run_inline_watch(rpc, mint, console, position=fill.position)
+
+
+@app.command("sell")
+def sell_cmd(
+    mint: str = typer.Argument(..., help="token mint to sell (full position)"),
+) -> None:
+    """paper-sell full open position at current PumpSwap price."""
+    from archetype.execution import sell
+
+    settings, rpc = _require_helius()
+    ledger = settings.resolved_trading_ledger_db()
+    mint = mint.strip()
+
+    try:
+        fill = sell(ledger, rpc, mint)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]sell failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    label = fill.symbol or fill.name or mint[:8]
+    pnl = fill.pnl_sol or 0.0
+    pct = fill.pnl_pct or 0.0
+    color = "green" if pnl >= 0 else "red"
+    sign = "+" if pnl >= 0 else ""
+    console.print(
+        f"[{color}]SOLD[/{color}] {label}  "
+        f"proceeds={fill.sol:.4f} SOL  "
+        f"PnL={sign}{pnl:.4f} SOL ({sign}{pct:.2f}%)  "
+        f"@ {fill.price_sol:.10g} SOL  FDV=${fill.fdv_usd:,.0f}"
+    )
+    console.print(f"[dim]wallet={fill.wallet_sol:.4f} SOL[/dim]")
+
+
+balance_app = typer.Typer(
+    help="mock SOL wallet + open positions",
+    no_args_is_help=False,
+)
+app.add_typer(balance_app, name="balance")
+
+
+@balance_app.callback(invoke_without_command=True)
+def balance_cmd(ctx: typer.Context) -> None:
+    """show cash SOL + open positions (one-shot price marks)."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    from archetype.execution import get_balance, list_positions, mark_position
+
+    settings, rpc = _require_helius()
+    ledger = settings.resolved_trading_ledger_db()
+    cash = get_balance(ledger)
+    positions = list_positions(ledger)
+
+    console.print(f"[bold]paper wallet[/bold]  cash=[cyan]{cash:.4f} SOL[/cyan]")
+    if not positions:
+        console.print("[dim]no open positions[/dim]")
+        return
+
+    table = Table(title="Open positions")
+    table.add_column("symbol")
+    table.add_column("name")
+    table.add_column("mint")
+    table.add_column("value SOL", justify="right")
+    table.add_column("PnL %", justify="right")
+    table.add_column("cost SOL", justify="right")
+    table.add_column("FDV$", justify="right")
+
+    for pos in positions:
+        try:
+            mark = mark_position(rpc, pos)
+            pnl_s = f"{mark.pnl_pct:+.2f}%"
+            table.add_row(
+                mark.symbol or pos.symbol or "?",
+                (mark.name or pos.name or "")[:20],
+                pos.mint,
+                f"{mark.value_sol:.4f}",
+                pnl_s,
+                f"{pos.cost_sol:.4f}",
+                f"{mark.fdv_usd:,.0f}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            table.add_row(
+                pos.symbol or "?",
+                (pos.name or "")[:20],
+                pos.mint,
+                "?",
+                f"[red]err[/red]",
+                f"{pos.cost_sol:.4f}",
+                "?",
+            )
+            console.print(f"[yellow]mark failed {pos.mint[:8]}…:[/yellow] {exc}")
+
+    console.print(table)
+
+
+@balance_app.command("add")
+def balance_add_cmd(
+    sol: float = typer.Argument(..., help="SOL to add to paper wallet"),
+) -> None:
+    """add mock SOL to the paper wallet."""
+    from archetype.execution import add_sol
+
+    settings = get_settings()
+    ledger = settings.resolved_trading_ledger_db()
+    try:
+        new_bal = add_sol(ledger, sol)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]add failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]added[/green] {sol:.4f} SOL → balance={new_bal:.4f} SOL")
+
+
+@balance_app.command("reset")
+def balance_reset_cmd(
+    start: float = typer.Option(
+        100.0,
+        "--start",
+        help="SOL balance after reset (also clears open positions)",
+    ),
+) -> None:
+    """reset paper wallet to starting SOL and clear open positions."""
+    from archetype.execution import reset_wallet
+
+    settings = get_settings()
+    ledger = settings.resolved_trading_ledger_db()
+    new_bal = reset_wallet(ledger, start_sol=start)
+    console.print(
+        f"[green]reset[/green] wallet → {new_bal:.4f} SOL "
+        f"(open positions cleared)"
+    )
 
 
 @app.command("stop")

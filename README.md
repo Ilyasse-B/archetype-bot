@@ -4,7 +4,7 @@ Local Solana memecoin trading agent (paper-first). Design docs live in `docs/`.
 
 ## Phase 3 (in progress)
 
-Live PumpSwap price watch; paper wallet / TP-SL next.
+Live PumpSwap FDV via Helius WS; paper wallet + buy/sell with inline PnL.
 
 ### Setup
 
@@ -26,8 +26,17 @@ uv run archetype status
 uv run archetype migrations              # RAW unfiltered
 uv run archetype migrations --filtered   # PASS only
 uv run archetype backlog                 # pending agent queue
-uv run archetype watch <MINT>            # live FDV via Helius WS
+uv run archetype watch <MINT>            # live FDV (+ PnL if you hold it)
 uv run archetype watch <MINT> --once     # one snapshot
+
+# paper wallet
+uv run archetype balance                 # cash + open positions
+uv run archetype balance add 50
+uv run archetype balance reset           # back to 100 SOL, clear positions
+uv run archetype buy <MINT> 5            # paper buy → live watch w/ PnL
+uv run archetype buy <MINT> 5 --no-track # fill only
+uv run archetype sell <MINT>             # full exit
+
 uv run archetype stop
 ```
 
