@@ -80,6 +80,9 @@ def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
         ),
         "market_cap_usd": metrics.get("market_cap_usd"),
         "estimated_global_fees_sol": metrics.get("estimated_global_fees_sol"),
+        # true when vault estimate is under the soft bar (still passed hard floor)
+        "fees_check_needed": bool(metrics.get("fees_check_needed")),
+        "fees_warn_below_sol": metrics.get("fees_warn_below_sol"),
         "pool_sol_at_migrate": metrics.get("pool_sol_at_migrate"),
         "socials_present": metrics.get("socials_present") or meta.get("socials_present"),
         "twitter": meta.get("twitter"),

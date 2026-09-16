@@ -62,11 +62,14 @@ def run_full_filters(
         log.info("FILTER REJECT %s — %s", event.mint, reason)
         return result
 
+    fees = float(result.metrics.get("estimated_global_fees_sol") or 0)
+    fees_note = " fees=CHECK" if result.metrics.get("fees_check_needed") else ""
     log.info(
-        "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL socials=%s name=%s",
+        "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL%s socials=%s name=%s",
         event.mint,
         float(result.metrics.get("market_cap_usd") or 0),
-        float(result.metrics.get("estimated_global_fees_sol") or 0),
+        fees,
+        fees_note,
         ",".join(gate.socials_present) or "-",
         (meta.name or "?")[:32],
     )

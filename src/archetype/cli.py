@@ -326,7 +326,11 @@ def migrations_cmd(
                 if mcap is not None:
                     extra += f" mcap=${mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
                 if fees is not None:
-                    extra += f" fees~{fees:.2f}SOL" if isinstance(fees, (int, float)) else ""
+                    if isinstance(fees, (int, float)):
+                        if metrics.get("fees_check_needed") or fees < 2.25:
+                            extra += f" [yellow]fees~{fees:.2f}SOL CHECK[/yellow]"
+                        else:
+                            extra += f" fees~{fees:.2f}SOL"
                 console.print(
                     f"[green]{ts}[/green] #{m.get('id')} {tag} mint={mint}{extra}"
                     + (f" — {reason_s}" if reason_s and passed is False else "")

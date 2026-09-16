@@ -285,11 +285,12 @@ def run_onchain_filters(
 
         vault_addr = creator_vault_pda(curve.creator)
         share = max(thresholds.creator_fee_share, 0.05)
+        # early-exit poll once we clear the "looks good" bar (not the hard floor)
         vault_sol, estimated_fees_sol, fee_samples = _poll_creator_fees(
             rpc,
             vault_addr,
             share=share,
-            min_fees=thresholds.min_global_fees_sol,
+            min_fees=thresholds.fees_warn_below_sol,
             timeout_sec=thresholds.fees_poll_sec,
             interval_sec=thresholds.fees_poll_interval_sec,
         )
@@ -299,6 +300,10 @@ def run_onchain_filters(
         result.metrics["fees_method"] = (
             "creator_vault / creator_fee_share (polled post-migrate, best-effort)"
         )
+        # soft band: pass but tell agent/--trade to double-check
+        fees_check = estimated_fees_sol < thresholds.fees_warn_below_sol
+        result.metrics["fees_check_needed"] = fees_check
+        result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
 
         if estimated_fees_sol < thresholds.min_global_fees_sol:
             result.fail(
@@ -454,11 +459,14 @@ def _done(
         log_filter_reject(ledger_path, result.mint, reason)
         log.info("FILTER REJECT %s — %s", result.mint, reason)
     else:
+        fees = float(result.metrics.get("estimated_global_fees_sol") or 0)
+        fees_note = " fees=CHECK" if result.metrics.get("fees_check_needed") else ""
         log.info(
-            "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL pool=%.2fSOL",
+            "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL%s pool=%.2fSOL",
             result.mint,
             float(result.metrics.get("market_cap_usd") or 0),
-            float(result.metrics.get("estimated_global_fees_sol") or 0),
+            fees,
+            fees_note,
             float(result.metrics.get("pool_sol_at_migrate") or 0),
         )
     return result

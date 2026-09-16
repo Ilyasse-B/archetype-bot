@@ -91,6 +91,12 @@ def _print_candidate(console: Console, item: BacklogItem, pending: int) -> None:
     info = item.coin_info or {}
     mcap = info.get("market_cap_usd")
     fees = info.get("estimated_global_fees_sol")
+    warn_bar = info.get("fees_warn_below_sol")
+    warn_bar_f = float(warn_bar) if isinstance(warn_bar, (int, float)) else 2.25
+    # prefer explicit flag from filter; else infer for older backlog rows
+    fees_check = bool(info.get("fees_check_needed"))
+    if not fees_check and isinstance(fees, (int, float)):
+        fees_check = fees < warn_bar_f
     socials = ",".join(info.get("socials_present") or []) or "—"
     bits = [
         f"[bold]#{item.id}[/bold] {_coin_label(item)}",
@@ -100,10 +106,20 @@ def _print_candidate(console: Console, item: BacklogItem, pending: int) -> None:
     if isinstance(mcap, (int, float)):
         bits.append(f"mcap=${mcap:,.0f}")
     if isinstance(fees, (int, float)):
-        bits.append(f"fees~{fees:.2f} SOL")
+        if fees_check:
+            bits.append(f"[yellow bold]fees~{fees:.2f} SOL · CHECK[/yellow bold]")
+        else:
+            bits.append(f"fees~{fees:.2f} SOL")
+    elif fees_check:
+        bits.append("[yellow bold]fees=? · CHECK[/yellow bold]")
     console.print()
     console.rule(f"[cyan]candidate[/cyan]  backlog pending={pending}")
     console.print("  ".join(bits))
+    if fees_check:
+        console.print(
+            f"[yellow]⚠ fees estimate under {warn_bar_f:.2f} SOL "
+            f"(vault proxy can under-read vs Axiom) — verify before buying[/yellow]"
+        )
     if info.get("twitter"):
         console.print(f"[dim]twitter={info['twitter']}[/dim]")
     if info.get("telegram"):
