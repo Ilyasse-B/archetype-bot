@@ -121,6 +121,8 @@ def buy(
         else:
             entry_fdv = tick.fdv_usd
         initial_cost = existing.initial_cost_sol
+        bought_sol = existing.bought_sol + size_sol
+        sold_sol = existing.sold_sol
     else:
         new_tokens = tokens_bought
         new_cost = size_sol
@@ -129,6 +131,8 @@ def buy(
         symbol = tick.symbol
         entry_fdv = tick.fdv_usd
         initial_cost = size_sol
+        bought_sol = size_sol
+        sold_sol = 0.0
 
     new_bal = set_balance(ledger_path, bal - size_sol)
     pos = upsert_position(
@@ -142,6 +146,8 @@ def buy(
         entry_fdv_usd=entry_fdv,
         initial_cost_sol=initial_cost,
         pool=tick.pool,
+        bought_sol=bought_sol,
+        sold_sol=sold_sol,
     )
     return FillResult(
         side="buy",
@@ -296,6 +302,8 @@ def sell(
             entry_fdv_usd=pos.entry_fdv_usd,
             initial_cost_sol=max(0.0, new_initial),
             pool=tick.pool or pos.pool,
+            bought_sol=pos.bought_sol,  # never shrinks on sell
+            sold_sol=pos.sold_sol + proceeds,
         )
         record_closed_trade(
             ledger_path,

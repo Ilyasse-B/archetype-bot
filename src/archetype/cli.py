@@ -100,6 +100,8 @@ def _position_from_api(data: dict | None):
         opened_at=str(data.get("opened_at") or ""),
         initial_cost_sol=float(data.get("initial_cost_sol") or 0),
         pool=data.get("pool"),
+        bought_sol=float(data.get("bought_sol") or data.get("cost_sol") or 0),
+        sold_sol=float(data.get("sold_sol") or 0),
     )
 
 
@@ -368,7 +370,7 @@ def watch_cmd(
     """
     import logging
 
-    from archetype.execution import format_watch_line, run_inline_watch
+    from archetype.execution import format_position_header, format_watch_line, run_inline_watch
     from archetype.filters.helius import HeliusRpc
     from archetype.price import fetch_price_tick
 
@@ -414,15 +416,7 @@ def watch_cmd(
                 + ("  [position]" if pos else "")
             )
             if pos is not None:
-                entry_fdv = (
-                    f"${pos.entry_fdv_usd:,.0f}"
-                    if pos.entry_fdv_usd is not None
-                    else "?"
-                )
-                console.print(
-                    f"[dim]cost={pos.cost_sol:.4f} SOL  "
-                    f"avg entry FDV={entry_fdv}[/dim]"
-                )
+                console.print(format_position_header(pos))
             console.print(format_watch_line(tick, pos))
             return
 
@@ -453,7 +447,7 @@ def buy_cmd(
     """paper-buy via daemon, then optional local live FDV/PnL watch."""
     import logging
 
-    from archetype.execution import run_inline_watch
+    from archetype.execution import format_position_header, run_inline_watch
     from archetype.filters.helius import HeliusRpc
 
     mint = mint.strip()
@@ -471,17 +465,11 @@ def buy_cmd(
         f"FDV=${float(fill.get('fdv_usd') or 0):,.0f}"
     )
     pos = _position_from_api(fill.get("position"))
-    entry_fdv = (
-        f"${pos.entry_fdv_usd:,.0f}"
-        if pos is not None and pos.entry_fdv_usd is not None
-        else "?"
-    )
-    cost = pos.cost_sol if pos else 0.0
     console.print(
-        f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL  "
-        f"position cost={cost:.4f} SOL  "
-        f"avg entry FDV={entry_fdv}[/dim]"
+        f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL[/dim]"
     )
+    if pos is not None:
+        console.print(format_position_header(pos))
 
     if not no_track and pos is not None:
         settings = get_settings()
@@ -572,10 +560,13 @@ def sell_cmd(
     )
     pos = fill.get("position")
     if pos:
+        bought = float(pos.get("bought_sol") or pos.get("cost_sol") or 0)
+        sold = float(pos.get("sold_sol") or 0)
+        sold_bit = f"  sold={sold:.4f} SOL" if sold > 1e-9 else ""
         console.print(
             f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL  "
-            f"remaining cost={float(pos.get('cost_sol') or 0):.4f} SOL  "
-            f"tokens={float(pos.get('tokens') or 0):,.4f}[/dim]"
+            f"bought={bought:.4f} SOL{sold_bit}  "
+            f"tokens left={float(pos.get('tokens') or 0):,.4f}[/dim]"
         )
     else:
         console.print(
@@ -612,19 +603,22 @@ def balance_cmd(ctx: typer.Context) -> None:
     table.add_column("symbol")
     table.add_column("name")
     table.add_column("mint")
+    table.add_column("bought SOL", justify="right")
+    table.add_column("sold SOL", justify="right")
     table.add_column("value SOL", justify="right")
     table.add_column("PnL %", justify="right")
-    table.add_column("cost SOL", justify="right")
     table.add_column("FDV$", justify="right")
 
     for p in positions:
+        sold = float(p.get("sold_sol") or 0)
         table.add_row(
             p.get("symbol") or "?",
             (p.get("name") or "")[:20],
             str(p.get("mint") or ""),
+            f"{float(p.get('bought_sol') or p.get('cost_sol') or 0):.4f}",
+            f"{sold:.4f}" if sold > 1e-9 else "—",
             f"{float(p.get('value_sol') or 0):.4f}",
             f"{float(p.get('pnl_pct') or 0):+.2f}%",
-            f"{float(p.get('cost_sol') or 0):.4f}",
             f"{float(p.get('fdv_usd') or 0):,.0f}",
         )
 

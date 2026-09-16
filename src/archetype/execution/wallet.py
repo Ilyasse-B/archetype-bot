@@ -27,6 +27,7 @@ class Position:
     name: str | None
     symbol: str | None
     tokens: float
+    # remaining cost basis (for unrealized pnl on leftover tokens)
     cost_sol: float
     entry_price_sol: float
     entry_fdv_usd: float | None
@@ -35,6 +36,9 @@ class Position:
     initial_cost_sol: float = 0.0
     # pumpswap pool address (helps skip holder-scan resolve)
     pool: str | None = None
+    # lifetime on this open row: total SOL spent / total SOL proceeds sold
+    bought_sol: float = 0.0
+    sold_sol: float = 0.0
 
     @property
     def label(self) -> str:
@@ -64,6 +68,8 @@ def ensure_wallet(ledger_path: Path, *, start_sol: float = DEFAULT_START_SOL) ->
                 entry_fdv_usd REAL,
                 initial_cost_sol REAL NOT NULL DEFAULT 0,
                 pool TEXT,
+                bought_sol REAL NOT NULL DEFAULT 0,
+                sold_sol REAL NOT NULL DEFAULT 0,
                 opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -97,6 +103,19 @@ def _migrate_positions(conn: sqlite3.Connection) -> None:
         )
     if "pool" not in cols:
         conn.execute("ALTER TABLE paper_positions ADD COLUMN pool TEXT")
+    if "bought_sol" not in cols:
+        conn.execute(
+            "ALTER TABLE paper_positions ADD COLUMN bought_sol REAL NOT NULL DEFAULT 0"
+        )
+        # old rows: treat remaining cost as the bought size we know about
+        conn.execute(
+            "UPDATE paper_positions SET bought_sol = cost_sol "
+            "WHERE bought_sol IS NULL OR bought_sol = 0"
+        )
+    if "sold_sol" not in cols:
+        conn.execute(
+            "ALTER TABLE paper_positions ADD COLUMN sold_sol REAL NOT NULL DEFAULT 0"
+        )
 
 
 def get_balance(ledger_path: Path) -> float:
@@ -145,7 +164,8 @@ def reset_wallet(
 
 _POS_COLS = (
     "id, mint, name, symbol, tokens, cost_sol, "
-    "entry_price_sol, entry_fdv_usd, initial_cost_sol, pool, opened_at"
+    "entry_price_sol, entry_fdv_usd, initial_cost_sol, pool, "
+    "bought_sol, sold_sol, opened_at"
 )
 
 
@@ -184,22 +204,36 @@ def upsert_position(
     entry_fdv_usd: float | None,
     initial_cost_sol: float,
     pool: str | None = None,
+    bought_sol: float | None = None,
+    sold_sol: float | None = None,
 ) -> Position:
     """insert or replace open position for mint."""
     ensure_wallet(ledger_path)
     with sqlite3.connect(ledger_path) as conn:
         conn.row_factory = sqlite3.Row
         existing = conn.execute(
-            "SELECT id, pool FROM paper_positions WHERE mint = ?", (mint,)
+            "SELECT id, pool, bought_sol, sold_sol FROM paper_positions WHERE mint = ?",
+            (mint,),
         ).fetchone()
         pool_val = pool or (existing["pool"] if existing else None)
         if existing:
+            bought_val = (
+                float(bought_sol)
+                if bought_sol is not None
+                else float(existing["bought_sol"] or 0)
+            )
+            sold_val = (
+                float(sold_sol)
+                if sold_sol is not None
+                else float(existing["sold_sol"] or 0)
+            )
             conn.execute(
                 """
                 UPDATE paper_positions SET
                     name = ?, symbol = ?, tokens = ?, cost_sol = ?,
                     entry_price_sol = ?, entry_fdv_usd = ?,
-                    initial_cost_sol = ?, pool = ?
+                    initial_cost_sol = ?, pool = ?,
+                    bought_sol = ?, sold_sol = ?
                 WHERE mint = ?
                 """,
                 (
@@ -211,16 +245,21 @@ def upsert_position(
                     entry_fdv_usd,
                     float(initial_cost_sol),
                     pool_val,
+                    bought_val,
+                    sold_val,
                     mint,
                 ),
             )
         else:
+            bought_val = float(bought_sol if bought_sol is not None else cost_sol)
+            sold_val = float(sold_sol if sold_sol is not None else 0.0)
             conn.execute(
                 """
                 INSERT INTO paper_positions
                     (mint, name, symbol, tokens, cost_sol,
-                     entry_price_sol, entry_fdv_usd, initial_cost_sol, pool)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_price_sol, entry_fdv_usd, initial_cost_sol, pool,
+                     bought_sol, sold_sol)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mint,
@@ -232,6 +271,8 @@ def upsert_position(
                     entry_fdv_usd,
                     float(initial_cost_sol),
                     pool_val,
+                    bought_val,
+                    sold_val,
                 ),
             )
         conn.commit()
@@ -312,6 +353,12 @@ def _row_to_pos(row: sqlite3.Row) -> Position:
     if initial is None:
         initial = row["cost_sol"]
     pool = row["pool"] if "pool" in keys else None
+    bought = row["bought_sol"] if "bought_sol" in keys else None
+    sold = row["sold_sol"] if "sold_sol" in keys else None
+    if bought is None:
+        bought = row["cost_sol"]
+    if sold is None:
+        sold = 0.0
     return Position(
         id=int(row["id"]),
         mint=str(row["mint"]),
@@ -328,4 +375,6 @@ def _row_to_pos(row: sqlite3.Row) -> Position:
         opened_at=str(row["opened_at"]),
         initial_cost_sol=float(initial),
         pool=str(pool) if pool else None,
+        bought_sol=float(bought),
+        sold_sol=float(sold),
     )

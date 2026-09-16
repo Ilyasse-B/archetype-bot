@@ -8,7 +8,7 @@ from archetype.execution.fills import (
     mark_position,
     sell,
 )
-from archetype.execution.track import format_watch_line, run_inline_pnl, run_inline_watch
+from archetype.execution.track import format_position_header, format_watch_line, run_inline_pnl, run_inline_watch
 from archetype.execution.wallet import (
     DEFAULT_START_SOL,
     Position,
@@ -28,6 +28,7 @@ __all__ = [
     "add_sol",
     "buy",
     "ensure_wallet",
+    "format_position_header",
     "format_watch_line",
     "get_balance",
     "get_position",

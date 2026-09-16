@@ -19,6 +19,20 @@ from archetype.price.resolve import ResolvedPool
 from archetype.price.stream import aiter_price_ticks_ws
 
 
+def format_position_header(pos: Position) -> str:
+    """watch header: original bought + sold-so-far (omit sold if none)."""
+    entry_fdv = (
+        f"${pos.entry_fdv_usd:,.0f}" if pos.entry_fdv_usd is not None else "?"
+    )
+    bought = pos.bought_sol if pos.bought_sol > 0 else pos.cost_sol
+    bits = [f"bought={bought:.4f} SOL"]
+    if pos.sold_sol > 1e-9:
+        bits.append(f"sold={pos.sold_sol:.4f} SOL")
+    bits.append(f"avg entry FDV={entry_fdv}")
+    bits.append(f"tokens left={pos.tokens:,.4f}")
+    return "[dim]" + "  ".join(bits) + "[/dim]"
+
+
 def format_watch_line(tick: PriceTick, pos: Position | None = None) -> Text:
     """one rich line — FDV always; PnL when we hold a paper position."""
     ts = datetime.now().strftime("%H:%M:%S")
@@ -30,8 +44,10 @@ def format_watch_line(tick: PriceTick, pos: Position | None = None) -> Text:
     t.append(f"price={tick.price_sol:.10g} SOL  ")
     if pos is not None:
         value_sol = pos.tokens * tick.price_sol
-        pnl_sol = value_sol - pos.cost_sol
-        pnl_pct = (pnl_sol / pos.cost_sol * 100.0) if pos.cost_sol > 0 else 0.0
+        # unrealized on leftover bags (remaining cost basis)
+        basis = pos.cost_sol
+        pnl_sol = value_sol - basis
+        pnl_pct = (pnl_sol / basis * 100.0) if basis > 0 else 0.0
         color = "green" if pnl_sol >= 0 else "red"
         sign = "+" if pnl_sol >= 0 else ""
         t.append(f"value={value_sol:.4f} SOL  ")
@@ -80,16 +96,7 @@ async def _watch_loop(
                     f"mint={mint}  [ws]"
                 ]
                 if pos is not None:
-                    entry_fdv = (
-                        f"${pos.entry_fdv_usd:,.0f}"
-                        if pos.entry_fdv_usd is not None
-                        else "?"
-                    )
-                    bits.append(
-                        f"[dim]position cost={pos.cost_sol:.4f} SOL  "
-                        f"avg entry FDV={entry_fdv}  "
-                        f"tokens={pos.tokens:,.4f}[/dim]"
-                    )
+                    bits.append(format_position_header(pos))
                 else:
                     bits.append(
                         f"[dim]pool={tick.pool}  "
