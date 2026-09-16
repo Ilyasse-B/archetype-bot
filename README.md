@@ -28,7 +28,6 @@ uv run archetype migrations --filtered   # PASS only
 uv run archetype backlog                 # pending agent queue
 uv run archetype watch <MINT>            # live FDV via Helius WS
 uv run archetype watch <MINT> --once     # one snapshot
-uv run archetype watch <MINT> --poll -i 1  # RPC poll fallback
 uv run archetype stop
 ```
 

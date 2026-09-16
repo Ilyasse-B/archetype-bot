@@ -1,15 +1,14 @@
 """
-live price stream — helius accountSubscribe on pool vaults (fast path),
-with optional RPC poll fallback.
+live price stream — helius accountSubscribe on pool vaults.
+emits a tick only when vault reserves change (trade-driven).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 import websockets
@@ -23,51 +22,15 @@ from archetype.price.snapshot import fetch_price_tick
 log = logging.getLogger("archetype.price")
 
 
-def iter_price_ticks(
-    rpc: HeliusRpc,
-    mint: str,
-    *,
-    interval_sec: float = 1.0,
-    refresh_sol_every: int = 30,
-) -> Iterator[PriceTick]:
-    """RPC poll loop (fallback)."""
-    resolved = resolve_pumpswap_pool(rpc, mint)
-    log.info(
-        "watching (poll) %s pool=%s name=%s",
-        mint,
-        resolved.pool.address,
-        resolved.name or "?",
-    )
-    sol_usd = get_sol_usd(rpc)
-    n = 0
-    while True:
-        if n > 0 and n % max(1, refresh_sol_every) == 0:
-            try:
-                sol_usd = get_sol_usd(rpc)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("sol usd refresh failed: %s", exc)
-        try:
-            tick = fetch_price_tick(
-                rpc, mint, resolved=resolved, sol_usd=sol_usd, source="rpc"
-            )
-            yield tick
-        except Exception as exc:  # noqa: BLE001
-            log.warning("price tick failed: %s", exc)
-        n += 1
-        time.sleep(max(0.2, interval_sec))
-
-
 async def aiter_price_ticks_ws(
     rpc: HeliusRpc,
     mint: str,
     *,
-    heartbeat_sec: float = 2.0,
     sol_refresh_sec: float = 30.0,
 ) -> AsyncIterator[PriceTick]:
     """
     subscribe to base + quote vault ATAs; emit a tick on every reserve change.
-
-    also heartbeats every heartbeat_sec so the CLI isn't silent between trades.
+    no heartbeat — silence just means price hasn't moved.
     """
     if not rpc.enabled:
         raise RuntimeError("ARCHETYPE_HELIUS_API_KEY not set")
@@ -120,39 +83,10 @@ async def aiter_price_ticks_ws(
             sub_to_kind[mid] = kind
 
         id_to_kind: dict[int, str] = {}
-        last_emit = time.monotonic()
         last_sol = time.monotonic()
 
         while True:
-            timeout = max(0.2, heartbeat_sec)
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            except TimeoutError:
-                # heartbeat — refresh sol occasionally, re-emit from cached reserves
-                now = time.monotonic()
-                if now - last_sol >= sol_refresh_sec:
-                    try:
-                        sol_usd = get_sol_usd(rpc)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("sol usd refresh failed: %s", exc)
-                    last_sol = now
-                try:
-                    yield build_tick(
-                        mint=mint,
-                        pool=pool.address,
-                        base_ui=base_ui,
-                        quote_sol=quote_sol,
-                        supply_ui=resolved.supply_ui,
-                        decimals=resolved.decimals,
-                        sol_usd=sol_usd,
-                        name=resolved.name,
-                        symbol=resolved.symbol,
-                        source="ws-heartbeat",
-                    )
-                    last_emit = time.monotonic()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("heartbeat tick failed: %s", exc)
-                continue
+            raw = await ws.recv()
 
             try:
                 msg: dict[str, Any] = json.loads(raw)
@@ -206,7 +140,6 @@ async def aiter_price_ticks_ws(
                     slot=int(slot) if slot is not None else None,
                     source="ws",
                 )
-                last_emit = time.monotonic()
             except Exception as exc:  # noqa: BLE001
                 log.warning("ws tick failed: %s", exc)
 

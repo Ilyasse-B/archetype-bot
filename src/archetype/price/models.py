@@ -77,7 +77,7 @@ def build_tick(
     source: str = "rpc",
     fdv_supply: float = PUMP_FDV_SUPPLY,
 ) -> PriceTick:
-    """shared math for poll + websocket paths."""
+    """shared math for websocket / snapshot paths."""
     if base_ui <= 0:
         raise ValueError("pool base reserve is zero")
     price_sol = quote_sol / base_ui

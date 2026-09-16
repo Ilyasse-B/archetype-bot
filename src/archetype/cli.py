@@ -302,33 +302,22 @@ def backlog_cmd(
 @app.command("watch")
 def watch_cmd(
     mint: str = typer.Argument(..., help="token mint address to watch"),
-    interval: float = typer.Option(
-        2.0,
-        "--interval",
-        "-i",
-        help="heartbeat / poll interval seconds (ws default heartbeat)",
-    ),
     once: bool = typer.Option(
         False,
         "--once",
         help="print one snapshot and exit",
     ),
-    poll: bool = typer.Option(
-        False,
-        "--poll",
-        help="use RPC polling instead of Helius websocket",
-    ),
 ) -> None:
     """
-    stream live PumpSwap price / FDV for a mint (no daemon needed).
+    stream live PumpSwap FDV for a mint (no daemon needed).
 
-    FDV = price × 1B (axiom-style). default = websocket vault subscribe.
+    FDV = price × 1B (axiom-style). ticks only on vault changes via Helius WS.
     """
     import asyncio
     import logging
 
     from archetype.filters.helius import HeliusRpc
-    from archetype.price import aiter_price_ticks_ws, fetch_price_tick, iter_price_ticks
+    from archetype.price import aiter_price_ticks_ws, fetch_price_tick
 
     settings = get_settings()
     if not settings.helius_api_key.strip():
@@ -345,20 +334,16 @@ def watch_cmd(
         ts = datetime.now().strftime("%H:%M:%S")
         label = tick.name or tick.symbol or mint[:8]
         if first:
-            mode = "ws" if not poll else "poll"
             console.print(
-                f"[bold]watching[/bold] {label}  mint={mint}  [{mode}]\n"
+                f"[bold]watching[/bold] {label}  mint={mint}  [ws]\n"
                 f"[dim]pool={tick.pool}  FDV supply={tick.fdv_supply:,.0f}  "
                 f"SOL=${tick.sol_usd:,.2f}[/dim]"
             )
-        src = getattr(tick, "source", "") or ""
-        tag = f" [dim]{src}[/dim]" if src.startswith("ws") else ""
         console.print(
             f"[green]{ts}[/green]  "
             f"FDV=[bold cyan]${tick.fdv_usd:,.0f}[/bold cyan]  "
             f"price={tick.price_sol:.10g} SOL (${tick.price_usd:.8g})  "
             f"pool={tick.pool_sol:.2f} SOL / {tick.pool_base_ui:,.0f} tok"
-            f"{tag}"
         )
 
     try:
@@ -367,26 +352,11 @@ def watch_cmd(
             _print_tick(tick, first=True)
             return
 
-        if poll:
-            console.print(
-                f"[dim]RPC poll every {interval:.1f}s (ctrl+c to stop)…[/dim]"
-            )
-            first = True
-            for tick in iter_price_ticks(rpc, mint, interval_sec=interval):
-                _print_tick(tick, first=first)
-                first = False
-            return
-
-        console.print(
-            f"[dim]Helius WS vault subscribe + {interval:.1f}s heartbeat "
-            f"(ctrl+c to stop)…[/dim]"
-        )
+        console.print("[dim]Helius WS vault subscribe (ctrl+c to stop)…[/dim]")
 
         async def _run_ws() -> None:
             first = True
-            async for tick in aiter_price_ticks_ws(
-                rpc, mint, heartbeat_sec=interval
-            ):
+            async for tick in aiter_price_ticks_ws(rpc, mint):
                 _print_tick(tick, first=first)
                 first = False
 
