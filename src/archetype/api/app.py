@@ -16,12 +16,14 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 
 from archetype import __version__
+from archetype.api.paper import create_paper_router
 from archetype.backlog import dequeue_fifo, enqueue_passed, list_pending, pending_count
 from archetype.config import Settings, get_settings
 from archetype.db import db_exists_and_ok
 from archetype.filters import run_full_filters
 from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
+from archetype.execution import ensure_wallet
 
 
 class StatusResponse(BaseModel):
@@ -100,9 +102,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # ensure paper wallet tables exist
+        await asyncio.to_thread(ensure_wallet, ledger)
         await feed.start()
         yield
         await feed.stop()
+        rpc.close()
 
     app = FastAPI(title="Archetype Agent", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -110,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.migration_buffer = buffer
     app.state.pumpportal_feed = feed
     app.state.helius_rpc = rpc
+    app.include_router(create_paper_router())
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -127,11 +133,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         pp_ok = bool(s.pumpportal_api_key.strip())
         helius_ok = bool(s.helius_api_key.strip())
         ok = active_ok and ledger_ok
-        msg = "daemon up; migrations + filters + backlog active"
+        msg = "daemon up; migrations + filters + backlog + paper wallet"
         if not pp_ok:
             msg = "daemon up; pumpportal key missing"
         elif not helius_ok:
-            msg = "daemon up; helius key missing — raw feed only (no filters)"
+            msg = "daemon up; helius key missing — raw feed only (no filters/paper)"
         elif not feed_status.get("connected"):
             msg = "daemon up; connecting to pumpportal…"
         return StatusResponse(
@@ -144,7 +150,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             trading_ledger_db=str(ledger_p),
             active_context_ok=active_ok,
             trading_ledger_ok=ledger_ok,
-            phase="2-backlog",
+            phase="3-paper",
             message=msg,
             server_time=datetime.now(timezone.utc).isoformat(),
             pumpportal_configured=pp_ok,

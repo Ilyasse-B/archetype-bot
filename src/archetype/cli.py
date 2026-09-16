@@ -50,6 +50,59 @@ def _get(path: str, timeout: float = 5.0) -> httpx.Response:
         raise typer.Exit(code=1) from None
 
 
+def _post(path: str, json: dict | None = None, timeout: float = 60.0) -> httpx.Response:
+    """POST against the local daemon; exit nicely if its down."""
+    settings = get_settings()
+    url = f"{settings.base_url}{path}"
+    try:
+        return httpx.post(url, json=json or {}, timeout=timeout)
+    except httpx.ConnectError:
+        console.print(
+            f"[red]daemon not reachable at {settings.base_url}[/red]\n"
+            "start it with: [bold]uv run python -m archetype.daemon[/bold]"
+        )
+        raise typer.Exit(code=1) from None
+    except httpx.HTTPError as exc:
+        console.print(f"[red]request failed:[/red] {exc}")
+        raise typer.Exit(code=1) from None
+
+
+def _api_error(resp: httpx.Response, label: str) -> None:
+    """print fastapi error detail and exit."""
+    detail = ""
+    try:
+        detail = str(resp.json().get("detail") or resp.text)
+    except Exception:  # noqa: BLE001
+        detail = resp.text
+    console.print(f"[red]{label}:[/red] {detail}")
+    raise typer.Exit(code=1)
+
+
+def _position_from_api(data: dict | None):
+    """rebuild Position from daemon JSON (for local watch PnL)."""
+    if not data:
+        return None
+    from archetype.execution.wallet import Position
+
+    return Position(
+        id=int(data.get("id") or 0),
+        mint=str(data["mint"]),
+        name=data.get("name"),
+        symbol=data.get("symbol"),
+        tokens=float(data["tokens"]),
+        cost_sol=float(data["cost_sol"]),
+        entry_price_sol=float(data["entry_price_sol"]),
+        entry_fdv_usd=(
+            float(data["entry_fdv_usd"])
+            if data.get("entry_fdv_usd") is not None
+            else None
+        ),
+        opened_at=str(data.get("opened_at") or ""),
+        initial_cost_sol=float(data.get("initial_cost_sol") or 0),
+        pool=data.get("pool"),
+    )
+
+
 def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> None:
     """pretty table for migration events."""
     if not migrations:
@@ -309,13 +362,13 @@ def watch_cmd(
     ),
 ) -> None:
     """
-    live PumpSwap FDV for a mint (inline).
+    live PumpSwap FDV for a mint (inline) — Helius WS runs in this CLI process.
 
-    if you hold an open paper position on that mint, also shows value + PnL.
+    if the daemon has an open paper position on that mint, also shows value + PnL.
     """
     import logging
 
-    from archetype.execution import format_watch_line, get_position, run_inline_watch
+    from archetype.execution import format_watch_line, run_inline_watch
     from archetype.filters.helius import HeliusRpc
     from archetype.price import fetch_price_tick
 
@@ -330,7 +383,20 @@ def watch_cmd(
     rpc = HeliusRpc(settings.helius_api_key)
     mint = mint.strip()
     ledger = settings.resolved_trading_ledger_db()
-    pos = get_position(ledger, mint)
+
+    # position comes from daemon (single writer); price WS stays local
+    pos = None
+    try:
+        resp = httpx.get(
+            f"{settings.base_url}/paper/position/{mint}", timeout=10.0
+        )
+        if resp.status_code == 200:
+            pos = _position_from_api((resp.json() or {}).get("position"))
+    except httpx.HTTPError:
+        console.print(
+            "[dim]daemon unreachable — watch is price-only "
+            "(start daemon for position PnL)[/dim]"
+        )
 
     try:
         if once:
@@ -374,21 +440,6 @@ def watch_cmd(
         raise typer.Exit(code=1) from exc
 
 
-def _require_helius() -> tuple:
-    """settings + rpc, or exit if no key."""
-    import logging
-
-    from archetype.filters.helius import HeliusRpc
-
-    settings = get_settings()
-    if not settings.helius_api_key.strip():
-        console.print("[red]ARCHETYPE_HELIUS_API_KEY not set[/red]")
-        raise typer.Exit(code=1)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    return settings, HeliusRpc(settings.helius_api_key)
-
-
 @app.command("buy")
 def buy_cmd(
     mint: str = typer.Argument(..., help="token mint to buy"),
@@ -399,43 +450,53 @@ def buy_cmd(
         help="skip live watch after fill",
     ),
 ) -> None:
-    """paper-buy at current PumpSwap price, then live inline FDV/PnL."""
-    from archetype.execution import buy, run_inline_watch
+    """paper-buy via daemon, then optional local live FDV/PnL watch."""
+    import logging
 
-    settings, rpc = _require_helius()
-    ledger = settings.resolved_trading_ledger_db()
+    from archetype.execution import run_inline_watch
+    from archetype.filters.helius import HeliusRpc
+
     mint = mint.strip()
+    resp = _post("/paper/buy", {"mint": mint, "sol": sol}, timeout=90.0)
+    if resp.status_code != 200:
+        _api_error(resp, "buy failed")
 
-    try:
-        fill = buy(ledger, rpc, mint, sol)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]buy failed:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    label = fill.symbol or fill.name or mint[:8]
+    fill = (resp.json() or {}).get("fill") or {}
+    label = fill.get("symbol") or fill.get("name") or mint[:8]
     console.print(
         f"[green]BOUGHT[/green] {label}  "
-        f"spent={fill.sol:.4f} SOL  tokens={fill.tokens:,.4f}  "
-        f"@ {fill.price_sol:.10g} SOL  FDV=${fill.fdv_usd:,.0f}"
+        f"spent={float(fill.get('sol') or 0):.4f} SOL  "
+        f"tokens={float(fill.get('tokens') or 0):,.4f}  "
+        f"@ {float(fill.get('price_sol') or 0):.10g} SOL  "
+        f"FDV=${float(fill.get('fdv_usd') or 0):,.0f}"
     )
+    pos = _position_from_api(fill.get("position"))
     entry_fdv = (
-        f"${fill.position.entry_fdv_usd:,.0f}"
-        if fill.position.entry_fdv_usd is not None
+        f"${pos.entry_fdv_usd:,.0f}"
+        if pos is not None and pos.entry_fdv_usd is not None
         else "?"
     )
+    cost = pos.cost_sol if pos else 0.0
     console.print(
-        f"[dim]wallet={fill.wallet_sol:.4f} SOL  "
-        f"position cost={fill.position.cost_sol:.4f} SOL  "
+        f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL  "
+        f"position cost={cost:.4f} SOL  "
         f"avg entry FDV={entry_fdv}[/dim]"
     )
-    if not no_track and fill.position is not None:
+
+    if not no_track and pos is not None:
+        settings = get_settings()
+        if not settings.helius_api_key.strip():
+            console.print("[yellow]no helius key — skip live watch[/yellow]")
+            return
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        rpc = HeliusRpc(settings.helius_api_key)
         run_inline_watch(
             rpc,
             mint,
             console,
-            position=fill.position,
-            resolved=fill.resolved,
-            ledger_path=ledger,
+            position=pos,
+            ledger_path=settings.resolved_trading_ledger_db(),
         )
 
 
@@ -452,7 +513,7 @@ def sell_cmd(
     ),
 ) -> None:
     """
-    paper-sell at current price.
+    paper-sell via daemon.
 
     examples:
       sell <mint>           → full exit
@@ -460,15 +521,8 @@ def sell_cmd(
       sell <mint> init      → sell first-buy SOL (fails if underwater)
       sell <mint> 5 sol     → sell 5 SOL worth
     """
-    from archetype.execution import sell
-
-    settings, rpc = _require_helius()
-    ledger = settings.resolved_trading_ledger_db()
     mint = mint.strip()
-
-    percent: float | None = None
-    sol_amount: float | None = None
-    initials = False
+    body: dict = {"mint": mint, "initials": False}
 
     if amount is not None:
         raw = amount.strip().lower()
@@ -480,16 +534,16 @@ def sell_cmd(
             if unit_l is not None:
                 console.print("[red]sell init takes no unit[/red]")
                 raise typer.Exit(code=1)
-            initials = True
+            body["initials"] = True
         elif unit_l in ("sol", "sols"):
             try:
-                sol_amount = float(raw)
+                body["sol_amount"] = float(raw)
             except ValueError as exc:
                 console.print(f"[red]invalid SOL amount:[/red] {amount}")
                 raise typer.Exit(code=1) from exc
         else:
             try:
-                percent = float(raw)
+                body["percent"] = float(raw)
             except ValueError as exc:
                 console.print(
                     f"[red]invalid amount:[/red] {amount} "
@@ -497,43 +551,40 @@ def sell_cmd(
                 )
                 raise typer.Exit(code=1) from exc
 
-    try:
-        fill = sell(
-            ledger,
-            rpc,
-            mint,
-            percent=percent,
-            sol_amount=sol_amount,
-            initials=initials,
-        )
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]sell failed:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
+    resp = _post("/paper/sell", body, timeout=90.0)
+    if resp.status_code != 200:
+        _api_error(resp, "sell failed")
 
-    label = fill.symbol or fill.name or mint[:8]
-    pnl = fill.pnl_sol or 0.0
-    pct = fill.pnl_pct or 0.0
+    fill = (resp.json() or {}).get("fill") or {}
+    label = fill.get("symbol") or fill.get("name") or mint[:8]
+    pnl = float(fill.get("pnl_sol") or 0.0)
+    pct = float(fill.get("pnl_pct") or 0.0)
     color = "green" if pnl >= 0 else "red"
     sign = "+" if pnl >= 0 else ""
-    mode_tag = f" ({fill.mode})" if fill.mode != "full" else ""
+    mode = fill.get("mode") or "full"
+    mode_tag = f" ({mode})" if mode != "full" else ""
     console.print(
         f"[{color}]SOLD[/{color}]{mode_tag} {label}  "
-        f"proceeds={fill.sol:.4f} SOL  "
+        f"proceeds={float(fill.get('sol') or 0):.4f} SOL  "
         f"PnL={sign}{pnl:.4f} SOL ({sign}{pct:.2f}%)  "
-        f"@ {fill.price_sol:.10g} SOL  FDV=${fill.fdv_usd:,.0f}"
+        f"@ {float(fill.get('price_sol') or 0):.10g} SOL  "
+        f"FDV=${float(fill.get('fdv_usd') or 0):,.0f}"
     )
-    if fill.position is not None:
+    pos = fill.get("position")
+    if pos:
         console.print(
-            f"[dim]wallet={fill.wallet_sol:.4f} SOL  "
-            f"remaining cost={fill.position.cost_sol:.4f} SOL  "
-            f"tokens={fill.position.tokens:,.4f}[/dim]"
+            f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL  "
+            f"remaining cost={float(pos.get('cost_sol') or 0):.4f} SOL  "
+            f"tokens={float(pos.get('tokens') or 0):,.4f}[/dim]"
         )
     else:
-        console.print(f"[dim]wallet={fill.wallet_sol:.4f} SOL[/dim]")
+        console.print(
+            f"[dim]wallet={float(fill.get('wallet_sol') or 0):.4f} SOL[/dim]"
+        )
 
 
 balance_app = typer.Typer(
-    help="mock SOL wallet + open positions",
+    help="mock SOL wallet + open positions (via daemon)",
     no_args_is_help=False,
 )
 app.add_typer(balance_app, name="balance")
@@ -541,19 +592,19 @@ app.add_typer(balance_app, name="balance")
 
 @balance_app.callback(invoke_without_command=True)
 def balance_cmd(ctx: typer.Context) -> None:
-    """show cash SOL + open positions (one-shot price marks)."""
+    """show cash SOL + open positions (daemon marks prices)."""
     if ctx.invoked_subcommand is not None:
         return
 
-    from archetype.execution import get_balance, mark_all_positions
-
-    settings, rpc = _require_helius()
-    ledger = settings.resolved_trading_ledger_db()
-    cash = get_balance(ledger)
-    marks = mark_all_positions(ledger, rpc)
+    resp = _get("/paper/balance", timeout=60.0)
+    if resp.status_code != 200:
+        _api_error(resp, "balance failed")
+    data = resp.json() or {}
+    cash = float(data.get("cash_sol") or 0)
+    positions = data.get("positions") or []
 
     console.print(f"[bold]paper wallet[/bold]  cash=[cyan]{cash:.4f} SOL[/cyan]")
-    if not marks:
+    if not positions:
         console.print("[dim]no open positions[/dim]")
         return
 
@@ -566,16 +617,15 @@ def balance_cmd(ctx: typer.Context) -> None:
     table.add_column("cost SOL", justify="right")
     table.add_column("FDV$", justify="right")
 
-    for mark in marks:
-        pos = mark.position
+    for p in positions:
         table.add_row(
-            mark.symbol or pos.symbol or "?",
-            (mark.name or pos.name or "")[:20],
-            pos.mint,
-            f"{mark.value_sol:.4f}",
-            f"{mark.pnl_pct:+.2f}%",
-            f"{pos.cost_sol:.4f}",
-            f"{mark.fdv_usd:,.0f}",
+            p.get("symbol") or "?",
+            (p.get("name") or "")[:20],
+            str(p.get("mint") or ""),
+            f"{float(p.get('value_sol') or 0):.4f}",
+            f"{float(p.get('pnl_pct') or 0):+.2f}%",
+            f"{float(p.get('cost_sol') or 0):.4f}",
+            f"{float(p.get('fdv_usd') or 0):,.0f}",
         )
 
     console.print(table)
@@ -585,17 +635,15 @@ def balance_cmd(ctx: typer.Context) -> None:
 def balance_add_cmd(
     sol: float = typer.Argument(..., help="SOL to add to paper wallet"),
 ) -> None:
-    """add mock SOL to the paper wallet."""
-    from archetype.execution import add_sol
-
-    settings = get_settings()
-    ledger = settings.resolved_trading_ledger_db()
-    try:
-        new_bal = add_sol(ledger, sol)
-    except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]add failed:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-    console.print(f"[green]added[/green] {sol:.4f} SOL → balance={new_bal:.4f} SOL")
+    """add mock SOL via daemon."""
+    resp = _post("/paper/balance/add", {"sol": sol})
+    if resp.status_code != 200:
+        _api_error(resp, "add failed")
+    data = resp.json() or {}
+    console.print(
+        f"[green]added[/green] {sol:.4f} SOL → "
+        f"balance={float(data.get('cash_sol') or 0):.4f} SOL"
+    )
 
 
 @balance_app.command("reset")
@@ -606,14 +654,13 @@ def balance_reset_cmd(
         help="SOL balance after reset (also clears open positions)",
     ),
 ) -> None:
-    """reset paper wallet to starting SOL and clear open positions."""
-    from archetype.execution import reset_wallet
-
-    settings = get_settings()
-    ledger = settings.resolved_trading_ledger_db()
-    new_bal = reset_wallet(ledger, start_sol=start)
+    """reset paper wallet via daemon."""
+    resp = _post("/paper/balance/reset", {"start": start})
+    if resp.status_code != 200:
+        _api_error(resp, "reset failed")
+    data = resp.json() or {}
     console.print(
-        f"[green]reset[/green] wallet → {new_bal:.4f} SOL "
+        f"[green]reset[/green] wallet → {float(data.get('cash_sol') or 0):.4f} SOL "
         f"(open positions cleared)"
     )
 
