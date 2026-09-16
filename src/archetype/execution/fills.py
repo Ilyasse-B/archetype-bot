@@ -21,7 +21,7 @@ from archetype.execution.track import round_mark
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
 from archetype.price.models import PriceTick
-from archetype.price.resolve import ResolvedPool
+from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
 from archetype.price.snapshot import fetch_price_tick, fetch_price_tick_resolved
 
 # dust leftover → treat as full close
@@ -82,12 +82,18 @@ def buy(
     *,
     tick: PriceTick | None = None,
     resolved: ResolvedPool | None = None,
+    name: str | None = None,
+    symbol: str | None = None,
+    known_pool: str | None = None,
 ) -> FillResult:
     """
     spend size_sol of mock cash at current price.
 
     tokens = size_sol / price_sol (simple, no slippage).
     rebuy on same mint averages cost basis; initial_cost_sol stays.
+
+    pass tick (e.g. last CLI watch price) to fill at what the user saw.
+    name/symbol/known_pool are hints when daemon resolves itself.
     """
     if size_sol <= 0:
         raise ValueError("buy size must be > 0")
@@ -99,13 +105,48 @@ def buy(
         )
 
     existing = get_position(ledger_path, mint)
+    hint_name = name or (existing.name if existing else None)
+    hint_symbol = symbol or (existing.symbol if existing else None)
+    hint_pool = known_pool or (existing.pool if existing else None)
+
     if tick is None:
         tick, resolved = fetch_price_tick_resolved(
             rpc,
             mint,
             resolved=resolved,
-            **_price_kwargs(ledger_path, existing),
+            ledger_path=ledger_path,
+            known_pool=hint_pool,
+            name=hint_name,
+            symbol=hint_symbol,
         )
+    else:
+        # still resolve pool for position storage if we dont have one
+        if resolved is None and (hint_pool or not existing):
+            try:
+                resolved = resolve_pumpswap_pool(
+                    rpc,
+                    mint,
+                    known_pool=hint_pool or (tick.pool or None),
+                    name=hint_name or tick.name,
+                    symbol=hint_symbol or tick.symbol,
+                    ledger_path=ledger_path,
+                    skip_das=bool(
+                        (hint_name or tick.name)
+                        and (hint_symbol or tick.symbol)
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                resolved = None
+        # overlay labels onto the client tick
+        if not tick.name and (hint_name or (resolved.name if resolved else None)):
+            tick.name = hint_name or (resolved.name if resolved else None)
+        if not tick.symbol and (
+            hint_symbol or (resolved.symbol if resolved else None)
+        ):
+            tick.symbol = hint_symbol or (
+                resolved.symbol if resolved else None
+            )
+
     if tick.price_sol <= 0:
         raise ValueError("invalid price")
 
@@ -115,8 +156,8 @@ def buy(
         new_tokens = existing.tokens + tokens_bought
         new_cost = existing.cost_sol + size_sol
         entry_price = new_cost / new_tokens if new_tokens > 0 else tick.price_sol
-        name = tick.name or existing.name
-        symbol = tick.symbol or existing.symbol
+        name = tick.name or existing.name or hint_name
+        symbol = tick.symbol or existing.symbol or hint_symbol
         if existing.entry_fdv_usd is not None and existing.cost_sol > 0:
             entry_fdv = (
                 existing.entry_fdv_usd * existing.cost_sol + tick.fdv_usd * size_sol
@@ -142,20 +183,32 @@ def buy(
         new_tokens = tokens_bought
         new_cost = size_sol
         entry_price = tick.price_sol
-        name = tick.name
-        symbol = tick.symbol
+        name = tick.name or hint_name
+        symbol = tick.symbol or hint_symbol
         entry_fdv = tick.fdv_usd
         initial_cost = size_sol
         bought_sol = size_sol
         sold_sol = 0.0
+        pool_addr = (
+            (tick.pool or None)
+            or (resolved.pool.address if resolved else None)
+            or hint_pool
+        )
         round_id = open_round(
             ledger_path,
             mint=mint,
             name=name,
             symbol=symbol,
-            pool=tick.pool,
+            pool=pool_addr,
             entry_price_sol=entry_price,
             entry_fdv_usd=entry_fdv,
+        )
+
+        pool_addr = (
+            (tick.pool or None)
+            or (resolved.pool.address if resolved else None)
+            or hint_pool
+            or (existing.pool if existing else None)
         )
 
     new_bal = set_balance(ledger_path, bal - size_sol)
@@ -169,7 +222,7 @@ def buy(
         entry_price_sol=entry_price,
         entry_fdv_usd=entry_fdv,
         initial_cost_sol=initial_cost,
-        pool=tick.pool,
+        pool=pool_addr,
         bought_sol=bought_sol,
         sold_sol=sold_sol,
         round_id=round_id,
@@ -214,6 +267,9 @@ def sell(
     initials: bool = False,
     tick: PriceTick | None = None,
     resolved: ResolvedPool | None = None,
+    name: str | None = None,
+    symbol: str | None = None,
+    known_pool: str | None = None,
 ) -> FillResult:
     """
     sell open position (full / % / SOL out / initials).
@@ -222,6 +278,8 @@ def sell(
     - percent=25 → 25% of tokens
     - sol_amount=5 → sell ~5 SOL worth of tokens
     - initials=True → sell enough to recover first-buy SOL; fails if underwater
+
+    pass tick to fill at the live watch price the user saw.
     """
     modes = sum(
         [
@@ -237,13 +295,28 @@ def sell(
     if pos is None:
         raise ValueError(f"no open position for {mint}")
 
+    hint_name = name or pos.name
+    hint_symbol = symbol or pos.symbol
+    hint_pool = known_pool or pos.pool
+
     if tick is None:
         tick, resolved = fetch_price_tick_resolved(
             rpc,
             mint,
             resolved=resolved,
-            **_price_kwargs(ledger_path, pos),
+            ledger_path=ledger_path,
+            known_pool=hint_pool,
+            name=hint_name,
+            symbol=hint_symbol,
         )
+    else:
+        if not tick.name:
+            tick.name = hint_name
+        if not tick.symbol:
+            tick.symbol = hint_symbol
+        if not tick.pool and hint_pool:
+            tick.pool = hint_pool
+
     if tick.price_sol <= 0:
         raise ValueError("invalid price")
 
@@ -312,14 +385,18 @@ def sell(
     remaining_tokens = pos.tokens - tokens_sold
     remaining_cost = max(0.0, pos.cost_sol - cost_sold)
 
+    label_name = tick.name or hint_name
+    label_symbol = tick.symbol or hint_symbol
+    pool_addr = (tick.pool or None) or hint_pool
+
     round_id = pos.round_id
     if round_id is None:
         round_id = open_round(
             ledger_path,
             mint=mint,
-            name=tick.name or pos.name,
-            symbol=tick.symbol or pos.symbol,
-            pool=tick.pool or pos.pool,
+            name=label_name,
+            symbol=label_symbol,
+            pool=pool_addr,
             entry_price_sol=pos.entry_price_sol,
             entry_fdv_usd=pos.entry_fdv_usd,
         )
@@ -336,8 +413,8 @@ def sell(
         mode=mode,
         cost_basis_sol=cost_sold,
         pnl_sol=pnl_sol,
-        name=tick.name or pos.name,
-        symbol=tick.symbol or pos.symbol,
+        name=label_name,
+        symbol=label_symbol,
     )
 
     if remaining_tokens <= _DUST_TOKENS or mode == "full":
@@ -346,8 +423,8 @@ def sell(
             int(round_id),
             exit_price_sol=tick.price_sol,
             exit_fdv_usd=tick.fdv_usd,
-            name=tick.name or pos.name,
-            symbol=tick.symbol or pos.symbol,
+            name=label_name,
+            symbol=label_symbol,
         )
         delete_position(ledger_path, mint)
         remaining_pos: Position | None = None
@@ -360,14 +437,14 @@ def sell(
         remaining_pos = upsert_position(
             ledger_path,
             mint=mint,
-            name=tick.name or pos.name,
-            symbol=tick.symbol or pos.symbol,
+            name=label_name,
+            symbol=label_symbol,
             tokens=remaining_tokens,
             cost_sol=remaining_cost,
             entry_price_sol=entry_price,
             entry_fdv_usd=pos.entry_fdv_usd,
             initial_cost_sol=max(0.0, new_initial),
-            pool=tick.pool or pos.pool,
+            pool=pool_addr,
             bought_sol=pos.bought_sol,
             sold_sol=pos.sold_sol + proceeds,
             round_id=round_id,
@@ -384,8 +461,8 @@ def sell(
         wallet_sol=new_bal,
         pnl_sol=pnl_sol,
         pnl_pct=pnl_pct,
-        name=tick.name or pos.name,
-        symbol=tick.symbol or pos.symbol,
+        name=label_name,
+        symbol=label_symbol,
         mode=mode,
         resolved=resolved,
         round_id=round_id,

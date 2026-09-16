@@ -241,9 +241,33 @@ def migrations_cmd(
         "--filtered",
         help="only show migrations that passed on-chain filters",
     ),
+    trade: bool = typer.Option(
+        False,
+        "--trade",
+        help="interactive watch/reject stream over filter-passed backlog "
+        "(implies --filtered; polls sqlite, no extra daemon load)",
+    ),
     json_out: bool = typer.Option(False, "--json", help="raw json"),
 ) -> None:
     """show recent PumpPortal migrations (raw or filtered)."""
+    if trade:
+        if not filtered:
+            console.print(
+                "[dim]--trade implies --filtered "
+                "(only backlog PASSes)[/dim]"
+            )
+            filtered = True
+        if follow:
+            console.print(
+                "[yellow]--follow ignored with --trade[/yellow]"
+            )
+        if json_out:
+            console.print("[yellow]--json ignored with --trade[/yellow]")
+        from archetype.agent import run_filtered_trade_stream
+
+        run_filtered_trade_stream(get_settings(), console)
+        return
+
     q = f"limit={limit}&filtered={'true' if filtered else 'false'}"
     if not follow:
         resp = _get(f"/migrations?{q}")

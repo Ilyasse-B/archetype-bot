@@ -25,11 +25,51 @@ from archetype.execution import (
 )
 from archetype.execution.wallet import get_balance
 from archetype.filters.helius import HeliusRpc
+from archetype.price.models import PUMP_FDV_SUPPLY, PriceTick, build_tick
+
+
+def _tick_from_body(
+    body: BuyRequest | SellRequest,
+    mint: str,
+) -> PriceTick | None:
+    """rebuild a PriceTick from optional CLI watch snapshot fields."""
+    if body.price_sol is None:
+        return None
+    price = float(body.price_sol)
+    # prefer fdv→sol_usd so stored fdv_usd matches what the CLI showed
+    if body.fdv_usd is not None and price > 0:
+        sol_usd = float(body.fdv_usd) / (price * PUMP_FDV_SUPPLY)
+    elif body.sol_usd is not None and body.sol_usd > 0:
+        sol_usd = float(body.sol_usd)
+    else:
+        sol_usd = 150.0
+    # synthesize reserves consistent with price (price = quote/base)
+    base_ui = PUMP_FDV_SUPPLY
+    quote_sol = price * base_ui
+    return build_tick(
+        mint=mint,
+        pool=body.pool or "",
+        base_ui=base_ui,
+        quote_sol=quote_sol,
+        supply_ui=base_ui,
+        decimals=6,
+        sol_usd=sol_usd,
+        name=body.name,
+        symbol=body.symbol,
+        source="cli",
+    )
 
 
 class BuyRequest(BaseModel):
     mint: str
     sol: float = Field(..., gt=0)
+    # optional hints / last watch tick so fills match what the CLI showed
+    name: str | None = None
+    symbol: str | None = None
+    pool: str | None = None
+    price_sol: float | None = Field(None, gt=0)
+    fdv_usd: float | None = Field(None, gt=0)
+    sol_usd: float | None = Field(None, gt=0)
 
 
 class SellRequest(BaseModel):
@@ -37,6 +77,12 @@ class SellRequest(BaseModel):
     percent: float | None = Field(None, gt=0, le=100)
     sol_amount: float | None = Field(None, gt=0)
     initials: bool = False
+    name: str | None = None
+    symbol: str | None = None
+    pool: str | None = None
+    price_sol: float | None = Field(None, gt=0)
+    fdv_usd: float | None = Field(None, gt=0)
+    sol_usd: float | None = Field(None, gt=0)
 
 
 class AddSolRequest(BaseModel):
@@ -177,9 +223,19 @@ def create_paper_router() -> APIRouter:
     async def paper_buy(body: BuyRequest, request: Request) -> dict[str, Any]:
         rpc, ledger = _rpc_ledger(request)
         mint = body.mint.strip()
+        tick = _tick_from_body(body, mint)
 
         def _run() -> Any:
-            return buy(ledger, rpc, mint, body.sol)
+            return buy(
+                ledger,
+                rpc,
+                mint,
+                body.sol,
+                tick=tick,
+                name=body.name,
+                symbol=body.symbol,
+                known_pool=body.pool,
+            )
 
         try:
             fill = await asyncio.to_thread(_run)
@@ -203,6 +259,7 @@ def create_paper_router() -> APIRouter:
                 status_code=400,
                 detail="use only one of percent / sol_amount / initials",
             )
+        tick = _tick_from_body(body, mint)
 
         def _run() -> Any:
             return sell(
@@ -212,6 +269,10 @@ def create_paper_router() -> APIRouter:
                 percent=body.percent,
                 sol_amount=body.sol_amount,
                 initials=body.initials,
+                tick=tick,
+                name=body.name,
+                symbol=body.symbol,
+                known_pool=body.pool,
             )
 
         try:

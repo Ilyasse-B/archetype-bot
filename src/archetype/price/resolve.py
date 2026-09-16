@@ -50,11 +50,16 @@ def resolve_pumpswap_pool(
     if use_cache:
         cached = cache_get(mint, ledger_path=ledger_path)
         if cached is not None:
-            # fill missing labels if caller has them
+            # fill missing labels if caller has them (and persist)
+            patched = False
             if name and not cached.name:
                 cached.name = name
+                patched = True
             if symbol and not cached.symbol:
                 cached.symbol = symbol
+                patched = True
+            if patched and ledger_path is not None:
+                cache_put(cached, ledger_path=ledger_path)
             return cached
 
     mint_acct = rpc.get_account_json_parsed(mint)

@@ -42,6 +42,20 @@ CREATE TABLE IF NOT EXISTS agent_rejects (
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- coins reviewed but not rejected: left aside, or traded
+CREATE TABLE IF NOT EXISTS agent_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL,
+    backlog_id INTEGER,
+    outcome TEXT NOT NULL,
+    coin_info TEXT,
+    notes TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviews_mint ON agent_reviews(mint);
+CREATE INDEX IF NOT EXISTS idx_reviews_outcome ON agent_reviews(outcome);
+
 CREATE TABLE IF NOT EXISTS migration_backlog (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mint TEXT NOT NULL,

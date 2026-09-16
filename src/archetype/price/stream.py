@@ -69,10 +69,19 @@ async def aiter_price_ticks_ws(
         resolved=resolved,
         sol_usd=sol_usd,
         source="ws",
+        name=name or resolved.name,
+        symbol=symbol or resolved.symbol,
         ledger_path=ledger_path,
     )
     base_ui = tick0.pool_base_ui
     quote_sol = tick0.pool_sol
+    # keep labels even if resolve/cache was blank
+    label_name = tick0.name or name or resolved.name
+    label_symbol = tick0.symbol or symbol or resolved.symbol
+    if label_name and not resolved.name:
+        resolved.name = label_name
+    if label_symbol and not resolved.symbol:
+        resolved.symbol = label_symbol
     yield tick0
 
     ws_url = rpc.ws_url
@@ -154,8 +163,8 @@ async def aiter_price_ticks_ws(
                     supply_ui=resolved.supply_ui,
                     decimals=resolved.decimals,
                     sol_usd=sol_usd,
-                    name=resolved.name,
-                    symbol=resolved.symbol,
+                    name=label_name or resolved.name,
+                    symbol=label_symbol or resolved.symbol,
                     slot=int(slot) if slot is not None else None,
                     source="ws",
                 )

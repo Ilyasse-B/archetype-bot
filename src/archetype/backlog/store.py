@@ -183,6 +183,33 @@ def dequeue_fifo(ledger_path: Path) -> BacklogItem | None:
     return item
 
 
+def consume_id(ledger_path: Path, backlog_id: int) -> BacklogItem | None:
+    """
+    mark a specific pending row consumed (first decision on that coin).
+
+    returns the item if it was still pending, else None.
+    """
+    ensure_backlog_table(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, mint, coin_info, timestamp, consumed "
+            "FROM migration_backlog WHERE id = ? AND consumed = 0",
+            (backlog_id,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE migration_backlog SET consumed = 1 WHERE id = ?",
+            (backlog_id,),
+        )
+        conn.commit()
+    item = _row_to_item(row)
+    item.consumed = True
+    log.info("BACKLOG consume #%s mint=%s", item.id, item.mint)
+    return item
+
+
 def list_pending(ledger_path: Path, limit: int = 50) -> list[BacklogItem]:
     """pending items oldest → newest."""
     ensure_backlog_table(ledger_path)

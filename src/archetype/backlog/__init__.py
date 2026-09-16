@@ -2,6 +2,7 @@
 
 from archetype.backlog.store import (
     BacklogItem,
+    consume_id,
     dequeue_fifo,
     enqueue_passed,
     list_pending,
@@ -11,6 +12,7 @@ from archetype.backlog.store import (
 
 __all__ = [
     "BacklogItem",
+    "consume_id",
     "enqueue_passed",
     "dequeue_fifo",
     "peek_fifo",

@@ -128,8 +128,9 @@ def cache_put(
                 quote_ata=excluded.quote_ata,
                 decimals=excluded.decimals,
                 supply_ui=excluded.supply_ui,
-                name=excluded.name,
-                symbol=excluded.symbol,
+                -- never wipe a known label with null
+                name=COALESCE(excluded.name, pool_cache.name),
+                symbol=COALESCE(excluded.symbol, pool_cache.symbol),
                 creator=excluded.creator,
                 base_mint=excluded.base_mint,
                 quote_mint=excluded.quote_mint,

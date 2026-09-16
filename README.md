@@ -25,6 +25,7 @@ uv run python -m archetype.daemon
 uv run archetype status
 uv run archetype migrations              # RAW unfiltered
 uv run archetype migrations --filtered   # PASS only
+uv run archetype migrations --filtered --trade   # interactive watch/reject/buy/sell
 uv run archetype backlog                 # pending agent queue
 
 # paper wallet (daemon)
