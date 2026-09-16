@@ -102,6 +102,9 @@ def _position_from_api(data: dict | None):
         pool=data.get("pool"),
         bought_sol=float(data.get("bought_sol") or data.get("cost_sol") or 0),
         sold_sol=float(data.get("sold_sol") or 0),
+        round_id=(
+            int(data["round_id"]) if data.get("round_id") is not None else None
+        ),
     )
 
 

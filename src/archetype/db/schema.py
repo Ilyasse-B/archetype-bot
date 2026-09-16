@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS migration_backlog (
 
 CREATE INDEX IF NOT EXISTS idx_backlog_consumed ON migration_backlog(consumed, id);
 
+-- legacy stub (no longer written; kept for old dbs)
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mint TEXT NOT NULL,
@@ -68,6 +69,55 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at DATETIME,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- atomic buy/sell legs
+CREATE TABLE IF NOT EXISTS trade_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL,
+    mint TEXT NOT NULL,
+    side TEXT NOT NULL,
+    mode TEXT,
+    sol REAL NOT NULL,
+    tokens REAL NOT NULL,
+    price_sol REAL NOT NULL,
+    fdv_usd REAL,
+    cost_basis_sol REAL,
+    pnl_sol REAL,
+    name TEXT,
+    symbol TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_fills_round ON trade_fills(round_id, id);
+CREATE INDEX IF NOT EXISTS idx_fills_mint ON trade_fills(mint, id);
+
+-- one lifecycle per coin bag (open → closed when flat)
+CREATE TABLE IF NOT EXISTS trade_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    name TEXT,
+    symbol TEXT,
+    pool TEXT,
+    entry_price_sol REAL,
+    exit_price_sol REAL,
+    entry_fdv_usd REAL,
+    exit_fdv_usd REAL,
+    bought_sol REAL NOT NULL DEFAULT 0,
+    sold_sol REAL NOT NULL DEFAULT 0,
+    pnl_sol REAL,
+    pnl_pct REAL,
+    buy_count INTEGER NOT NULL DEFAULT 0,
+    sell_count INTEGER NOT NULL DEFAULT 0,
+    time_held_seconds INTEGER,
+    opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    closed_at DATETIME,
+    thesis TEXT,
+    tp REAL,
+    sl REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rounds_mint ON trade_rounds(mint, status);
 
 -- paper wallet (singleton row id=1)
 CREATE TABLE IF NOT EXISTS paper_wallet (
@@ -90,6 +140,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     pool TEXT,
     bought_sol REAL NOT NULL DEFAULT 0,
     sold_sol REAL NOT NULL DEFAULT 0,
+    round_id INTEGER,
     opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

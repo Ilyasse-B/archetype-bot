@@ -7,16 +7,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from archetype.execution.ledger import finalize_round, open_round, record_fill
 from archetype.execution.wallet import (
     Position,
     delete_position,
     get_balance,
     get_position,
     list_positions,
-    record_closed_trade,
     set_balance,
     upsert_position,
 )
+from archetype.execution.track import round_mark
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
 from archetype.price.models import PriceTick
@@ -45,6 +46,8 @@ class FillResult:
     symbol: str | None = None
     mode: str = "full"  # full | percent | sol | init
     resolved: ResolvedPool | None = None
+    round_id: int | None = None
+    fill_id: int | None = None
 
 
 @dataclass
@@ -123,6 +126,18 @@ def buy(
         initial_cost = existing.initial_cost_sol
         bought_sol = existing.bought_sol + size_sol
         sold_sol = existing.sold_sol
+        round_id = existing.round_id
+        if round_id is None:
+            # legacy open bag — start a round now
+            round_id = open_round(
+                ledger_path,
+                mint=mint,
+                name=name,
+                symbol=symbol,
+                pool=tick.pool or existing.pool,
+                entry_price_sol=existing.entry_price_sol,
+                entry_fdv_usd=existing.entry_fdv_usd,
+            )
     else:
         new_tokens = tokens_bought
         new_cost = size_sol
@@ -133,6 +148,15 @@ def buy(
         initial_cost = size_sol
         bought_sol = size_sol
         sold_sol = 0.0
+        round_id = open_round(
+            ledger_path,
+            mint=mint,
+            name=name,
+            symbol=symbol,
+            pool=tick.pool,
+            entry_price_sol=entry_price,
+            entry_fdv_usd=entry_fdv,
+        )
 
     new_bal = set_balance(ledger_path, bal - size_sol)
     pos = upsert_position(
@@ -148,6 +172,20 @@ def buy(
         pool=tick.pool,
         bought_sol=bought_sol,
         sold_sol=sold_sol,
+        round_id=round_id,
+    )
+    fill_id = record_fill(
+        ledger_path,
+        round_id=int(round_id),
+        mint=mint,
+        side="buy",
+        sol=size_sol,
+        tokens=tokens_bought,
+        price_sol=tick.price_sol,
+        fdv_usd=tick.fdv_usd,
+        mode="buy",
+        name=name,
+        symbol=symbol,
     )
     return FillResult(
         side="buy",
@@ -161,6 +199,8 @@ def buy(
         name=name,
         symbol=symbol,
         resolved=resolved,
+        round_id=round_id,
+        fill_id=fill_id,
     )
 
 
@@ -272,16 +312,42 @@ def sell(
     remaining_tokens = pos.tokens - tokens_sold
     remaining_cost = max(0.0, pos.cost_sol - cost_sold)
 
-    if remaining_tokens <= _DUST_TOKENS or mode == "full":
-        record_closed_trade(
+    round_id = pos.round_id
+    if round_id is None:
+        round_id = open_round(
             ledger_path,
             mint=mint,
-            entry_price=pos.entry_price_sol,
-            exit_price=tick.price_sol,
-            size_sol=cost_sold,
-            pnl_sol=pnl_sol,
-            opened_at=pos.opened_at,
-            status="closed",
+            name=tick.name or pos.name,
+            symbol=tick.symbol or pos.symbol,
+            pool=tick.pool or pos.pool,
+            entry_price_sol=pos.entry_price_sol,
+            entry_fdv_usd=pos.entry_fdv_usd,
+        )
+
+    fill_id = record_fill(
+        ledger_path,
+        round_id=int(round_id),
+        mint=mint,
+        side="sell",
+        sol=proceeds,
+        tokens=tokens_sold,
+        price_sol=tick.price_sol,
+        fdv_usd=tick.fdv_usd,
+        mode=mode,
+        cost_basis_sol=cost_sold,
+        pnl_sol=pnl_sol,
+        name=tick.name or pos.name,
+        symbol=tick.symbol or pos.symbol,
+    )
+
+    if remaining_tokens <= _DUST_TOKENS or mode == "full":
+        finalize_round(
+            ledger_path,
+            int(round_id),
+            exit_price_sol=tick.price_sol,
+            exit_fdv_usd=tick.fdv_usd,
+            name=tick.name or pos.name,
+            symbol=tick.symbol or pos.symbol,
         )
         delete_position(ledger_path, mint)
         remaining_pos: Position | None = None
@@ -302,18 +368,9 @@ def sell(
             entry_fdv_usd=pos.entry_fdv_usd,
             initial_cost_sol=max(0.0, new_initial),
             pool=tick.pool or pos.pool,
-            bought_sol=pos.bought_sol,  # never shrinks on sell
+            bought_sol=pos.bought_sol,
             sold_sol=pos.sold_sol + proceeds,
-        )
-        record_closed_trade(
-            ledger_path,
-            mint=mint,
-            entry_price=pos.entry_price_sol,
-            exit_price=tick.price_sol,
-            size_sol=cost_sold,
-            pnl_sol=pnl_sol,
-            opened_at=pos.opened_at,
-            status=f"partial:{mode}",
+            round_id=round_id,
         )
 
     return FillResult(
@@ -331,6 +388,8 @@ def sell(
         symbol=tick.symbol or pos.symbol,
         mode=mode,
         resolved=resolved,
+        round_id=round_id,
+        fill_id=fill_id,
     )
 
 
@@ -352,8 +411,7 @@ def mark_position(
             ledger_path=ledger_path,
         )
     value_sol = pos.tokens * tick.price_sol
-    pnl_sol = value_sol - pos.cost_sol
-    pnl_pct = (pnl_sol / pos.cost_sol * 100.0) if pos.cost_sol > 0 else 0.0
+    _, pnl_sol, pnl_pct = round_mark(pos, tick.price_sol)
     return MarkedPosition(
         position=pos,
         price_sol=tick.price_sol,

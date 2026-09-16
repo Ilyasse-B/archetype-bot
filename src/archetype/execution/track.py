@@ -19,6 +19,20 @@ from archetype.price.resolve import ResolvedPool
 from archetype.price.stream import aiter_price_ticks_ws
 
 
+def round_mark(pos: Position, price_sol: float) -> tuple[float, float, float]:
+    """
+    aggregated round mark-to-market.
+
+    pnl = (sold_proceeds + remaining_value) - bought
+    """
+    bought = pos.bought_sol if pos.bought_sol > 0 else pos.cost_sol
+    value_sol = pos.tokens * price_sol
+    total = pos.sold_sol + value_sol
+    pnl_sol = total - bought
+    pnl_pct = (pnl_sol / bought * 100.0) if bought > 0 else 0.0
+    return value_sol, pnl_sol, pnl_pct
+
+
 def format_position_header(pos: Position) -> str:
     """watch header: original bought + sold-so-far (omit sold if none)."""
     entry_fdv = (
@@ -34,7 +48,7 @@ def format_position_header(pos: Position) -> str:
 
 
 def format_watch_line(tick: PriceTick, pos: Position | None = None) -> Text:
-    """one rich line — FDV always; PnL when we hold a paper position."""
+    """one rich line — FDV always; aggregated round PnL when holding."""
     ts = datetime.now().strftime("%H:%M:%S")
     label = tick.symbol or tick.name or (pos.label if pos else tick.mint[:8])
     t = Text()
@@ -43,14 +57,10 @@ def format_watch_line(tick: PriceTick, pos: Position | None = None) -> Text:
     t.append(f"FDV=${tick.fdv_usd:,.0f}  ", style="cyan bold")
     t.append(f"price={tick.price_sol:.10g} SOL  ")
     if pos is not None:
-        value_sol = pos.tokens * tick.price_sol
-        # unrealized on leftover bags (remaining cost basis)
-        basis = pos.cost_sol
-        pnl_sol = value_sol - basis
-        pnl_pct = (pnl_sol / basis * 100.0) if basis > 0 else 0.0
+        value_sol, pnl_sol, pnl_pct = round_mark(pos, tick.price_sol)
         color = "green" if pnl_sol >= 0 else "red"
         sign = "+" if pnl_sol >= 0 else ""
-        t.append(f"value={value_sol:.4f} SOL  ")
+        t.append(f"left={value_sol:.4f} SOL  ")
         t.append(
             f"PnL={sign}{pnl_sol:.4f} SOL ({sign}{pnl_pct:.2f}%)",
             style=color,

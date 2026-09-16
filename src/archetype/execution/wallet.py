@@ -39,6 +39,8 @@ class Position:
     # lifetime on this open row: total SOL spent / total SOL proceeds sold
     bought_sol: float = 0.0
     sold_sol: float = 0.0
+    # links to trade_rounds while open
+    round_id: int | None = None
 
     @property
     def label(self) -> str:
@@ -70,11 +72,16 @@ def ensure_wallet(ledger_path: Path, *, start_sol: float = DEFAULT_START_SOL) ->
                 pool TEXT,
                 bought_sol REAL NOT NULL DEFAULT 0,
                 sold_sol REAL NOT NULL DEFAULT 0,
+                round_id INTEGER,
                 opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
         _migrate_positions(conn)
+        from archetype.execution.ledger import ensure_trade_ledger
+
+        ensure_trade_ledger(ledger_path)
+
         row = conn.execute(
             "SELECT sol_balance FROM paper_wallet WHERE id = 1"
         ).fetchone()
@@ -116,6 +123,8 @@ def _migrate_positions(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE paper_positions ADD COLUMN sold_sol REAL NOT NULL DEFAULT 0"
         )
+    if "round_id" not in cols:
+        conn.execute("ALTER TABLE paper_positions ADD COLUMN round_id INTEGER")
 
 
 def get_balance(ledger_path: Path) -> float:
@@ -165,7 +174,7 @@ def reset_wallet(
 _POS_COLS = (
     "id, mint, name, symbol, tokens, cost_sol, "
     "entry_price_sol, entry_fdv_usd, initial_cost_sol, pool, "
-    "bought_sol, sold_sol, opened_at"
+    "bought_sol, sold_sol, round_id, opened_at"
 )
 
 
@@ -206,13 +215,15 @@ def upsert_position(
     pool: str | None = None,
     bought_sol: float | None = None,
     sold_sol: float | None = None,
+    round_id: int | None = None,
 ) -> Position:
     """insert or replace open position for mint."""
     ensure_wallet(ledger_path)
     with sqlite3.connect(ledger_path) as conn:
         conn.row_factory = sqlite3.Row
         existing = conn.execute(
-            "SELECT id, pool, bought_sol, sold_sol FROM paper_positions WHERE mint = ?",
+            "SELECT id, pool, bought_sol, sold_sol, round_id "
+            "FROM paper_positions WHERE mint = ?",
             (mint,),
         ).fetchone()
         pool_val = pool or (existing["pool"] if existing else None)
@@ -227,13 +238,22 @@ def upsert_position(
                 if sold_sol is not None
                 else float(existing["sold_sol"] or 0)
             )
+            round_val = (
+                int(round_id)
+                if round_id is not None
+                else (
+                    int(existing["round_id"])
+                    if existing["round_id"] is not None
+                    else None
+                )
+            )
             conn.execute(
                 """
                 UPDATE paper_positions SET
                     name = ?, symbol = ?, tokens = ?, cost_sol = ?,
                     entry_price_sol = ?, entry_fdv_usd = ?,
                     initial_cost_sol = ?, pool = ?,
-                    bought_sol = ?, sold_sol = ?
+                    bought_sol = ?, sold_sol = ?, round_id = ?
                 WHERE mint = ?
                 """,
                 (
@@ -247,6 +267,7 @@ def upsert_position(
                     pool_val,
                     bought_val,
                     sold_val,
+                    round_val,
                     mint,
                 ),
             )
@@ -258,8 +279,8 @@ def upsert_position(
                 INSERT INTO paper_positions
                     (mint, name, symbol, tokens, cost_sol,
                      entry_price_sol, entry_fdv_usd, initial_cost_sol, pool,
-                     bought_sol, sold_sol)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     bought_sol, sold_sol, round_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mint,
@@ -273,6 +294,7 @@ def upsert_position(
                     pool_val,
                     bought_val,
                     sold_val,
+                    int(round_id) if round_id is not None else None,
                 ),
             )
         conn.commit()
@@ -292,61 +314,6 @@ def delete_position(ledger_path: Path, mint: str) -> None:
         conn.commit()
 
 
-def record_closed_trade(
-    ledger_path: Path,
-    *,
-    mint: str,
-    entry_price: float,
-    exit_price: float,
-    size_sol: float,
-    pnl_sol: float,
-    opened_at: str | None,
-    status: str = "closed",
-) -> None:
-    """append a closed/partial row to trades (history)."""
-    ensure_wallet(ledger_path)
-    with sqlite3.connect(ledger_path) as conn:
-        # trades table may already exist from schema init
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mint TEXT NOT NULL,
-                status TEXT NOT NULL,
-                entry_price REAL,
-                exit_price REAL,
-                size_sol REAL,
-                tp REAL,
-                sl REAL,
-                pnl_sol REAL,
-                thesis TEXT,
-                time_held_seconds INTEGER,
-                opened_at DATETIME,
-                closed_at DATETIME,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO trades
-                (mint, status, entry_price, exit_price, size_sol,
-                 pnl_sol, opened_at, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                mint,
-                status,
-                float(entry_price),
-                float(exit_price),
-                float(size_sol),
-                float(pnl_sol),
-                opened_at,
-            ),
-        )
-        conn.commit()
-
-
 def _row_to_pos(row: sqlite3.Row) -> Position:
     keys = row.keys()
     initial = row["initial_cost_sol"] if "initial_cost_sol" in keys else None
@@ -359,6 +326,7 @@ def _row_to_pos(row: sqlite3.Row) -> Position:
         bought = row["cost_sol"]
     if sold is None:
         sold = 0.0
+    round_id = row["round_id"] if "round_id" in keys else None
     return Position(
         id=int(row["id"]),
         mint=str(row["mint"]),
@@ -377,4 +345,5 @@ def _row_to_pos(row: sqlite3.Row) -> Position:
         pool=str(pool) if pool else None,
         bought_sol=float(bought),
         sold_sol=float(sold),
+        round_id=int(round_id) if round_id is not None else None,
     )

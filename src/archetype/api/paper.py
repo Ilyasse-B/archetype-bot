@@ -63,6 +63,7 @@ def _pos_dict(pos: Position | None) -> dict[str, Any] | None:
         "pool": pos.pool,
         "bought_sol": pos.bought_sol,
         "sold_sol": pos.sold_sol,
+        "round_id": pos.round_id,
         "opened_at": pos.opened_at,
     }
 
