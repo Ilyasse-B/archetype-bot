@@ -2,9 +2,9 @@
 
 Local Solana memecoin trading agent (paper-first). Design docs live in `docs/`.
 
-## Phase 2 (current)
+## Phase 3 (in progress)
 
-PumpPortal migrations → on-chain filters → metadata/socials gate → **persisted FIFO backlog**.
+Live PumpSwap price watch; paper wallet / TP-SL next.
 
 ### Setup
 
@@ -13,7 +13,7 @@ cd /home/ilyasse/Archetype/archetype-bot
 uv sync
 ```
 
-### Run daemon
+### Run daemon (migrations / filters / backlog)
 
 ```bash
 uv run python -m archetype.daemon
@@ -24,9 +24,11 @@ uv run python -m archetype.daemon
 ```bash
 uv run archetype status
 uv run archetype migrations              # RAW unfiltered
-uv run archetype migrations --filtered   # PASS only (on-chain + socials)
-uv run archetype migrations --follow
-uv run archetype backlog                 # pending agent queue (FIFO)
+uv run archetype migrations --filtered   # PASS only
+uv run archetype backlog                 # pending agent queue
+uv run archetype watch <MINT>            # live FDV via Helius WS
+uv run archetype watch <MINT> --once     # one snapshot
+uv run archetype watch <MINT> --poll -i 1  # RPC poll fallback
 uv run archetype stop
 ```
 

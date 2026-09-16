@@ -25,6 +25,15 @@ class HeliusRpc:
     def enabled(self) -> bool:
         return bool(self._api_key)
 
+    @property
+    def api_key(self) -> str:
+        return self._api_key
+
+    @property
+    def ws_url(self) -> str:
+        """helius websocket endpoint."""
+        return f"wss://mainnet.helius-rpc.com/?api-key={self._api_key}"
+
     def call(self, method: str, params: Any) -> Any:
         """json-rpc call; raises on http/rpc errors."""
         if not self.enabled:
