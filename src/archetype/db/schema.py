@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     cost_sol REAL NOT NULL,
     entry_price_sol REAL NOT NULL,
     entry_fdv_usd REAL,
+    initial_cost_sol REAL NOT NULL DEFAULT 0,
     opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

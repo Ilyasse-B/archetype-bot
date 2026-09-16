@@ -421,17 +421,71 @@ def buy_cmd(
 
 @app.command("sell")
 def sell_cmd(
-    mint: str = typer.Argument(..., help="token mint to sell (full position)"),
+    mint: str = typer.Argument(..., help="token mint to sell"),
+    amount: str | None = typer.Argument(
+        None,
+        help="omit=100%%, number=percent, 'init'=recover first buy, or SOL with unit",
+    ),
+    unit: str | None = typer.Argument(
+        None,
+        help="pass 'sol' to treat amount as SOL (e.g. sell <mint> 5 sol)",
+    ),
 ) -> None:
-    """paper-sell full open position at current PumpSwap price."""
+    """
+    paper-sell at current price.
+
+    examples:
+      sell <mint>           → full exit
+      sell <mint> 25        → sell 25%
+      sell <mint> init      → sell first-buy SOL (fails if underwater)
+      sell <mint> 5 sol     → sell 5 SOL worth
+    """
     from archetype.execution import sell
 
     settings, rpc = _require_helius()
     ledger = settings.resolved_trading_ledger_db()
     mint = mint.strip()
 
+    percent: float | None = None
+    sol_amount: float | None = None
+    initials = False
+
+    if amount is not None:
+        raw = amount.strip().lower()
+        unit_l = unit.strip().lower() if unit else None
+        if unit_l is not None and unit_l not in ("sol", "sols"):
+            console.print(f"[red]unknown unit:[/red] {unit} (use 'sol' or omit)")
+            raise typer.Exit(code=1)
+        if raw == "init":
+            if unit_l is not None:
+                console.print("[red]sell init takes no unit[/red]")
+                raise typer.Exit(code=1)
+            initials = True
+        elif unit_l in ("sol", "sols"):
+            try:
+                sol_amount = float(raw)
+            except ValueError as exc:
+                console.print(f"[red]invalid SOL amount:[/red] {amount}")
+                raise typer.Exit(code=1) from exc
+        else:
+            try:
+                percent = float(raw)
+            except ValueError as exc:
+                console.print(
+                    f"[red]invalid amount:[/red] {amount} "
+                    "(use a percent, 'init', or '<n> sol')"
+                )
+                raise typer.Exit(code=1) from exc
+
     try:
-        fill = sell(ledger, rpc, mint)
+        fill = sell(
+            ledger,
+            rpc,
+            mint,
+            percent=percent,
+            sol_amount=sol_amount,
+            initials=initials,
+        )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]sell failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -441,13 +495,21 @@ def sell_cmd(
     pct = fill.pnl_pct or 0.0
     color = "green" if pnl >= 0 else "red"
     sign = "+" if pnl >= 0 else ""
+    mode_tag = f" ({fill.mode})" if fill.mode != "full" else ""
     console.print(
-        f"[{color}]SOLD[/{color}] {label}  "
+        f"[{color}]SOLD[/{color}]{mode_tag} {label}  "
         f"proceeds={fill.sol:.4f} SOL  "
         f"PnL={sign}{pnl:.4f} SOL ({sign}{pct:.2f}%)  "
         f"@ {fill.price_sol:.10g} SOL  FDV=${fill.fdv_usd:,.0f}"
     )
-    console.print(f"[dim]wallet={fill.wallet_sol:.4f} SOL[/dim]")
+    if fill.position is not None:
+        console.print(
+            f"[dim]wallet={fill.wallet_sol:.4f} SOL  "
+            f"remaining cost={fill.position.cost_sol:.4f} SOL  "
+            f"tokens={fill.position.tokens:,.4f}[/dim]"
+        )
+    else:
+        console.print(f"[dim]wallet={fill.wallet_sol:.4f} SOL[/dim]")
 
 
 balance_app = typer.Typer(

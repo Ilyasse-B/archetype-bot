@@ -20,6 +20,9 @@ from archetype.filters.helius import HeliusRpc
 from archetype.price.models import PriceTick
 from archetype.price.snapshot import fetch_price_tick
 
+# dust leftover → treat as full close
+_DUST_TOKENS = 1e-9
+
 
 @dataclass
 class FillResult:
@@ -37,6 +40,7 @@ class FillResult:
     pnl_pct: float | None = None
     name: str | None = None
     symbol: str | None = None
+    mode: str = "full"  # full | percent | sol | init
 
 
 @dataclass
@@ -65,7 +69,7 @@ def buy(
     spend size_sol of mock cash at current price.
 
     tokens = size_sol / price_sol (simple, no slippage).
-    rebuy on same mint averages cost basis.
+    rebuy on same mint averages cost basis; initial_cost_sol stays.
     """
     if size_sol <= 0:
         raise ValueError("buy size must be > 0")
@@ -96,6 +100,7 @@ def buy(
             ) / new_cost
         else:
             entry_fdv = tick.fdv_usd
+        initial_cost = existing.initial_cost_sol
     else:
         new_tokens = tokens_bought
         new_cost = size_sol
@@ -103,6 +108,7 @@ def buy(
         name = tick.name
         symbol = tick.symbol
         entry_fdv = tick.fdv_usd
+        initial_cost = size_sol
 
     new_bal = set_balance(ledger_path, bal - size_sol)
     pos = upsert_position(
@@ -114,6 +120,7 @@ def buy(
         cost_sol=new_cost,
         entry_price_sol=entry_price,
         entry_fdv_usd=entry_fdv,
+        initial_cost_sol=initial_cost,
     )
     return FillResult(
         side="buy",
@@ -134,9 +141,29 @@ def sell(
     rpc: HeliusRpc,
     mint: str,
     *,
+    percent: float | None = None,
+    sol_amount: float | None = None,
+    initials: bool = False,
     tick: PriceTick | None = None,
 ) -> FillResult:
-    """full exit of open position at current price."""
+    """
+    sell open position (full / % / SOL out / initials).
+
+    - no args → 100%
+    - percent=25 → 25% of tokens
+    - sol_amount=5 → sell ~5 SOL worth of tokens
+    - initials=True → sell enough to recover first-buy SOL; fails if underwater
+    """
+    modes = sum(
+        [
+            percent is not None,
+            sol_amount is not None,
+            initials,
+        ]
+    )
+    if modes > 1:
+        raise ValueError("use only one of percent / sol amount / init")
+
     pos = get_position(ledger_path, mint)
     if pos is None:
         raise ValueError(f"no open position for {mint}")
@@ -145,36 +172,127 @@ def sell(
     if tick.price_sol <= 0:
         raise ValueError("invalid price")
 
-    proceeds = pos.tokens * tick.price_sol
-    pnl_sol = proceeds - pos.cost_sol
-    pnl_pct = (pnl_sol / pos.cost_sol * 100.0) if pos.cost_sol > 0 else 0.0
+    value_sol = pos.tokens * tick.price_sol
+    mode = "full"
+
+    if initials:
+        mode = "init"
+        init = float(pos.initial_cost_sol or 0.0)
+        if init <= 0:
+            raise ValueError(
+                "no initials left to sell "
+                "(already recovered, or initial size unknown)"
+            )
+        if value_sol + 1e-9 < init:
+            raise ValueError(
+                f"cannot sell initials at a loss: "
+                f"position value={value_sol:.4f} SOL < "
+                f"initials={init:.4f} SOL"
+            )
+        target_sol = init
+        tokens_sold = target_sol / tick.price_sol
+        if tokens_sold > pos.tokens:
+            tokens_sold = pos.tokens
+        proceeds = tokens_sold * tick.price_sol
+        # attribute the recovered capital as cost on this leg (~0 pnl)
+        cost_sold = min(init, pos.cost_sol)
+        new_initial = 0.0
+    elif sol_amount is not None:
+        mode = "sol"
+        if sol_amount <= 0:
+            raise ValueError("SOL amount must be > 0")
+        if sol_amount > value_sol + 1e-9:
+            raise ValueError(
+                f"not enough position value: want {sol_amount:.4f} SOL, "
+                f"have {value_sol:.4f} SOL"
+            )
+        tokens_sold = sol_amount / tick.price_sol
+        if tokens_sold > pos.tokens:
+            tokens_sold = pos.tokens
+        proceeds = tokens_sold * tick.price_sol
+        frac = tokens_sold / pos.tokens if pos.tokens > 0 else 1.0
+        cost_sold = pos.cost_sol * frac
+        new_initial = pos.initial_cost_sol * (1.0 - frac)
+    elif percent is not None:
+        mode = "percent"
+        if percent <= 0 or percent > 100:
+            raise ValueError("percent must be in (0, 100]")
+        frac = percent / 100.0
+        tokens_sold = pos.tokens * frac
+        proceeds = tokens_sold * tick.price_sol
+        cost_sold = pos.cost_sol * frac
+        new_initial = pos.initial_cost_sol * (1.0 - frac)
+    else:
+        mode = "full"
+        tokens_sold = pos.tokens
+        proceeds = value_sol
+        cost_sold = pos.cost_sol
+        new_initial = 0.0
+
+    pnl_sol = proceeds - cost_sold
+    pnl_pct = (pnl_sol / cost_sold * 100.0) if cost_sold > 0 else 0.0
 
     bal = get_balance(ledger_path)
     new_bal = set_balance(ledger_path, bal + proceeds)
-    record_closed_trade(
-        ledger_path,
-        mint=mint,
-        entry_price=pos.entry_price_sol,
-        exit_price=tick.price_sol,
-        size_sol=pos.cost_sol,
-        pnl_sol=pnl_sol,
-        opened_at=pos.opened_at,
-    )
-    delete_position(ledger_path, mint)
+
+    remaining_tokens = pos.tokens - tokens_sold
+    remaining_cost = max(0.0, pos.cost_sol - cost_sold)
+
+    if remaining_tokens <= _DUST_TOKENS or mode == "full":
+        record_closed_trade(
+            ledger_path,
+            mint=mint,
+            entry_price=pos.entry_price_sol,
+            exit_price=tick.price_sol,
+            size_sol=cost_sold,
+            pnl_sol=pnl_sol,
+            opened_at=pos.opened_at,
+            status="closed",
+        )
+        delete_position(ledger_path, mint)
+        remaining_pos: Position | None = None
+    else:
+        entry_price = (
+            remaining_cost / remaining_tokens
+            if remaining_tokens > 0
+            else pos.entry_price_sol
+        )
+        remaining_pos = upsert_position(
+            ledger_path,
+            mint=mint,
+            name=tick.name or pos.name,
+            symbol=tick.symbol or pos.symbol,
+            tokens=remaining_tokens,
+            cost_sol=remaining_cost,
+            entry_price_sol=entry_price,
+            entry_fdv_usd=pos.entry_fdv_usd,
+            initial_cost_sol=max(0.0, new_initial),
+        )
+        record_closed_trade(
+            ledger_path,
+            mint=mint,
+            entry_price=pos.entry_price_sol,
+            exit_price=tick.price_sol,
+            size_sol=cost_sold,
+            pnl_sol=pnl_sol,
+            opened_at=pos.opened_at,
+            status=f"partial:{mode}",
+        )
 
     return FillResult(
         side="sell",
         mint=mint,
         sol=proceeds,
-        tokens=pos.tokens,
+        tokens=tokens_sold,
         price_sol=tick.price_sol,
         fdv_usd=tick.fdv_usd,
-        position=None,
+        position=remaining_pos,
         wallet_sol=new_bal,
         pnl_sol=pnl_sol,
         pnl_pct=pnl_pct,
         name=tick.name or pos.name,
         symbol=tick.symbol or pos.symbol,
+        mode=mode,
     )
 
 

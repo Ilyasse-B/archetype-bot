@@ -31,6 +31,8 @@ class Position:
     entry_price_sol: float
     entry_fdv_usd: float | None
     opened_at: str
+    # first-buy size; used by `sell init` (not bumped on rebuy)
+    initial_cost_sol: float = 0.0
 
     @property
     def label(self) -> str:
@@ -58,10 +60,12 @@ def ensure_wallet(ledger_path: Path, *, start_sol: float = DEFAULT_START_SOL) ->
                 cost_sol REAL NOT NULL,
                 entry_price_sol REAL NOT NULL,
                 entry_fdv_usd REAL,
+                initial_cost_sol REAL NOT NULL DEFAULT 0,
                 opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
+        _migrate_positions(conn)
         row = conn.execute(
             "SELECT sol_balance FROM paper_wallet WHERE id = 1"
         ).fetchone()
@@ -72,7 +76,22 @@ def ensure_wallet(ledger_path: Path, *, start_sol: float = DEFAULT_START_SOL) ->
             )
             conn.commit()
             return WalletState(sol_balance=float(start_sol))
+        conn.commit()
         return WalletState(sol_balance=float(row[0]))
+
+
+def _migrate_positions(conn: sqlite3.Connection) -> None:
+    """add initial_cost_sol for dbs created before that column."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_positions)")}
+    if "initial_cost_sol" not in cols:
+        conn.execute(
+            "ALTER TABLE paper_positions ADD COLUMN initial_cost_sol REAL"
+        )
+        # best-effort: treat current cost as the initial for old rows
+        conn.execute(
+            "UPDATE paper_positions SET initial_cost_sol = cost_sol "
+            "WHERE initial_cost_sol IS NULL"
+        )
 
 
 def get_balance(ledger_path: Path) -> float:
@@ -119,15 +138,19 @@ def reset_wallet(
     return float(start_sol)
 
 
+_POS_COLS = (
+    "id, mint, name, symbol, tokens, cost_sol, "
+    "entry_price_sol, entry_fdv_usd, initial_cost_sol, opened_at"
+)
+
+
 def list_positions(ledger_path: Path) -> list[Position]:
     """all open positions."""
     ensure_wallet(ledger_path)
     with sqlite3.connect(ledger_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, mint, name, symbol, tokens, cost_sol, "
-            "entry_price_sol, entry_fdv_usd, opened_at "
-            "FROM paper_positions ORDER BY id ASC"
+            f"SELECT {_POS_COLS} FROM paper_positions ORDER BY id ASC"
         ).fetchall()
     return [_row_to_pos(r) for r in rows]
 
@@ -138,9 +161,7 @@ def get_position(ledger_path: Path, mint: str) -> Position | None:
     with sqlite3.connect(ledger_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT id, mint, name, symbol, tokens, cost_sol, "
-            "entry_price_sol, entry_fdv_usd, opened_at "
-            "FROM paper_positions WHERE mint = ?",
+            f"SELECT {_POS_COLS} FROM paper_positions WHERE mint = ?",
             (mint,),
         ).fetchone()
     return _row_to_pos(row) if row else None
@@ -156,6 +177,7 @@ def upsert_position(
     cost_sol: float,
     entry_price_sol: float,
     entry_fdv_usd: float | None,
+    initial_cost_sol: float,
 ) -> Position:
     """insert or replace open position for mint."""
     ensure_wallet(ledger_path)
@@ -169,7 +191,8 @@ def upsert_position(
                 """
                 UPDATE paper_positions SET
                     name = ?, symbol = ?, tokens = ?, cost_sol = ?,
-                    entry_price_sol = ?, entry_fdv_usd = ?
+                    entry_price_sol = ?, entry_fdv_usd = ?,
+                    initial_cost_sol = ?
                 WHERE mint = ?
                 """,
                 (
@@ -179,6 +202,7 @@ def upsert_position(
                     float(cost_sol),
                     float(entry_price_sol),
                     entry_fdv_usd,
+                    float(initial_cost_sol),
                     mint,
                 ),
             )
@@ -187,8 +211,8 @@ def upsert_position(
                 """
                 INSERT INTO paper_positions
                     (mint, name, symbol, tokens, cost_sol,
-                     entry_price_sol, entry_fdv_usd)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     entry_price_sol, entry_fdv_usd, initial_cost_sol)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     mint,
@@ -198,13 +222,12 @@ def upsert_position(
                     float(cost_sol),
                     float(entry_price_sol),
                     entry_fdv_usd,
+                    float(initial_cost_sol),
                 ),
             )
         conn.commit()
         row = conn.execute(
-            "SELECT id, mint, name, symbol, tokens, cost_sol, "
-            "entry_price_sol, entry_fdv_usd, opened_at "
-            "FROM paper_positions WHERE mint = ?",
+            f"SELECT {_POS_COLS} FROM paper_positions WHERE mint = ?",
             (mint,),
         ).fetchone()
     assert row is not None
@@ -228,8 +251,9 @@ def record_closed_trade(
     size_sol: float,
     pnl_sol: float,
     opened_at: str | None,
+    status: str = "closed",
 ) -> None:
-    """append a closed row to trades (history)."""
+    """append a closed/partial row to trades (history)."""
     ensure_wallet(ledger_path)
     with sqlite3.connect(ledger_path) as conn:
         # trades table may already exist from schema init
@@ -258,10 +282,11 @@ def record_closed_trade(
             INSERT INTO trades
                 (mint, status, entry_price, exit_price, size_sol,
                  pnl_sol, opened_at, closed_at)
-            VALUES (?, 'closed', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 mint,
+                status,
                 float(entry_price),
                 float(exit_price),
                 float(size_sol),
@@ -273,6 +298,10 @@ def record_closed_trade(
 
 
 def _row_to_pos(row: sqlite3.Row) -> Position:
+    keys = row.keys()
+    initial = row["initial_cost_sol"] if "initial_cost_sol" in keys else None
+    if initial is None:
+        initial = row["cost_sol"]
     return Position(
         id=int(row["id"]),
         mint=str(row["mint"]),
@@ -287,4 +316,5 @@ def _row_to_pos(row: sqlite3.Row) -> Position:
             else None
         ),
         opened_at=str(row["opened_at"]),
+        initial_cost_sol=float(initial),
     )

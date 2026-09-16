@@ -36,6 +36,9 @@ uv run archetype balance reset           # back to 100 SOL, clear positions
 uv run archetype buy <MINT> 5            # paper buy → live watch w/ PnL
 uv run archetype buy <MINT> 5 --no-track # fill only
 uv run archetype sell <MINT>             # full exit
+uv run archetype sell <MINT> 25          # sell 25%
+uv run archetype sell <MINT> init        # recover first-buy SOL (fails if underwater)
+uv run archetype sell <MINT> 5 sol       # sell 5 SOL worth
 
 uv run archetype stop
 ```
