@@ -49,7 +49,7 @@ class FilterThresholds:
     """numeric gates for a single-pass migrate filter."""
 
     min_market_cap_usd: float = 10_000.0
-    min_global_fees_sol: float = 3.0
+    min_global_fees_sol: float = 2.25
     min_pool_sol: float = 0.5  # sanity floor on quote vault at migrate
     # creator fee share of total fees (rough) — used to estimate global fees
     # from unclaimed creator vault. axiom "fees" is indexed; this is best-effort.
