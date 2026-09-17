@@ -24,6 +24,7 @@ from archetype.filters import run_full_filters
 from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
 from archetype.execution import ensure_wallet
+from archetype.execution.tpsl import TpslEngine
 
 
 class StatusResponse(BaseModel):
@@ -104,9 +105,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         # ensure paper wallet tables exist
         await asyncio.to_thread(ensure_wallet, ledger)
+        tpsl = TpslEngine(rpc=rpc, ledger_path=ledger)
+        app.state.tpsl_engine = tpsl
+        await tpsl.start()
         await feed.start()
         yield
         await feed.stop()
+        await tpsl.stop()
         rpc.close()
 
     app = FastAPI(title="Archetype Agent", version=__version__, lifespan=lifespan)

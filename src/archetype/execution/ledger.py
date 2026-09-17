@@ -144,6 +144,40 @@ def record_fill(
         return int(cur.lastrowid)
 
 
+def set_round_tpsl(
+    ledger_path: Path,
+    round_id: int,
+    *,
+    tp: float | None,
+    sl: float | None,
+) -> None:
+    """persist take-profit / stop-loss percentages on an open round."""
+    ensure_trade_ledger(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        conn.execute(
+            "UPDATE trade_rounds SET tp = ?, sl = ? WHERE id = ?",
+            (tp, sl, int(round_id)),
+        )
+        conn.commit()
+
+
+def get_round_tpsl(
+    ledger_path: Path, round_id: int
+) -> tuple[float | None, float | None]:
+    """return (tp_pct, sl_pct) — None means unset."""
+    ensure_trade_ledger(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        row = conn.execute(
+            "SELECT tp, sl FROM trade_rounds WHERE id = ?",
+            (int(round_id),),
+        ).fetchone()
+    if row is None:
+        return None, None
+    tp = float(row[0]) if row[0] is not None else None
+    sl = float(row[1]) if row[1] is not None else None
+    return tp, sl
+
+
 @dataclass
 class ClosedRound:
     """summary after finalize."""

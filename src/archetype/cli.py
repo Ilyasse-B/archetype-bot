@@ -105,6 +105,14 @@ def _position_from_api(data: dict | None):
         round_id=(
             int(data["round_id"]) if data.get("round_id") is not None else None
         ),
+        profit_pct=(
+            float(data["profit_pct"])
+            if data.get("profit_pct") is not None
+            else None
+        ),
+        loss_pct=(
+            float(data["loss_pct"]) if data.get("loss_pct") is not None else None
+        ),
     )
 
 
@@ -424,7 +432,8 @@ def watch_cmd(
             f"{settings.base_url}/paper/position/{mint}", timeout=10.0
         )
         if resp.status_code == 200:
-            pos = _position_from_api((resp.json() or {}).get("position"))
+            data = resp.json() or {}
+            pos = _position_from_api(data.get("position"))
     except httpx.HTTPError:
         console.print(
             "[dim]daemon unreachable — watch is price-only "
@@ -457,6 +466,7 @@ def watch_cmd(
             console,
             position=pos,
             ledger_path=ledger,
+            daemon_base_url=settings.base_url,
         )
     except KeyboardInterrupt:
         console.print("\n[dim]stopped watching[/dim]")
@@ -516,7 +526,72 @@ def buy_cmd(
             console,
             position=pos,
             ledger_path=settings.resolved_trading_ledger_db(),
+            daemon_base_url=settings.base_url,
         )
+
+
+@app.command("set-profit")
+def set_profit_cmd(
+    mint: str = typer.Argument(..., help="token mint with open position"),
+    pct: str = typer.Argument(
+        ..., help="take-profit %% (e.g. 50), or 'clear'"
+    ),
+) -> None:
+    """set / clear take-profit %% — daemon monitors and auto-sells on hit."""
+    mint = mint.strip()
+    body: dict = {"mint": mint}
+    if pct.strip().lower() in ("clear", "off", "none", "0"):
+        body["clear_profit"] = True
+    else:
+        try:
+            body["profit_pct"] = float(pct)
+        except ValueError:
+            console.print(f"[red]bad %:[/red] {pct}")
+            raise typer.Exit(code=1)
+    resp = _post("/paper/tpsl", body, timeout=30.0)
+    if resp.status_code != 200:
+        _api_error(resp, "set-profit")
+    data = resp.json() or {}
+    tp = data.get("profit_pct")
+    sl = data.get("loss_pct")
+    console.print(
+        f"[yellow]TPSL[/yellow] mint={mint}  "
+        f"TP={('+' + str(tp) + '%') if tp is not None else '—'}  "
+        f"SL={('-' + str(sl) + '%') if sl is not None else '—'}  "
+        f"[{'monitoring' if data.get('monitoring') else 'idle'}]"
+    )
+
+
+@app.command("set-loss")
+def set_loss_cmd(
+    mint: str = typer.Argument(..., help="token mint with open position"),
+    pct: str = typer.Argument(
+        ..., help="stop-loss %% magnitude (e.g. 20 → −20%), or 'clear'"
+    ),
+) -> None:
+    """set / clear stop-loss %% — daemon monitors and auto-sells on hit."""
+    mint = mint.strip()
+    body: dict = {"mint": mint}
+    if pct.strip().lower() in ("clear", "off", "none", "0"):
+        body["clear_loss"] = True
+    else:
+        try:
+            body["loss_pct"] = float(pct)
+        except ValueError:
+            console.print(f"[red]bad %:[/red] {pct}")
+            raise typer.Exit(code=1)
+    resp = _post("/paper/tpsl", body, timeout=30.0)
+    if resp.status_code != 200:
+        _api_error(resp, "set-loss")
+    data = resp.json() or {}
+    tp = data.get("profit_pct")
+    sl = data.get("loss_pct")
+    console.print(
+        f"[yellow]TPSL[/yellow] mint={mint}  "
+        f"TP={('+' + str(tp) + '%') if tp is not None else '—'}  "
+        f"SL={('-' + str(sl) + '%') if sl is not None else '—'}  "
+        f"[{'monitoring' if data.get('monitoring') else 'idle'}]"
+    )
 
 
 @app.command("sell")

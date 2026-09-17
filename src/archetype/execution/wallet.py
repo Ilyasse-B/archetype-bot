@@ -41,6 +41,9 @@ class Position:
     sold_sol: float = 0.0
     # links to trade_rounds while open
     round_id: int | None = None
+    # take-profit / stop-loss % (from trade_rounds; not stored on positions row)
+    profit_pct: float | None = None
+    loss_pct: float | None = None
 
     @property
     def label(self) -> str:

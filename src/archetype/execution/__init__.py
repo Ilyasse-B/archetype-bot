@@ -8,12 +8,6 @@ from archetype.execution.fills import (
     mark_position,
     sell,
 )
-from archetype.execution.ledger import (
-    finalize_round,
-    list_fills_for_round,
-    open_round,
-    record_fill,
-)
 from archetype.execution.track import (
     format_position_header,
     format_watch_line,
@@ -32,6 +26,14 @@ from archetype.execution.wallet import (
     list_positions,
     reset_wallet,
 )
+from archetype.execution.ledger import (
+    finalize_round,
+    get_round_tpsl,
+    list_fills_for_round,
+    open_round,
+    record_fill,
+    set_round_tpsl,
+)
 
 __all__ = [
     "DEFAULT_START_SOL",
@@ -45,6 +47,7 @@ __all__ = [
     "format_watch_line",
     "get_balance",
     "get_position",
+    "get_round_tpsl",
     "list_fills_for_round",
     "list_positions",
     "mark_all_positions",
@@ -56,4 +59,5 @@ __all__ = [
     "run_inline_pnl",
     "run_inline_watch",
     "sell",
+    "set_round_tpsl",
 ]

@@ -270,6 +270,7 @@ def sell(
     name: str | None = None,
     symbol: str | None = None,
     known_pool: str | None = None,
+    exit_reason: str | None = None,
 ) -> FillResult:
     """
     sell open position (full / % / SOL out / initials).
@@ -278,6 +279,7 @@ def sell(
     - percent=25 → 25% of tokens
     - sol_amount=5 → sell ~5 SOL worth of tokens
     - initials=True → sell enough to recover first-buy SOL; fails if underwater
+    - exit_reason='tp'|'sl' → labels the fill when auto-exiting
 
     pass tick to fill at the live watch price the user saw.
     """
@@ -376,6 +378,10 @@ def sell(
         cost_sold = pos.cost_sol
         new_initial = 0.0
 
+    # auto-exit label overrides mode for the fill row
+    if exit_reason in ("tp", "sl") and mode == "full":
+        mode = exit_reason
+
     pnl_sol = proceeds - cost_sold
     pnl_pct = (pnl_sol / cost_sold * 100.0) if cost_sold > 0 else 0.0
 
@@ -417,7 +423,7 @@ def sell(
         symbol=label_symbol,
     )
 
-    if remaining_tokens <= _DUST_TOKENS or mode == "full":
+    if remaining_tokens <= _DUST_TOKENS or mode in ("full", "tp", "sl"):
         finalize_round(
             ledger_path,
             int(round_id),

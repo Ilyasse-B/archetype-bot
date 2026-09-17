@@ -74,6 +74,14 @@ def _position_from_api(data: dict | None) -> Position | None:
         round_id=(
             int(data["round_id"]) if data.get("round_id") is not None else None
         ),
+        profit_pct=(
+            float(data["profit_pct"])
+            if data.get("profit_pct") is not None
+            else None
+        ),
+        loss_pct=(
+            float(data["loss_pct"]) if data.get("loss_pct") is not None else None
+        ),
     )
 
 
@@ -166,6 +174,13 @@ def _parse_watch_cmd(raw: str) -> tuple[str, list[str]] | None:
     parts = s.split()
     verb = parts[0].lower()
     args = parts[1:]
+    # "set profit 50" / "set loss 20" / "set profit clear"
+    if verb == "set" and args:
+        side = args[0].lower()
+        if side in ("profit", "tp"):
+            return "set_profit", args[1:]
+        if side in ("loss", "sl", "stop"):
+            return "set_loss", args[1:]
     # aliases
     if verb in ("w",):
         verb = "watch"  # noop if already watching
@@ -228,19 +243,62 @@ def _tick_body(tick, *, name: str | None = None, symbol: str | None = None) -> d
     }
 
 
-def _fetch_position(
+def _apply_tpsl_to_pos(pos, tpsl: dict | None):
+    """overlay profit/loss % onto a Position (mutates)."""
+    if pos is None or not tpsl:
+        return pos
+    if "profit_pct" in tpsl:
+        pos.profit_pct = (
+            float(tpsl["profit_pct"])
+            if tpsl.get("profit_pct") is not None
+            else None
+        )
+    if "loss_pct" in tpsl:
+        pos.loss_pct = (
+            float(tpsl["loss_pct"]) if tpsl.get("loss_pct") is not None else None
+        )
+    return pos
+
+
+def _fetch_position_bundle(
     settings: Settings, mint: str
-) -> Position | None:
-    """GET open paper position if any."""
+) -> tuple[Position | None, dict | None, dict | None]:
+    """GET position + tpsl + last_hit in one call."""
     try:
         resp = httpx.get(
             f"{settings.base_url}/paper/position/{mint}", timeout=10.0
         )
-        if resp.status_code == 200:
-            return _position_from_api((resp.json() or {}).get("position"))
+        if resp.status_code != 200:
+            return None, None, None
+        data = resp.json() or {}
+        pos = _position_from_api(data.get("position"))
+        tpsl = data.get("tpsl")
+        _apply_tpsl_to_pos(pos, tpsl)
+        return pos, tpsl, data.get("last_hit")
     except httpx.HTTPError:
-        return None
-    return None
+        return None, None, None
+
+
+def _fetch_position(settings: Settings, mint: str) -> Position | None:
+    """GET open paper position if any."""
+    pos, _tpsl, _hit = _fetch_position_bundle(settings, mint)
+    return pos
+
+
+def _format_tpsl_hit(hit: dict) -> str:
+    """rich markup for an auto-exit event."""
+    reason = str(hit.get("reason") or "?").upper()
+    tag = "green" if reason == "TP" else "red"
+    pnl = float(hit.get("pnl_sol") or 0)
+    pct = float(hit.get("pnl_pct") or 0)
+    sign = "+" if pct >= 0 else ""
+    label = hit.get("symbol") or hit.get("name") or hit.get("mint", "")[:8]
+    return (
+        f"[{tag} bold]{reason} HIT[/] {label}  "
+        f"sold={float(hit.get('sol') or 0):.4f} SOL  "
+        f"PnL={sign}{pnl:.4f} SOL ({sign}{pct:.2f}%)  "
+        f"FDV=${float(hit.get('fdv_usd') or 0):,.0f}"
+    )
 
 
 @contextmanager
@@ -298,6 +356,8 @@ async def _interactive_watch(
 
     help_bits = [
         "buy <sol>",
+        "set profit <pct>|clear",
+        "set loss <pct>|clear",
         "reject",
         "leave/exit/stop",
     ]
@@ -314,6 +374,8 @@ async def _interactive_watch(
     input_buf = ""
     price_line: Text | None = None
     last_tick = None  # PriceTick | None — for redraw after buy/sell
+    last_tpsl_poll = 0.0
+    seen_hit_seq = 0
 
     async def _stdin_reader() -> None:
         # cbreak: read 1 char, we echo via Live panel
@@ -384,6 +446,38 @@ async def _interactive_watch(
                             )
                             first = False
                         last_tick = tick
+
+                        # poll daemon ~1s for TP/SL hit (daemon owns the exit)
+                        now = time.monotonic()
+                        if now - last_tpsl_poll >= 1.0:
+                            last_tpsl_poll = now
+                            new_pos, _tpsl, hit = await asyncio.to_thread(
+                                _fetch_position_bundle, settings, mint
+                            )
+                            if (
+                                hit
+                                and int(hit.get("seq") or 0) > seen_hit_seq
+                            ):
+                                seen_hit_seq = int(hit.get("seq") or 0)
+                                live.console.print(_format_tpsl_hit(hit))
+                                pos = None
+                                bought = True  # still counts as traded
+                                result.bought = True
+                                if last_tick is not None:
+                                    price_line = format_watch_line(
+                                        last_tick, None
+                                    )
+                                _refresh(live)
+                                next_tick = asyncio.create_task(
+                                    tick_iter.__anext__(), name="next-tick"
+                                )
+                                continue
+                            if new_pos is not None:
+                                pos = new_pos
+                            elif pos is not None:
+                                # closed manually elsewhere
+                                pos = None
+
                         price_line = format_watch_line(tick, pos)
                         _refresh(live)
                         next_tick = asyncio.create_task(
@@ -478,8 +572,91 @@ async def _interactive_watch(
                                     )
                                 live.console.print(
                                     "[dim]cmds: buy <sol> | "
-                                    "sell [pct|init|<n> sol] "
-                                    "| reject | leave[/dim]"
+                                    "sell [pct|init|<n> sol] | "
+                                    "set profit/loss <pct>|clear | "
+                                    "reject | leave[/dim]"
+                                )
+                                if last_tick is not None:
+                                    price_line = format_watch_line(
+                                        last_tick, pos
+                                    )
+                                _refresh(live)
+                                continue
+
+                            if verb in ("set_profit", "set_loss"):
+                                if pos is None or pos.tokens <= 0:
+                                    live.console.print(
+                                        "[yellow]buy first, then set "
+                                        "profit/loss[/yellow]"
+                                    )
+                                    continue
+                                side = (
+                                    "profit"
+                                    if verb == "set_profit"
+                                    else "loss"
+                                )
+                                if not args:
+                                    live.console.print(
+                                        f"[yellow]usage:[/yellow] "
+                                        f"set {side} <pct>|clear"
+                                    )
+                                    continue
+                                body_tpsl: dict[str, Any] = {"mint": mint}
+                                token = args[0].lower()
+                                if token in ("clear", "off", "none", "0"):
+                                    body_tpsl[
+                                        "clear_profit"
+                                        if side == "profit"
+                                        else "clear_loss"
+                                    ] = True
+                                else:
+                                    try:
+                                        pct = float(args[0])
+                                    except ValueError:
+                                        live.console.print(
+                                            f"[yellow]bad %:[/yellow] {args[0]}"
+                                        )
+                                        continue
+                                    if pct <= 0:
+                                        live.console.print(
+                                            "[yellow]% must be > 0 "
+                                            "(or clear)[/yellow]"
+                                        )
+                                        continue
+                                    body_tpsl[
+                                        "profit_pct"
+                                        if side == "profit"
+                                        else "loss_pct"
+                                    ] = pct
+                                data = _post_paper(
+                                    settings,
+                                    "/paper/tpsl",
+                                    body_tpsl,
+                                    live.console,
+                                )
+                                if data is None:
+                                    continue
+                                _apply_tpsl_to_pos(pos, data)
+                                tp = data.get("profit_pct")
+                                sl = data.get("loss_pct")
+                                tp_s = (
+                                    f"+{float(tp):g}%"
+                                    if tp is not None
+                                    else "—"
+                                )
+                                sl_s = (
+                                    f"-{float(sl):g}%"
+                                    if sl is not None
+                                    else "—"
+                                )
+                                mon = (
+                                    "monitoring"
+                                    if data.get("monitoring")
+                                    else "idle"
+                                )
+                                live.console.print(
+                                    f"[yellow]TPSL[/yellow] TP={tp_s}  "
+                                    f"SL={sl_s}  [{mon}]"
                                 )
                                 if last_tick is not None:
                                     price_line = format_watch_line(
@@ -576,7 +753,7 @@ async def _interactive_watch(
 
                             live.console.print(
                                 f"[yellow]unknown cmd:[/yellow] {raw}  "
-                                "(buy / sell / reject / leave)"
+                                "(buy / sell / set profit|loss / reject / leave)"
                             )
                             continue
 
@@ -683,7 +860,7 @@ def run_filtered_trade_stream(
     rpc = HeliusRpc(settings.helius_api_key)
     console.print(
         "[bold]filtered trade stream[/bold]  "
-        "[dim]watch / reject · during watch: buy · sell · reject · leave[/dim]"
+        "[dim]watch / reject · during watch: buy · sell · set profit/loss · reject · leave[/dim]"
     )
 
     try:

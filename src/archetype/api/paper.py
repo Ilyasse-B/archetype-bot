@@ -85,6 +85,20 @@ class SellRequest(BaseModel):
     sol_usd: float | None = Field(None, gt=0)
 
 
+class TpslRequest(BaseModel):
+    """
+    set / clear take-profit and stop-loss percentages.
+
+    omit a field to leave it unchanged; send null to clear that side.
+    """
+
+    mint: str
+    profit_pct: float | None = Field(None, description="+% pnl to take profit")
+    loss_pct: float | None = Field(None, description="−% pnl stop (positive)")
+    clear_profit: bool = False
+    clear_loss: bool = False
+
+
 class AddSolRequest(BaseModel):
     sol: float = Field(..., gt=0)
 
@@ -93,10 +107,14 @@ class ResetRequest(BaseModel):
     start: float = Field(DEFAULT_START_SOL, gt=0)
 
 
-def _pos_dict(pos: Position | None) -> dict[str, Any] | None:
+def _pos_dict(
+    pos: Position | None,
+    *,
+    tpsl: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if pos is None:
         return None
-    return {
+    out: dict[str, Any] = {
         "id": pos.id,
         "mint": pos.mint,
         "name": pos.name,
@@ -112,6 +130,11 @@ def _pos_dict(pos: Position | None) -> dict[str, Any] | None:
         "round_id": pos.round_id,
         "opened_at": pos.opened_at,
     }
+    if tpsl:
+        out["profit_pct"] = tpsl.get("profit_pct")
+        out["loss_pct"] = tpsl.get("loss_pct")
+        out["tpsl_monitoring"] = tpsl.get("monitoring")
+    return out
 
 
 def _fill_dict(fill: Any) -> dict[str, Any]:
@@ -144,6 +167,13 @@ def _rpc_ledger(request: Request) -> tuple[HeliusRpc, Path]:
     return rpc, ledger
 
 
+def _tpsl_engine(request: Request):
+    engine = getattr(request.app.state, "tpsl_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="tpsl engine not ready")
+    return engine
+
+
 def create_paper_router() -> APIRouter:
     """paper trading routes mounted on the daemon app."""
     router = APIRouter(prefix="/paper", tags=["paper"])
@@ -152,16 +182,17 @@ def create_paper_router() -> APIRouter:
     async def paper_balance(request: Request) -> dict[str, Any]:
         """cash + open positions with one-shot marks."""
         rpc, ledger = _rpc_ledger(request)
+        engine = getattr(request.app.state, "tpsl_engine", None)
 
         def _run() -> dict[str, Any]:
             cash = get_balance(ledger)
             marks = mark_all_positions(ledger, rpc)
-            return {
-                "ok": True,
-                "cash_sol": cash,
-                "positions": [
+            positions = []
+            for m in marks:
+                tpsl = engine.levels_dict(m.position.mint) if engine else None
+                positions.append(
                     {
-                        **(_pos_dict(m.position) or {}),
+                        **(_pos_dict(m.position, tpsl=tpsl) or {}),
                         "price_sol": m.price_sol,
                         "fdv_usd": m.fdv_usd,
                         "value_sol": m.value_sol,
@@ -170,9 +201,8 @@ def create_paper_router() -> APIRouter:
                         "name": m.name,
                         "symbol": m.symbol,
                     }
-                    for m in marks
-                ],
-            }
+                )
+            return {"ok": True, "cash_sol": cash, "positions": positions}
 
         try:
             return await asyncio.to_thread(_run)
@@ -199,11 +229,16 @@ def create_paper_router() -> APIRouter:
         body: ResetRequest, request: Request
     ) -> dict[str, Any]:
         _, ledger = _rpc_ledger(request)
+        engine = getattr(request.app.state, "tpsl_engine", None)
 
         def _run() -> float:
             return reset_wallet(ledger, start_sol=body.start)
 
         new_bal = await asyncio.to_thread(_run)
+        if engine is not None:
+            # wipe monitors — wallet reset clears positions
+            for mint in list(getattr(engine, "_tasks", {})):
+                await engine.on_position_closed(mint)
         return {
             "ok": True,
             "cash_sol": new_bal,
@@ -212,18 +247,71 @@ def create_paper_router() -> APIRouter:
 
     @router.get("/position/{mint}")
     async def paper_position(mint: str, request: Request) -> dict[str, Any]:
-        """one open position (for CLI watch PnL overlay)."""
+        """one open position (for CLI watch PnL overlay) + tpsl levels."""
         _, ledger = _rpc_ledger(request)
+        engine = getattr(request.app.state, "tpsl_engine", None)
         pos = await asyncio.to_thread(get_position, ledger, mint.strip())
-        if pos is None:
-            return {"ok": True, "position": None}
-        return {"ok": True, "position": _pos_dict(pos)}
+        tpsl = engine.levels_dict(mint.strip()) if engine else None
+        hit = tpsl.get("last_hit") if tpsl else None
+        return {
+            "ok": True,
+            "position": _pos_dict(pos, tpsl=tpsl),
+            "tpsl": tpsl,
+            "last_hit": hit,
+        }
+
+    @router.get("/tpsl/{mint}")
+    async def paper_tpsl_get(mint: str, request: Request) -> dict[str, Any]:
+        """current tp/sl + whether daemon is monitoring + last hit."""
+        engine = _tpsl_engine(request)
+        data = engine.levels_dict(mint.strip())
+        return {"ok": True, **data}
+
+    @router.post("/tpsl")
+    async def paper_tpsl_set(
+        body: TpslRequest, request: Request
+    ) -> dict[str, Any]:
+        """configure take-profit / stop-loss % on an open position."""
+        engine = _tpsl_engine(request)
+        mint = body.mint.strip()
+
+        kw: dict[str, Any] = {}
+        if body.clear_profit:
+            kw["profit_pct"] = None
+        elif "profit_pct" in body.model_fields_set:
+            if body.profit_pct is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="profit_pct null — use clear_profit=true",
+                )
+            kw["profit_pct"] = body.profit_pct
+        if body.clear_loss:
+            kw["loss_pct"] = None
+        elif "loss_pct" in body.model_fields_set:
+            if body.loss_pct is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="loss_pct null — use clear_loss=true",
+                )
+            kw["loss_pct"] = body.loss_pct
+
+        if not kw:
+            raise HTTPException(
+                status_code=400,
+                detail="pass profit_pct / loss_pct or clear_profit / clear_loss",
+            )
+        try:
+            levels = await engine.set_levels(mint, **kw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, **engine.levels_dict(mint), "active": levels.active}
 
     @router.post("/buy")
     async def paper_buy(body: BuyRequest, request: Request) -> dict[str, Any]:
         rpc, ledger = _rpc_ledger(request)
         mint = body.mint.strip()
         tick = _tick_from_body(body, mint)
+        engine = getattr(request.app.state, "tpsl_engine", None)
 
         def _run() -> Any:
             return buy(
@@ -241,7 +329,12 @@ def create_paper_router() -> APIRouter:
             fill = await asyncio.to_thread(_run)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True, "fill": _fill_dict(fill)}
+        tpsl = engine.levels_dict(mint) if engine else None
+        out = _fill_dict(fill)
+        if out.get("position") is not None and tpsl:
+            out["position"]["profit_pct"] = tpsl.get("profit_pct")
+            out["position"]["loss_pct"] = tpsl.get("loss_pct")
+        return {"ok": True, "fill": out}
 
     @router.post("/sell")
     async def paper_sell(body: SellRequest, request: Request) -> dict[str, Any]:
@@ -260,6 +353,7 @@ def create_paper_router() -> APIRouter:
                 detail="use only one of percent / sol_amount / initials",
             )
         tick = _tick_from_body(body, mint)
+        engine = getattr(request.app.state, "tpsl_engine", None)
 
         def _run() -> Any:
             return sell(
@@ -279,6 +373,9 @@ def create_paper_router() -> APIRouter:
             fill = await asyncio.to_thread(_run)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # flat → stop tpsl monitor
+        if fill.position is None and engine is not None:
+            await engine.on_position_closed(mint)
         return {"ok": True, "fill": _fill_dict(fill)}
 
     return router
