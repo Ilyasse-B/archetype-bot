@@ -1,5 +1,6 @@
 """local llm client for the phase 4 lock loop."""
 
+from archetype.llm.binder import AgentToolkit
 from archetype.llm.client import make_chat
 from archetype.llm.decision import (
     DecisionInvalid,
@@ -10,6 +11,7 @@ from archetype.llm.decision import (
 from archetype.llm.memory import FocusMemory, PromptWindow
 
 __all__ = [
+    "AgentToolkit",
     "DecisionInvalid",
     "FocusMemory",
     "PromptWindow",
