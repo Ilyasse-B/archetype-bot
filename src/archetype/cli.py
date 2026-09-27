@@ -475,6 +475,65 @@ def watch_cmd(
         raise typer.Exit(code=1) from exc
 
 
+@app.command("peek")
+def peek_cmd(
+    mint: str = typer.Argument(..., help="token mint to peek"),
+) -> None:
+    """one-shot FDV/price via daemon agent API (same tool the LLM will call)."""
+    mint = mint.strip()
+    resp = _post("/agent/peek", {"mint": mint}, timeout=60.0)
+    if resp.status_code != 200:
+        _api_error(resp, "peek")
+    d = resp.json() or {}
+    label = d.get("symbol") or d.get("name") or mint[:8]
+    console.print(
+        f"[bold]peek[/bold] {label}  "
+        f"FDV=${float(d.get('fdv_usd') or 0):,.0f}  "
+        f"price={float(d.get('price_sol') or 0):.10g} SOL  "
+        f"pool={float(d.get('pool_sol') or 0):.2f} SOL"
+    )
+    if d.get("holding"):
+        pnl = float(d.get("pnl_sol") or 0)
+        pct = float(d.get("pnl_pct") or 0)
+        sign = "+" if pct >= 0 else ""
+        color = "green" if pnl >= 0 else "red"
+        console.print(
+            f"[{color}]holding value={float(d.get('value_sol') or 0):.4f} SOL  "
+            f"PnL={sign}{pnl:.4f} SOL ({sign}{pct:.2f}%)[/{color}]"
+        )
+        tp, sl = d.get("profit_pct"), d.get("loss_pct")
+        if tp is not None or sl is not None:
+            console.print(
+                f"[yellow]TP="
+                f"{('+' + str(tp) + '%') if tp is not None else '—'}  "
+                f"SL={('-' + str(sl) + '%') if sl is not None else '—'}[/yellow]"
+            )
+
+
+@app.command("agent-tools")
+def agent_tools_cmd() -> None:
+    """list the /agent tool catalog the Phase 4 LLM will bind."""
+    resp = _get("/agent/tools", timeout=10.0)
+    if resp.status_code != 200:
+        _api_error(resp, "agent-tools")
+    tools = (resp.json() or {}).get("tools") or []
+    table = Table(title="Agent tool catalog")
+    table.add_column("name", style="cyan")
+    table.add_column("when")
+    table.add_column("method")
+    table.add_column("path")
+    table.add_column("description")
+    for t in tools:
+        table.add_row(
+            str(t.get("name") or ""),
+            str(t.get("when") or ""),
+            str(t.get("method") or ""),
+            str(t.get("path") or ""),
+            str(t.get("description") or "")[:60],
+        )
+    console.print(table)
+
+
 @app.command("buy")
 def buy_cmd(
     mint: str = typer.Argument(..., help="token mint to buy"),

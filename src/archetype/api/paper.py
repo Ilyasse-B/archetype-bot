@@ -29,18 +29,20 @@ from archetype.price.models import PUMP_FDV_SUPPLY, PriceTick, build_tick
 
 
 def _tick_from_body(
-    body: BuyRequest | SellRequest,
+    body: Any,
     mint: str,
 ) -> PriceTick | None:
-    """rebuild a PriceTick from optional CLI watch snapshot fields."""
-    if body.price_sol is None:
+    """rebuild a PriceTick from optional CLI/agent watch snapshot fields."""
+    if getattr(body, "price_sol", None) is None:
         return None
     price = float(body.price_sol)
     # prefer fdv→sol_usd so stored fdv_usd matches what the CLI showed
-    if body.fdv_usd is not None and price > 0:
-        sol_usd = float(body.fdv_usd) / (price * PUMP_FDV_SUPPLY)
-    elif body.sol_usd is not None and body.sol_usd > 0:
-        sol_usd = float(body.sol_usd)
+    fdv_usd = getattr(body, "fdv_usd", None)
+    sol_usd_b = getattr(body, "sol_usd", None)
+    if fdv_usd is not None and price > 0:
+        sol_usd = float(fdv_usd) / (price * PUMP_FDV_SUPPLY)
+    elif sol_usd_b is not None and sol_usd_b > 0:
+        sol_usd = float(sol_usd_b)
     else:
         sol_usd = 150.0
     # synthesize reserves consistent with price (price = quote/base)
@@ -48,14 +50,14 @@ def _tick_from_body(
     quote_sol = price * base_ui
     return build_tick(
         mint=mint,
-        pool=body.pool or "",
+        pool=getattr(body, "pool", None) or "",
         base_ui=base_ui,
         quote_sol=quote_sol,
         supply_ui=base_ui,
         decimals=6,
         sol_usd=sol_usd,
-        name=body.name,
-        symbol=body.symbol,
+        name=getattr(body, "name", None),
+        symbol=getattr(body, "symbol", None),
         source="cli",
     )
 
