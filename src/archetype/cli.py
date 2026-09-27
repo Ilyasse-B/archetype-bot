@@ -401,11 +401,17 @@ def watch_cmd(
         "--once",
         help="print one snapshot and exit",
     ),
+    trade: bool = typer.Option(
+        False,
+        "--trade",
+        help="watch this mint and trade it live (buy / sell / set profit|loss)",
+    ),
 ) -> None:
     """
     live PumpSwap FDV for a mint (inline) — Helius WS runs in this CLI process.
 
     if the daemon has an open paper position on that mint, also shows value + PnL.
+    --trade adds the same buy / sell commands as migrations --trade.
     """
     import logging
 
@@ -424,6 +430,14 @@ def watch_cmd(
     rpc = HeliusRpc(settings.helius_api_key)
     mint = mint.strip()
     ledger = settings.resolved_trading_ledger_db()
+
+    if trade:
+        if once:
+            console.print("[yellow]--once ignored with --trade[/yellow]")
+        from archetype.agent import run_watch_trade
+
+        run_watch_trade(settings, console, mint)
+        return
 
     # position comes from daemon (single writer); price WS stays local
     pos = None

@@ -22,7 +22,6 @@ from typing import Any, Literal
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
-from archetype.api.paper import _fill_dict, _pos_dict
 from archetype.execution.fills import mark_all_positions
 from archetype.execution.tpsl import TpslEngine
 from archetype.execution.wallet import get_balance, get_position
@@ -268,6 +267,9 @@ class AgentToolkit:
             return await asyncio.to_thread(next_candidate, kit.ledger_path)
 
         async def get_wallet() -> dict[str, Any]:
+            # lazy — api package imports the daemon app
+            from archetype.api.paper import _pos_dict
+
             def _run() -> dict[str, Any]:
                 cash = get_balance(kit.ledger_path)
                 marks = mark_all_positions(kit.ledger_path, kit.rpc)
@@ -291,6 +293,8 @@ class AgentToolkit:
             return await asyncio.to_thread(_run)
 
         async def get_position_tool(mint: str = "") -> dict[str, Any]:
+            from archetype.api.paper import _pos_dict
+
             use, err = kit._resolve_mint(mint)
             if err or use is None:
                 return err or _deny("mint required")
@@ -316,6 +320,8 @@ class AgentToolkit:
                 return err or _deny("mint required")
             if sol <= 0 or profit_pct <= 0 or loss_pct <= 0:
                 return _deny("buy needs sol, profit_pct, and loss_pct > 0")
+            from archetype.api.paper import _fill_dict
+
             raw = await asyncio.to_thread(
                 agent_buy,
                 kit.ledger_path,
@@ -353,6 +359,8 @@ class AgentToolkit:
             )
             if modes > 1:
                 return _deny("use only one of percent / sol_amount / initials")
+            from archetype.api.paper import _fill_dict
+
             fill = await asyncio.to_thread(
                 agent_sell,
                 kit.ledger_path,

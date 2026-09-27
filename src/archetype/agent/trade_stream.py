@@ -836,6 +836,54 @@ def _wait_for_backlog_item(
         return None
 
 
+def run_watch_trade(
+    settings: Settings,
+    console: Console | None,
+    mint: str,
+) -> None:
+    """
+    live watch one mint with the same buy / sell / set profit|loss cmds
+    as the filtered trade stream. does not touch the backlog.
+    """
+    console = console or Console()
+    mint = mint.strip()
+    if not settings.helius_api_key.strip():
+        console.print("[red]ARCHETYPE_HELIUS_API_KEY not set[/red]")
+        return
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    rpc = HeliusRpc(settings.helius_api_key)
+    ledger = settings.resolved_trading_ledger_db()
+    ensure_agent_tables(ledger)
+    console.print(
+        f"[bold]watch trade[/bold] {mint}  "
+        "[dim]buy · sell · set profit/loss · reject · leave[/dim]"
+    )
+    try:
+        session = asyncio.run(
+            _interactive_watch(
+                rpc,
+                mint,
+                console,
+                settings,
+                ledger_path=ledger,
+            )
+        )
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped watching[/dim]")
+        return
+    if session.action == "reject":
+        record_reject(
+            ledger,
+            mint,
+            reasoning="manual reject (watch --trade)",
+            decision="reject",
+        )
+        console.print(f"[red]REJECTED[/red] {mint} → agent_rejects")
+    else:
+        console.print("[dim]stopped watching[/dim]")
+
+
 def run_filtered_trade_stream(
     settings: Settings,
     console: Console | None = None,
@@ -858,6 +906,16 @@ def run_filtered_trade_stream(
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     rpc = HeliusRpc(settings.helius_api_key)
+    try:
+        resp = httpx.get(f"{settings.base_url}/agent/loop", timeout=3.0)
+        if resp.status_code == 200 and (resp.json() or {}).get("running"):
+            console.print(
+                "[yellow]agent loop is running and owns the backlog. "
+                "POST /agent/loop/stop before this stream.[/yellow]"
+            )
+            return
+    except httpx.HTTPError:
+        pass
     console.print(
         "[bold]filtered trade stream[/bold]  "
         "[dim]watch / reject · during watch: buy · sell · set profit/loss · reject · leave[/dim]"

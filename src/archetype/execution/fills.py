@@ -189,27 +189,28 @@ def buy(
         initial_cost = size_sol
         bought_sol = size_sol
         sold_sol = 0.0
-        pool_addr = (
-            (tick.pool or None)
-            or (resolved.pool.address if resolved else None)
-            or hint_pool
-        )
         round_id = open_round(
             ledger_path,
             mint=mint,
             name=name,
             symbol=symbol,
-            pool=pool_addr,
+            pool=(
+                (tick.pool or None)
+                or (resolved.pool.address if resolved else None)
+                or hint_pool
+            ),
             entry_price_sol=entry_price,
             entry_fdv_usd=entry_fdv,
         )
 
-        pool_addr = (
-            (tick.pool or None)
-            or (resolved.pool.address if resolved else None)
-            or hint_pool
-            or (existing.pool if existing else None)
-        )
+    # both new bags and add-to-position need this — it used to live
+    # only on the new-bag branch, so a second buy crashed
+    pool_addr = (
+        (tick.pool or None)
+        or (resolved.pool.address if resolved else None)
+        or hint_pool
+        or (existing.pool if existing else None)
+    )
 
     new_bal = set_balance(ledger_path, bal - size_sol)
     pos = upsert_position(

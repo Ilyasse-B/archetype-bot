@@ -359,4 +359,28 @@ def create_agent_router() -> APIRouter:
             agent_reject, ledger, body.mint, reasoning=body.reasoning
         )
 
+    @router.get("/loop")
+    async def agent_loop_status(request: Request) -> dict[str, Any]:
+        """phase, mint, last decision. running stays false until started."""
+        loop = getattr(request.app.state, "agent_loop", None)
+        if loop is None:
+            return {"ok": True, "running": False, "phase": "idle"}
+        return loop.status()
+
+    @router.post("/loop/start")
+    async def agent_loop_start(request: Request) -> dict[str, Any]:
+        """start the background lock loop. needs ollama already up."""
+        loop = getattr(request.app.state, "agent_loop", None)
+        if loop is None:
+            raise HTTPException(status_code=503, detail="agent loop not ready")
+        return await loop.start()
+
+    @router.post("/loop/stop")
+    async def agent_loop_stop(request: Request) -> dict[str, Any]:
+        """stop the lock loop. filters and TP/SL keep running."""
+        loop = getattr(request.app.state, "agent_loop", None)
+        if loop is None:
+            raise HTTPException(status_code=503, detail="agent loop not ready")
+        return await loop.stop()
+
     return router

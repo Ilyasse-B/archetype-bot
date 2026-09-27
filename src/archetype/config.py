@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.2:3b"
     ollama_timeout_sec: float = 30.0
+    # lock loop task — off so the human trade stream keeps the backlog
+    agent_loop_enabled: bool = False
 
     def resolved_active_context_db(self) -> Path:
         """path to the sliding-window context db."""
@@ -99,6 +101,7 @@ def get_settings() -> Settings:
         "ollama_base_url",
         "ollama_model",
         "ollama_timeout_sec",
+        "agent_loop_enabled",
     ):
         if key in yaml_data:
             flat[key] = yaml_data[key]

@@ -12,5 +12,9 @@ ollama_base_url: "http://127.0.0.1:11434"
 ollama_model: "llama3.2:3b"
 ollama_timeout_sec: 30
 
+# lock-loop task inside the daemon. leave false while you use --trade yourself.
+# start ollama first, then POST /agent/loop/start (or set this true and restart).
+agent_loop_enabled: false
+
 # sqlite files land under data/ by default
 # data_dir: ./data

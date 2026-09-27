@@ -26,6 +26,7 @@ from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
 from archetype.execution import ensure_wallet
 from archetype.execution.tpsl import TpslEngine
+from archetype.llm.runner import AgentLoop
 from archetype.tools.alerts import MoveAlertEngine
 
 
@@ -109,12 +110,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await asyncio.to_thread(ensure_wallet, ledger)
         tpsl = TpslEngine(rpc=rpc, ledger_path=ledger)
         alerts = MoveAlertEngine(rpc=rpc, ledger_path=ledger)
+        agent_loop = AgentLoop(settings, rpc, tpsl=tpsl, alerts=alerts)
         app.state.tpsl_engine = tpsl
         app.state.move_alert_engine = alerts
+        app.state.agent_loop = agent_loop
         await tpsl.start()
         await alerts.start()
         await feed.start()
+        if settings.agent_loop_enabled:
+            await agent_loop.start()
         yield
+        await agent_loop.stop()
         await feed.stop()
         await alerts.stop()
         await tpsl.stop()
@@ -144,6 +150,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ledger_ok = db_exists_and_ok(ledger_p)
         pp_ok = bool(s.pumpportal_api_key.strip())
         helius_ok = bool(s.helius_api_key.strip())
+        loop = getattr(app.state, "agent_loop", None)
+        loop_status = loop.status() if loop is not None else {}
+        agent_phase = (
+            str(loop_status.get("phase") or "idle")
+            if loop_status.get("running")
+            else "stopped"
+        )
         ok = active_ok and ledger_ok
         msg = "daemon up; migrations + filters + backlog + paper + agent API"
         if not pp_ok:
@@ -155,7 +168,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return StatusResponse(
             ok=ok,
             version=__version__,
-            agent_state=s.agent_state,
+            agent_state=agent_phase,
             host=s.host,
             port=s.port,
             active_context_db=str(active),
