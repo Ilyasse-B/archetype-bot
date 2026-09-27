@@ -16,6 +16,9 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "pyyaml>=6.0.2",
     "solders>=0.29.0",
+    "langgraph>=1.2.12",
+    "langchain-core>=1.6.5",
+    "langchain-ollama>=1.1.0",
 ]
 
 [project.scripts]

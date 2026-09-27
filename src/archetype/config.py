@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     helius_api_key: str = ""
     pumpportal_api_key: str = ""
 
+    # local llm (phase 4) — one model, one call at a time
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "llama3.2:3b"
+    ollama_timeout_sec: float = 30.0
+
     def resolved_active_context_db(self) -> Path:
         """path to the sliding-window context db."""
         if self.active_context_db is not None:
@@ -91,6 +96,9 @@ def get_settings() -> Settings:
         "trading_ledger_db",
         "helius_api_key",
         "pumpportal_api_key",
+        "ollama_base_url",
+        "ollama_model",
+        "ollama_timeout_sec",
     ):
         if key in yaml_data:
             flat[key] = yaml_data[key]
