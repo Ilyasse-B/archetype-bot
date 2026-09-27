@@ -49,15 +49,17 @@ class FilterThresholds:
     """numeric gates for a single-pass migrate filter."""
 
     min_market_cap_usd: float = 10_000.0
-    # hard junk floor — vault estimate can under-read vs axiom, so keep this low
-    min_global_fees_sol: float = 0.5
-    # below this → still PASS, but flag fees_check_needed for agent / --trade
+    # hard floor — estimate must clear this or we reject
+    min_global_fees_sol: float = 2.0
+    # first read under this → reject now, don't keep polling
+    fees_poll_min_sol: float = 1.0
+    # cleared the hard floor but still under this → PASS + fees_check_needed
     fees_warn_below_sol: float = 2.25
     min_pool_sol: float = 0.5  # sanity floor on quote vault at migrate
     # creator fee share of total fees (rough) — used to estimate global fees
     # from unclaimed creator vault. axiom "fees" is indexed; this is best-effort.
     creator_fee_share: float = 0.25
-    # post-migrate races: fees / pool accounts often land a few seconds late
+    # extra polls only when the first read is already in [fees_poll_min, hard floor)
     fees_poll_sec: float = 6.0
     fees_poll_interval_sec: float = 1.2
     pool_poll_sec: float = 6.0

@@ -285,12 +285,13 @@ def run_onchain_filters(
 
         vault_addr = creator_vault_pda(curve.creator)
         share = max(thresholds.creator_fee_share, 0.05)
-        # early-exit poll once we clear the "looks good" bar (not the hard floor)
+        # one read first; only keep polling if we're already in the 1–2 SOL band
         vault_sol, estimated_fees_sol, fee_samples = _poll_creator_fees(
             rpc,
             vault_addr,
             share=share,
-            min_fees=thresholds.fees_warn_below_sol,
+            pass_fees=thresholds.min_global_fees_sol,
+            continue_fees=thresholds.fees_poll_min_sol,
             timeout_sec=thresholds.fees_poll_sec,
             interval_sec=thresholds.fees_poll_interval_sec,
         )
@@ -300,7 +301,7 @@ def run_onchain_filters(
         result.metrics["fees_method"] = (
             "creator_vault / creator_fee_share (polled post-migrate, best-effort)"
         )
-        # soft band: pass but tell agent/--trade to double-check
+        # cleared 2 SOL but still under the warn bar → yellow CHECK in --trade
         fees_check = estimated_fees_sol < thresholds.fees_warn_below_sol
         result.metrics["fees_check_needed"] = fees_check
         result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
@@ -369,39 +370,60 @@ def _wait_account(
     return last
 
 
+def _read_creator_fees(
+    rpc: HeliusRpc, vault_addr: str, *, share: float
+) -> tuple[float, float]:
+    """one vault read → (vault SOL, estimated global fees)."""
+    vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
+    vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
+    fees = vault_sol / share if vault_sol > 0 and share > 0 else 0.0
+    return vault_sol, fees
+
+
 def _poll_creator_fees(
     rpc: HeliusRpc,
     vault_addr: str,
     *,
     share: float,
-    min_fees: float,
+    pass_fees: float,
+    continue_fees: float,
     timeout_sec: float,
     interval_sec: float,
 ) -> tuple[float, float, list[float]]:
     """
-    re-read creator vault for a few seconds; take the max fee estimate.
+    one read first, then maybe keep going.
 
-    early-exit once we clear min_fees. backoff between polls.
+    already >= pass_fees → stop.
+    under continue_fees → stop (junk, don't burn more helius).
+    in between → poll until we clear pass_fees or the timer runs out.
+    takes the max estimate seen.
     """
-    deadline = time.monotonic() + max(0.0, timeout_sec)
     samples: list[float] = []
     best_vault = 0.0
     best_fees = 0.0
-    wait = max(0.05, interval_sec)
-    while True:
-        vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
-        vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
-        fees = vault_sol / share if vault_sol > 0 and share > 0 else 0.0
+
+    def _take(vault_sol: float, fees: float) -> None:
+        nonlocal best_vault, best_fees
         samples.append(round(fees, 6))
         if fees >= best_fees:
             best_fees = fees
             best_vault = vault_sol
-        if best_fees >= min_fees:
-            break
-        if time.monotonic() >= deadline:
-            break
+
+    vault_sol, fees = _read_creator_fees(rpc, vault_addr, share=share)
+    _take(vault_sol, fees)
+    # only the 1–2 SOL band gets the extra window
+    if best_fees >= pass_fees or best_fees < continue_fees:
+        return best_vault, best_fees, samples
+
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    wait = max(0.05, interval_sec)
+    while time.monotonic() < deadline:
         time.sleep(wait)
         wait = min(wait * 1.3, 2.0)
+        vault_sol, fees = _read_creator_fees(rpc, vault_addr, share=share)
+        _take(vault_sol, fees)
+        if best_fees >= pass_fees:
+            break
     return best_vault, best_fees, samples
 
 
