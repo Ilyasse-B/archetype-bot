@@ -2,6 +2,7 @@
 
 from archetype.llm.binder import AgentToolkit
 from archetype.llm.client import make_chat
+from archetype.llm.graph import LockLoop, fresh_state, load_system_prompt
 from archetype.llm.decision import (
     DecisionInvalid,
     ThinkDecision,
@@ -14,9 +15,12 @@ __all__ = [
     "AgentToolkit",
     "DecisionInvalid",
     "FocusMemory",
+    "LockLoop",
     "PromptWindow",
     "ThinkDecision",
     "decision_json_schema",
+    "fresh_state",
+    "load_system_prompt",
     "make_chat",
     "parse_decision",
 ]
