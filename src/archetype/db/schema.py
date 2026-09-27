@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS active_context (
 
 CREATE INDEX IF NOT EXISTS idx_context_timestamp ON active_context(timestamp);
 CREATE INDEX IF NOT EXISTS idx_context_entity ON active_context(entity_key);
+
+-- one rolling summary per focused mint (prompt sees this + last 5 events)
+CREATE TABLE IF NOT EXISTS focus_summary (
+    mint TEXT PRIMARY KEY,
+    summary TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # --- permanent ledger ---

@@ -7,9 +7,12 @@ from archetype.llm.decision import (
     decision_json_schema,
     parse_decision,
 )
+from archetype.llm.memory import FocusMemory, PromptWindow
 
 __all__ = [
     "DecisionInvalid",
+    "FocusMemory",
+    "PromptWindow",
     "ThinkDecision",
     "decision_json_schema",
     "make_chat",
