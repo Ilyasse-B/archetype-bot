@@ -227,6 +227,15 @@ def list_pending(ledger_path: Path, limit: int = 50) -> list[BacklogItem]:
     return [_row_to_item(r) for r in rows]
 
 
+def clear_pending(ledger_path: Path) -> int:
+    """drop unconsumed coins left over from the last daemon run."""
+    ensure_backlog_table(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        cur = conn.execute("DELETE FROM migration_backlog WHERE consumed = 0")
+        conn.commit()
+        return int(cur.rowcount)
+
+
 def pending_count(ledger_path: Path) -> int:
     """how many waiting."""
     ensure_backlog_table(ledger_path)

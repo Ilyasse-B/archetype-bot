@@ -77,6 +77,36 @@ class FocusMemory:
         """thesis is on the round now, so the sliding copy can go."""
         self._clear(mint.strip())
 
+    def save_round_log(self, round_id: int, mint: str) -> None:
+        """stick the full step log on the closed trade, for training later."""
+        blob = json.dumps(self._log_blob(mint))
+        with sqlite3.connect(self.ledger_path) as conn:
+            _add_column(conn, "trade_rounds", "agent_log", "TEXT")
+            conn.execute(
+                "UPDATE trade_rounds SET agent_log = ? WHERE id = ?",
+                (blob, int(round_id)),
+            )
+            conn.commit()
+
+    def save_reject_log(self, mint: str) -> None:
+        """same log, on the latest reject row for this mint."""
+        blob = json.dumps(self._log_blob(mint))
+        with sqlite3.connect(self.ledger_path) as conn:
+            _add_column(conn, "agent_rejects", "agent_log", "TEXT")
+            conn.execute(
+                """
+                UPDATE agent_rejects SET agent_log = ?
+                WHERE id = (
+                    SELECT id FROM agent_rejects
+                    WHERE mint = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                """,
+                (blob, mint.strip()),
+            )
+            conn.commit()
+
     def append_event(
         self, mint: str, kind: str, payload: dict[str, Any]
     ) -> FocusEvent:
@@ -161,6 +191,18 @@ class FocusMemory:
             ).fetchall()
         return [_event_from_row(r) for r in rows]
 
+    def round_row(self, round_id: int) -> dict[str, Any] | None:
+        """the trade row, so the close prompt can see pnl and the coin name."""
+        with sqlite3.connect(self.ledger_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM trade_rounds WHERE id = ?",
+                (int(round_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys()}
+
     def write_thesis(self, round_id: int, thesis: str) -> RoundThesis:
         """
         store the final thesis on a closed trade_rounds row.
@@ -219,6 +261,21 @@ class FocusMemory:
             )
             conn.commit()
 
+    def _log_blob(self, mint: str) -> dict[str, Any]:
+        """summary plus every event. this is what we keep after the coin is gone."""
+        return {
+            "summary": self._summary(mint),
+            "events": [
+                {
+                    "id": ev.id,
+                    "kind": ev.kind,
+                    "payload": ev.payload,
+                    "timestamp": ev.timestamp,
+                }
+                for ev in self.history_for_thesis(mint)
+            ],
+        }
+
     def _summary(self, mint: str) -> str:
         with sqlite3.connect(self.active_path) as conn:
             row = conn.execute(
@@ -257,6 +314,13 @@ class FocusMemory:
                 (keep_mint, f"-{STALE_DAYS} days"),
             )
             conn.commit()
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """old db files were created before this column existed."""
+    have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in have:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def _event_from_row(row: tuple[Any, ...] | sqlite3.Row) -> FocusEvent:

@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS agent_rejects (
     mint TEXT NOT NULL,
     reasoning TEXT NOT NULL,
     decision TEXT NOT NULL,
+    agent_log TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS trade_rounds (
     opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     closed_at DATETIME,
     thesis TEXT,
+    agent_log TEXT,
     tp REAL,
     sl REAL
 );

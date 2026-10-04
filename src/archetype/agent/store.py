@@ -24,6 +24,7 @@ def ensure_agent_tables(ledger_path: Path) -> None:
                 mint TEXT NOT NULL,
                 reasoning TEXT NOT NULL,
                 decision TEXT NOT NULL,
+                agent_log TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """

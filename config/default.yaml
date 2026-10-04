@@ -10,11 +10,21 @@ agent_state: idle
 # local ollama — phase 4 think steps
 ollama_base_url: "http://127.0.0.1:11434"
 ollama_model: "llama3.2:3b"
-ollama_timeout_sec: 30
+# cold prompt on this laptop ran past 90s. 150 covers load plus one reply.
+ollama_timeout_sec: 150
+# 0 = use every logical cpu except one. llama.cpp on its own only used the 2 performance cores.
+ollama_num_thread: 0
 
 # lock-loop task inside the daemon. leave false while you use --trade yourself.
 # start ollama first, then POST /agent/loop/start (or set this true and restart).
 agent_loop_enabled: false
+
+# buy size is fixed from the migration mcap. prompt and the buy path both read these.
+buy_mcap_small_usd: 50000
+buy_mcap_mid_usd: 125000
+buy_sol_small: 3
+buy_sol_mid: 5
+buy_sol_large: 10
 
 # sqlite files land under data/ by default
 # data_dir: ./data

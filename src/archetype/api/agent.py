@@ -24,7 +24,6 @@ from archetype.filters.helius import HeliusRpc
 from archetype.tools import (
     agent_reject,
     agent_sell,
-    catalog_dicts,
     next_candidate,
     peek_backlog,
     peek_price,
@@ -115,11 +114,6 @@ def _tpsl(request: Request):
 def create_agent_router() -> APIRouter:
     """agent-facing routes — stable contract for LangGraph tools."""
     router = APIRouter(prefix="/agent", tags=["agent"])
-
-    @router.get("/tools")
-    async def agent_tools() -> dict[str, Any]:
-        """catalog of tools the LLM binder should expose."""
-        return {"ok": True, "tools": catalog_dicts()}
 
     @router.post("/peek")
     async def agent_peek(body: PeekRequest, request: Request) -> dict[str, Any]:
@@ -358,6 +352,23 @@ def create_agent_router() -> APIRouter:
         return await asyncio.to_thread(
             agent_reject, ledger, body.mint, reasoning=body.reasoning
         )
+
+    @router.get("/events")
+    async def agent_events(
+        request: Request,
+        after_id: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=300),
+    ) -> dict[str, Any]:
+        """live thinking lines for migrations --follow."""
+        loop = getattr(request.app.state, "agent_loop", None)
+        feed = getattr(loop, "feed", None) if loop is not None else None
+        if feed is None:
+            return {"ok": True, "running": False, "events": []}
+        return {
+            "ok": True,
+            "running": bool(loop.running),
+            "events": feed.since(after_id, limit),
+        }
 
     @router.get("/loop")
     async def agent_loop_status(request: Request) -> dict[str, Any]:

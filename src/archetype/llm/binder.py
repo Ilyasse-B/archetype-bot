@@ -1,15 +1,12 @@
 """
-langchain tools over the in-process agent helpers.
+in-process commands the loop calls after the model picks an action.
 
-catalog `when` decides what the model can see:
-  free   → next_candidate, buy, reject
-  locked → sell, set_tpsl, move alerts
-  always → peek, wallet, position, backlog peek, list_tools
+the model does not see these. it replies with json, then the loop
+calls buy / reject / sell / set_tpsl itself.
 
-if a focus mint is set, trade/peek calls on any other mint are refused.
+if a focus mint is set, a call on any other mint is refused.
 peek_backlog is the exception — other-coin context, no second trade.
-drain_for_step() is what the loop calls before each think, so alerts
-are not stuck waiting for the model to remember the tool.
+drain_for_step() runs before each think, so alerts are not stuck.
 """
 
 from __future__ import annotations
@@ -19,17 +16,12 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
-from langchain_core.tools import BaseTool, StructuredTool
-from pydantic import BaseModel, Field
-
 from archetype.execution.fills import mark_all_positions
 from archetype.execution.tpsl import TpslEngine
 from archetype.execution.wallet import get_balance, get_position
 from archetype.filters.helius import HeliusRpc
 from archetype.tools.alerts import MoveAlertEngine
 from archetype.tools.backlog_tools import next_candidate, peek_backlog
-from archetype.tools.catalog import TOOL_CATALOG
-from archetype.tools.models import ToolSpec
 from archetype.tools.peek import peek_price
 from archetype.tools.trade_tools import agent_buy, agent_reject, agent_sell
 
@@ -38,63 +30,12 @@ log = logging.getLogger("archetype.binder")
 AgentMode = Literal["free", "locked"]
 
 
-class _EmptyIn(BaseModel):
-    """no args."""
-
-
-class _MintIn(BaseModel):
-    mint: str = ""
-
-
-class _AlertSubIn(BaseModel):
-    mint: str = ""
-    threshold_pct: float | None = Field(None, gt=0)
-
-
-class _BacklogPeekIn(BaseModel):
-    limit: int = Field(10, ge=1, le=50)
-
-
-class _BuyIn(BaseModel):
-    mint: str = ""
-    sol: float = Field(..., gt=0)
-    profit_pct: float = Field(..., gt=0)
-    loss_pct: float = Field(..., gt=0)
-
-
-class _SellIn(BaseModel):
-    mint: str = ""
-    percent: float | None = Field(None, gt=0, le=100)
-    sol_amount: float | None = Field(None, gt=0)
-    initials: bool = False
-
-
-class _TpslIn(BaseModel):
-    mint: str = ""
-    profit_pct: float | None = Field(None, gt=0)
-    loss_pct: float | None = Field(None, gt=0)
-    clear_profit: bool = False
-    clear_loss: bool = False
-
-
-class _RejectIn(BaseModel):
-    mint: str = ""
-    reasoning: str = ""
-
-
-def _spec(name: str) -> ToolSpec:
-    for spec in TOOL_CATALOG:
-        if spec.name == name:
-            return spec
-    raise KeyError(name)
-
-
 def _deny(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message}
 
 
 class AgentToolkit:
-    """mode-gated tools. call tools() again after set_focus — the list changes."""
+    """commands the loop calls by name. the model never sees this list."""
 
     def __init__(
         self,
@@ -119,32 +60,8 @@ class AgentToolkit:
         self.mode = mode
         self.focus_mint = (focus_mint or "").strip() or None
 
-    def visible_specs(self) -> list[ToolSpec]:
-        """catalog rows the model is allowed to call right now."""
-        return [s for s in TOOL_CATALOG if self._visible(s)]
-
-    def tools(self) -> list[BaseTool]:
-        """langchain tools for the current mode."""
-        out: list[BaseTool] = []
-        for spec in self.visible_specs():
-            handler = self._handlers[spec.name]
-            schema = _SCHEMAS[spec.name]
-            out.append(
-                StructuredTool.from_function(
-                    coroutine=handler,
-                    name=spec.name,
-                    description=spec.description,
-                    args_schema=schema,
-                )
-            )
-        return out
-
     async def call(self, name: str, **kwargs: Any) -> dict[str, Any]:
-        """
-        run one tool by catalog name.
-
-        still enforces mode + focus, even if the name isn't in tools().
-        """
+        """run one command by name. mode and focus still apply."""
         handler = self._handlers.get(name)
         if handler is None:
             return _deny(f"unknown tool {name}")
@@ -172,11 +89,6 @@ class AgentToolkit:
             "alerts": [a.model_dump() for a in alerts],
         }
 
-    def _visible(self, spec: ToolSpec) -> bool:
-        if spec.when == "always":
-            return True
-        return spec.when == self.mode
-
     def _need(self, when: str) -> dict[str, Any] | None:
         if when == "always" or when == self.mode:
             return None
@@ -198,14 +110,6 @@ class AgentToolkit:
 
     def _build_handlers(self) -> dict[str, Any]:
         kit = self
-
-        async def list_tools() -> dict[str, Any]:
-            return {
-                "ok": True,
-                "mode": kit.mode,
-                "focus_mint": kit.focus_mint,
-                "tools": [s.model_dump() for s in kit.visible_specs()],
-            }
 
         async def peek_price_tool(mint: str = "") -> dict[str, Any]:
             denied = kit._need("always")
@@ -419,7 +323,6 @@ class AgentToolkit:
             )
 
         return {
-            "list_tools": list_tools,
             "peek_price": peek_price_tool,
             "subscribe_move_alerts": subscribe_move_alerts,
             "unsubscribe_move_alerts": unsubscribe_move_alerts,
@@ -434,19 +337,3 @@ class AgentToolkit:
             "reject": reject,
         }
 
-
-_SCHEMAS: dict[str, type[BaseModel]] = {
-    "list_tools": _EmptyIn,
-    "peek_price": _MintIn,
-    "subscribe_move_alerts": _AlertSubIn,
-    "unsubscribe_move_alerts": _MintIn,
-    "drain_move_alerts": _EmptyIn,
-    "peek_backlog": _BacklogPeekIn,
-    "next_candidate": _EmptyIn,
-    "get_wallet": _EmptyIn,
-    "get_position": _MintIn,
-    "buy": _BuyIn,
-    "sell": _SellIn,
-    "set_tpsl": _TpslIn,
-    "reject": _RejectIn,
-}

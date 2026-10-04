@@ -13,11 +13,20 @@ import logging
 import time
 from typing import Any
 
+import httpx
+
 from archetype.config import Settings
 from archetype.filters.helius import HeliusRpc
 from archetype.llm.binder import AgentToolkit
-from archetype.llm.client import make_chat
-from archetype.llm.graph import LockLoop, LoopDeps, fresh_state, load_system_prompt
+from archetype.llm.client import OLLAMA_NUM_CTX, exc_text, make_chat, ollama_num_thread
+from archetype.llm.feed import AgentFeed
+from archetype.llm.graph import (
+    LockLoop,
+    LoopDeps,
+    fresh_state,
+    load_system_prompt,
+    load_thesis_prompt,
+)
 from archetype.llm.memory import FocusMemory
 
 log = logging.getLogger("archetype.agent.loop")
@@ -44,11 +53,16 @@ class AgentLoop:
         self.idle_sec = idle_sec
         self.think_sec = think_sec
         self._lock = lock
+        # only warm ollama when we own the chat client (tests inject a fake lock)
+        self._warm_model = lock is None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self.state: dict[str, Any] = dict(fresh_state())
         self.last_tick_sec: float | None = None
         self.ticks = 0
+        # migrations --follow polls this. survives across start/stop.
+        self.feed = AgentFeed()
+        self._seen_hit_seqs: set[int] = set()
 
     @property
     def running(self) -> bool:
@@ -108,18 +122,114 @@ class AgentLoop:
             alerts=self.alerts,
         )
         memory = FocusMemory(active, ledger)
+        feed = self.feed
+
+        def _emit(kind: str, **fields: Any) -> None:
+            feed.push(kind, **fields)
+
         return LockLoop(
             LoopDeps(
                 chat=make_chat(self.settings),
                 tools=tools,
                 memory=memory,
-                prompt=load_system_prompt(),
+                prompt=load_system_prompt(self.settings),
+                thesis_prompt=load_thesis_prompt(),
+                emit=_emit,
+                buy_sol=self.settings.buy_sol_for_mcap,
             )
         )
 
+    async def _warm_ollama(self) -> None:
+        """load the weights before the first coin. cold start ate the 30s timeout."""
+        url = self.settings.ollama_base_url.rstrip("/") + "/api/chat"
+        payload = {
+            "model": self.settings.ollama_model,
+            "messages": [{"role": "user", "content": "Reply with JSON {\"ok\": true}"}],
+            "format": "json",
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": 0,
+                "num_predict": 8,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_thread": ollama_num_thread(self.settings),
+            },
+        }
+        timeout = max(float(self.settings.ollama_timeout_sec), 150.0)
+        last = "ollama warm failed"
+        for attempt in (1, 2):
+            try:
+                t0 = time.perf_counter()
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                log.info(
+                    "ollama warm in %.1fs (%s threads)",
+                    time.perf_counter() - t0,
+                    ollama_num_thread(self.settings),
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc_text(exc)
+                log.warning("ollama warm attempt %s failed: %s", attempt, last)
+        log.warning("starting anyway after warm failed: %s", last)
+
+    def _drain_hits(self) -> None:
+        """tp/sl sells happen off to the side. push them to the live feed."""
+        tpsl = self.tpsl
+        hits = getattr(tpsl, "_hits", None) if tpsl is not None else None
+        if not hits:
+            return
+        focus = str(self.state.get("mint") or "")
+        memory = getattr(getattr(self._lock, "deps", None), "memory", None)
+        for hit in list(hits.values()):
+            seq = int(getattr(hit, "seq", 0) or 0)
+            if seq and seq in self._seen_hit_seqs:
+                continue
+            if seq:
+                self._seen_hit_seqs.add(seq)
+            mint = str(getattr(hit, "mint", "") or "")
+            self.feed.push(
+                "tpsl",
+                mint=mint,
+                name=getattr(hit, "name", "") or "",
+                symbol=getattr(hit, "symbol", "") or "",
+                reason=getattr(hit, "reason", "") or "",
+                sol=getattr(hit, "sol", None),
+                pnl_sol=getattr(hit, "pnl_sol", None),
+                pnl_pct=getattr(hit, "pnl_pct", None),
+            )
+            # so the close summary can see the stop or the target
+            if memory is not None and focus and mint == focus:
+                try:
+                    memory.append_event(
+                        mint,
+                        "tpsl",
+                        {
+                            "reason": getattr(hit, "reason", ""),
+                            "sol": getattr(hit, "sol", None),
+                            "pnl_sol": getattr(hit, "pnl_sol", None),
+                            "pnl_pct": getattr(hit, "pnl_pct", None),
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("could not store tpsl event", exc_info=True)
+
+    async def _watch_hits(self) -> None:
+        """check tp/sl about once a second so the cli is not stuck waiting on a think."""
+        while not self._stop.is_set():
+            self._drain_hits()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+            except TimeoutError:
+                continue
+
     async def _run(self) -> None:
         assert self._lock is not None
+        hit_task = asyncio.create_task(self._watch_hits(), name="agent-hits")
         try:
+            if self._warm_model:
+                await self._warm_ollama()
             while not self._stop.is_set():
                 phase_before = self.state.get("phase") or "idle"
                 t0 = time.perf_counter()
@@ -128,8 +238,8 @@ class AgentLoop:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("agent tick failed: %s", exc)
-                    self.state["last_error"] = str(exc)
+                    log.warning("agent tick failed: %s", exc_text(exc))
+                    self.state["last_error"] = exc_text(exc)
                     self.last_tick_sec = time.perf_counter() - t0
                     await self._sleep(self.idle_sec)
                     continue
@@ -149,6 +259,12 @@ class AgentLoop:
                 await self._sleep(delay)
         except asyncio.CancelledError:
             return
+        finally:
+            hit_task.cancel()
+            try:
+                await hit_task
+            except asyncio.CancelledError:
+                pass
 
     def _think_delay(self) -> float:
         """shorter wait when a move alert is already sitting in the queue."""

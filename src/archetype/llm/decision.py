@@ -27,6 +27,8 @@ ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell"]
 _ACTION_ALIASES = {
     "set_tpsl": "revise_tpsl",
     "tpsl": "revise_tpsl",
+    # before a buy, "wait" is the word. the loop still stores it as hold.
+    "wait": "hold",
 }
 
 
@@ -38,15 +40,13 @@ class ThinkDecision(BaseModel):
     """structured output for one search or locked think step."""
 
     action: ThinkAction
-    narrative: str = Field(..., min_length=1, description="short thesis for this step")
-    reasoning: str = Field(
-        "",
-        description="one-line why, required on reject (agent_rejects.reasoning)",
-    )
+    # blank means "keep the narrative we already have"
+    narrative: str = ""
+    reasoning: str = Field(..., min_length=1, description="why this action")
     # buy — same names as AgentBuyRequest
     sol: float | None = Field(None, gt=0, description="SOL to spend")
     profit_pct: float | None = Field(None, gt=0, description="take-profit %%")
-    loss_pct: float | None = Field(None, gt=0, description="stop-loss %% magnitude")
+    loss_pct: float | None = Field(None, gt=0, lt=100, description="stop-loss %% magnitude")
     # sell — same names as AgentSellRequest. all empty = sell 100%
     percent: float | None = Field(None, gt=0, le=100, description="%% of tokens")
     sol_amount: float | None = Field(None, gt=0, description="SOL to sell out")
@@ -72,10 +72,7 @@ class ThinkDecision(BaseModel):
 
     @model_validator(mode="after")
     def _fields_for_action(self) -> ThinkDecision:
-        if self.action == "reject":
-            if not self.reasoning:
-                raise ValueError("reject needs reasoning")
-        elif self.action == "buy":
+        if self.action == "buy":
             missing = [
                 name
                 for name, val in (
@@ -153,6 +150,93 @@ class ThinkDecision(BaseModel):
         return out
 
 
+def _as_num(val: Any) -> float | None:
+    if val in (None, ""):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_echo(text: str) -> bool:
+    """the model pastes the last validator line back as its reason."""
+    low = text.lower()
+    return any(
+        bit in low
+        for bit in (
+            "input should",
+            "profit_pct",
+            "loss_pct",
+            "use profit",
+            "readtimeout",
+            "field required",
+            "validation",
+            "last reply",
+            "send the json",
+            "timed out",
+            "name or fees",
+        )
+    )
+
+
+def _coerce_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """fix the replies a 3b actually sends before the schema sees them."""
+    out = dict(data)
+    action = out.get("action")
+    if isinstance(action, str):
+        action = action.strip().lower().replace("-", "_").replace(" ", "_")
+        out["action"] = action
+    # buy size is `sol`. if it only filled the sell field, use that number
+    if action == "buy" and out.get("sol") in (None, "") and out.get("sol_amount") not in (None, ""):
+        out["sol"] = out.pop("sol_amount")
+    narrative = out.get("narrative")
+    reasoning = out.get("reasoning")
+    if isinstance(narrative, str) and _is_echo(narrative):
+        out["narrative"] = ""
+    if isinstance(reasoning, str) and _is_echo(reasoning):
+        out["reasoning"] = ""
+    # narrative and reasoning stay separate. a blank narrative means keep the old one.
+    if not isinstance(out.get("narrative"), str):
+        out["narrative"] = ""
+    # reject and sell do not set levels. a wait can still echo 0s from the
+    # schema — drop them so the reply stays a wait.
+    if action in ("reject", "sell", "wait"):
+        out.pop("profit_pct", None)
+        out.pop("loss_pct", None)
+    elif action in ("hold", "revise_tpsl"):
+        for key in ("profit_pct", "loss_pct"):
+            n = _as_num(out.get(key))
+            if n is None or n <= 0:
+                out.pop(key, None)
+    return out
+
+
+def coach_text(raw: str) -> str:
+    """what the next prompt is allowed to see. not the pydantic line."""
+    low = raw.lower()
+    if "timeout" in low:
+        return "timed out. send the json again."
+    if "profit" in low or "loss" in low:
+        return "take-profit must be above 0. stop-loss must be above 0 and below 100."
+    if "unterminated" in low or "invalid json" in low or "not prose" in low:
+        return "reply was cut off. reasoning is one short sentence."
+    if "reasoning" in low:
+        return "every reply needs reasoning: why you took this action."
+    return "reply was not valid json. one short sentence."
+
+
+def _short_validation(exc: ValidationError) -> str:
+    """one line, not the pydantic essay (that got copied into the next reply)."""
+    bits: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc") or ())
+        msg = str(err.get("msg") or "invalid")
+        bits.append(f"{loc}: {msg}" if loc else msg)
+    text = "; ".join(bits) if bits else "invalid decision"
+    return text[:240]
+
+
 def parse_decision(raw: str | dict[str, Any]) -> ThinkDecision:
     """
     parse one model reply.
@@ -170,9 +254,9 @@ def parse_decision(raw: str | dict[str, Any]) -> ThinkDecision:
     if not isinstance(data, dict):
         raise DecisionInvalid("decision must be a json object")
     try:
-        return ThinkDecision.model_validate(data)
+        return ThinkDecision.model_validate(_coerce_payload(data))
     except ValidationError as exc:
-        raise DecisionInvalid(str(exc)) from exc
+        raise DecisionInvalid(_short_validation(exc)) from exc
 
 
 def decision_json_schema() -> dict[str, Any]:

@@ -5,6 +5,7 @@ fastapi control plane for the daemon.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from contextlib import asynccontextmanager
@@ -13,12 +14,20 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from archetype import __version__
 from archetype.api.agent import create_agent_router
+from archetype.api.live import LiveHub, sse_data
 from archetype.api.paper import create_paper_router
-from archetype.backlog import dequeue_fifo, enqueue_passed, list_pending, pending_count
+from archetype.backlog import (
+    clear_pending,
+    dequeue_fifo,
+    enqueue_passed,
+    list_pending,
+    pending_count,
+)
 from archetype.config import Settings, get_settings
 from archetype.db import db_exists_and_ok
 from archetype.filters import run_full_filters
@@ -28,6 +37,8 @@ from archetype.execution import ensure_wallet
 from archetype.execution.tpsl import TpslEngine
 from archetype.llm.runner import AgentLoop
 from archetype.tools.alerts import MoveAlertEngine
+
+log = logging.getLogger("archetype.app")
 
 
 class StatusResponse(BaseModel):
@@ -76,7 +87,14 @@ class BacklogResponse(BaseModel):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    buffer = MigrationBuffer(maxlen=200)
+    hub = LiveHub()
+
+    def _publish_migration(event: MigrationEvent) -> None:
+        hub.publish(
+            {"stream": "migration", "migration": event.model_dump(mode="json")}
+        )
+
+    buffer = MigrationBuffer(maxlen=200, on_change=_publish_migration)
     rpc = HeliusRpc(settings.helius_api_key)
     ledger = settings.resolved_trading_ledger_db()
 
@@ -106,11 +124,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # old passes must not be the first coin the agent sees
+        dropped = await asyncio.to_thread(clear_pending, ledger)
+        log.info("cleared %s pending backlog rows from the last run", dropped)
         # ensure paper wallet tables exist
         await asyncio.to_thread(ensure_wallet, ledger)
         tpsl = TpslEngine(rpc=rpc, ledger_path=ledger)
         alerts = MoveAlertEngine(rpc=rpc, ledger_path=ledger)
         agent_loop = AgentLoop(settings, rpc, tpsl=tpsl, alerts=alerts)
+        agent_loop.feed.on_push = lambda item: hub.publish(
+            {"stream": "agent", "event": item}
+        )
         app.state.tpsl_engine = tpsl
         app.state.move_alert_engine = alerts
         app.state.agent_loop = agent_loop
@@ -132,6 +156,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.migration_buffer = buffer
     app.state.pumpportal_feed = feed
     app.state.helius_rpc = rpc
+    app.state.live = hub
+
+    @app.get("/live")
+    async def live(
+        filtered: bool = Query(
+            False,
+            description="if true, only push migrations that passed filters",
+        ),
+    ) -> StreamingResponse:
+        """push migrations and agent lines as they happen. one connection."""
+
+        async def _gen():
+            loop = getattr(app.state, "agent_loop", None)
+            running = bool(loop.running) if loop is not None else False
+            q = hub.subscribe()
+            try:
+                yield sse_data({"stream": "hello", "agent_running": running})
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    except TimeoutError:
+                        # comment frame keeps the socket up. not an http request.
+                        yield ": ping\n\n"
+                        continue
+                    if filtered and msg.get("stream") == "migration":
+                        mig = msg.get("migration") or {}
+                        if mig.get("filter_passed") is not True:
+                            continue
+                    yield sse_data(msg)
+            finally:
+                hub.unsubscribe(q)
+
+        return StreamingResponse(
+            _gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     app.include_router(create_paper_router())
     app.include_router(create_agent_router())
 

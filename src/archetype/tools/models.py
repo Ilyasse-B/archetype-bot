@@ -63,13 +63,3 @@ class BacklogPeekItem(BaseModel):
     socials_present: list[str] = Field(default_factory=list)
     coin_info: dict[str, Any] = Field(default_factory=dict)
 
-
-class ToolSpec(BaseModel):
-    """machine-readable tool card for the future LLM binder."""
-
-    name: str
-    description: str
-    method: str  # GET | POST
-    path: str
-    when: str  # free | locked | always
-    params: dict[str, str] = Field(default_factory=dict)

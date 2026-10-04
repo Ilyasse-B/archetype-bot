@@ -57,9 +57,29 @@ class Settings(BaseSettings):
     # local llm (phase 4) — one model, one call at a time
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "llama3.2:3b"
-    ollama_timeout_sec: float = 30.0
+    ollama_timeout_sec: float = 150.0
+    # 0 = all but one logical cpu. llama.cpp otherwise sticks to the performance cores.
+    ollama_num_thread: int = 0
     # lock loop task — off so the human trade stream keeps the backlog
     agent_loop_enabled: bool = False
+
+    # fixed buy size from migration mcap. the prompt and the buy path both use these.
+    buy_mcap_small_usd: float = 50_000
+    buy_mcap_mid_usd: float = 125_000
+    buy_sol_small: float = 3.0
+    buy_sol_mid: float = 5.0
+    buy_sol_large: float = 10.0
+
+    def buy_sol_for_mcap(self, mcap_usd: float | None) -> float:
+        """sol to spend. missing mcap uses the smallest size."""
+        if mcap_usd is None:
+            return float(self.buy_sol_small)
+        mcap = float(mcap_usd)
+        if mcap < float(self.buy_mcap_small_usd):
+            return float(self.buy_sol_small)
+        if mcap < float(self.buy_mcap_mid_usd):
+            return float(self.buy_sol_mid)
+        return float(self.buy_sol_large)
 
     def resolved_active_context_db(self) -> Path:
         """path to the sliding-window context db."""
@@ -101,7 +121,13 @@ def get_settings() -> Settings:
         "ollama_base_url",
         "ollama_model",
         "ollama_timeout_sec",
+        "ollama_num_thread",
         "agent_loop_enabled",
+        "buy_mcap_small_usd",
+        "buy_mcap_mid_usd",
+        "buy_sol_small",
+        "buy_sol_mid",
+        "buy_sol_large",
     ):
         if key in yaml_data:
             flat[key] = yaml_data[key]

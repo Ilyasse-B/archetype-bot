@@ -6,6 +6,7 @@ keeps interactive stuff out of the agent process.
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 
@@ -160,6 +161,104 @@ def _print_migration_rows(migrations: list[dict], show_filter: bool = False) -> 
     console.print(table)
 
 
+def _print_follow_migration(m: dict) -> None:
+    """one migration line in the live follow view."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    mint = m.get("mint")
+    passed = m.get("filter_passed")
+    tag = (
+        "[green]PASS[/green]"
+        if passed is True
+        else ("[red]FAIL[/red]" if passed is False else "[dim]…[/dim]")
+    )
+    reasons = m.get("filter_reasons") or []
+    reason_s = ("; ".join(reasons))[:80] if reasons else ""
+    metrics = m.get("filter_metrics") or {}
+    meta = m.get("metadata") or metrics.get("metadata") or {}
+    mcap = metrics.get("market_cap_usd")
+    fees = metrics.get("estimated_global_fees_sol")
+    name = m.get("name") or meta.get("name")
+    socials = ",".join(meta.get("socials_present") or metrics.get("socials_present") or [])
+    extra = ""
+    if name:
+        extra += f" name={name[:24]}"
+    if socials:
+        extra += f" socials={socials}"
+    if isinstance(mcap, (int, float)):
+        extra += f" mcap=${mcap:,.0f}"
+    if isinstance(fees, (int, float)):
+        if metrics.get("fees_check_needed") or fees < 2.25:
+            extra += f" [yellow]fees~{fees:.2f}SOL CHECK[/yellow]"
+        else:
+            extra += f" fees~{fees:.2f}SOL"
+    console.print(
+        f"[green]{ts}[/green] #{m.get('id')} {tag} mint={mint}{extra}"
+        + (f" — {reason_s}" if reason_s and passed is False else "")
+    )
+
+
+def _follow_live(filtered: bool) -> None:
+    """one connection. the daemon pushes a line when something happens."""
+    from archetype.agent.live import print_agent_event
+
+    settings = get_settings()
+    url = f"{settings.base_url}/live?filtered={'true' if filtered else 'false'}"
+    console.print(
+        f"[dim]following {'filtered' if filtered else 'raw'} migrations "
+        f"(ctrl+c to stop)…[/dim]"
+    )
+    console.print("[dim]waiting for the next migration or agent line[/dim]")
+    timeout = httpx.Timeout(5.0, read=None)
+    try:
+        with httpx.stream("GET", url, timeout=timeout) as resp:
+            if resp.status_code == 404:
+                console.print(
+                    "[red]this daemon has no live feed[/red]\n"
+                    "restart it, then run migrations --follow again"
+                )
+                raise typer.Exit(code=1)
+            if resp.status_code != 200:
+                console.print(f"[red]live feed failed[/red] HTTP {resp.status_code}")
+                raise typer.Exit(code=1)
+            for line in resp.iter_lines():
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    data = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                stream = data.get("stream")
+                if stream == "hello":
+                    if data.get("agent_running") is False:
+                        console.print(
+                            "[yellow]agent loop is stopped[/yellow] — "
+                            "POST /agent/loop/start on the daemon to see thinking"
+                        )
+                    continue
+                if stream == "migration":
+                    mig = data.get("migration") or {}
+                    if isinstance(mig, dict):
+                        _print_follow_migration(mig)
+                    continue
+                if stream == "agent":
+                    ev = data.get("event") or {}
+                    if isinstance(ev, dict):
+                        print_agent_event(console, ev)
+    except httpx.ConnectError:
+        console.print(
+            f"[red]daemon not reachable at {settings.base_url}[/red]\n"
+            "start it with: [bold]uv run python -m archetype.daemon[/bold]"
+        )
+        raise typer.Exit(code=1) from None
+    except httpx.HTTPError as exc:
+        console.print(f"[red]live feed failed:[/red] {exc}")
+        raise typer.Exit(code=1) from None
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped following[/dim]")
+
+
 @app.callback()
 def main_callback() -> None:
     """Archetype CLI."""
@@ -242,7 +341,7 @@ def migrations_cmd(
         False,
         "--follow",
         "-f",
-        help="keep polling and print new migrations as they arrive",
+        help="stay connected. prints each migration and agent line as it happens",
     ),
     filtered: bool = typer.Option(
         False,
@@ -294,58 +393,7 @@ def migrations_cmd(
         _print_migration_rows(data.get("migrations") or [], show_filter=True)
         return
 
-    console.print(
-        f"[dim]following {'filtered' if filtered else 'raw'} migrations "
-        f"(ctrl+c to stop)…[/dim]"
-    )
-    last_id = 0
-    try:
-        while True:
-            resp = _get(f"/migrations?after_id={last_id}&{q}")
-            if resp.status_code != 200:
-                console.print(f"[red]poll failed[/red] HTTP {resp.status_code}")
-                time.sleep(2)
-                continue
-            data = resp.json()
-            events = data.get("migrations") or []
-            for m in events:
-                last_id = max(last_id, int(m.get("id") or 0))
-                ts = datetime.now().strftime("%H:%M:%S")
-                mint = m.get("mint")
-                passed = m.get("filter_passed")
-                tag = (
-                    "[green]PASS[/green]"
-                    if passed is True
-                    else ("[red]FAIL[/red]" if passed is False else "[dim]…[/dim]")
-                )
-                reasons = m.get("filter_reasons") or []
-                reason_s = ("; ".join(reasons))[:80] if reasons else ""
-                metrics = m.get("filter_metrics") or {}
-                meta = m.get("metadata") or metrics.get("metadata") or {}
-                mcap = metrics.get("market_cap_usd")
-                fees = metrics.get("estimated_global_fees_sol")
-                name = m.get("name") or meta.get("name")
-                socials = ",".join(meta.get("socials_present") or metrics.get("socials_present") or [])
-                extra = ""
-                if name:
-                    extra += f" name={name[:24]}"
-                if socials:
-                    extra += f" socials={socials}"
-                if mcap is not None:
-                    extra += f" mcap=${mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
-                if fees is not None:
-                    if isinstance(fees, (int, float)):
-                        if metrics.get("fees_check_needed") or fees < 2.25:
-                            extra += f" [yellow]fees~{fees:.2f}SOL CHECK[/yellow]"
-                        else:
-                            extra += f" fees~{fees:.2f}SOL"
-                console.print(
-                    f"[green]{ts}[/green] #{m.get('id')} {tag} mint={mint}{extra}"
-                    + (f" — {reason_s}" if reason_s and passed is False else "")
-                )
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        console.print("\n[dim]stopped following[/dim]")
+    _follow_live(filtered)
 
 
 @app.command("backlog")
@@ -522,30 +570,6 @@ def peek_cmd(
                 f"{('+' + str(tp) + '%') if tp is not None else '—'}  "
                 f"SL={('-' + str(sl) + '%') if sl is not None else '—'}[/yellow]"
             )
-
-
-@app.command("agent-tools")
-def agent_tools_cmd() -> None:
-    """list the /agent tool catalog the Phase 4 LLM will bind."""
-    resp = _get("/agent/tools", timeout=10.0)
-    if resp.status_code != 200:
-        _api_error(resp, "agent-tools")
-    tools = (resp.json() or {}).get("tools") or []
-    table = Table(title="Agent tool catalog")
-    table.add_column("name", style="cyan")
-    table.add_column("when")
-    table.add_column("method")
-    table.add_column("path")
-    table.add_column("description")
-    for t in tools:
-        table.add_row(
-            str(t.get("name") or ""),
-            str(t.get("when") or ""),
-            str(t.get("method") or ""),
-            str(t.get("path") or ""),
-            str(t.get("description") or "")[:60],
-        )
-    console.print(table)
 
 
 @app.command("buy")

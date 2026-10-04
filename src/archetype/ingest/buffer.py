@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
 
 from archetype.ingest.models import MigrationEvent
 
@@ -13,9 +14,15 @@ from archetype.ingest.models import MigrationEvent
 class MigrationBuffer:
     """async-safe buffer (one writer task, many readers)."""
 
-    def __init__(self, maxlen: int = 200) -> None:
+    def __init__(
+        self,
+        maxlen: int = 200,
+        on_change: Callable[[MigrationEvent], None] | None = None,
+    ) -> None:
         self._events: deque[MigrationEvent] = deque(maxlen=maxlen)
         self._lock = asyncio.Lock()
+        # live follow. called after the lock is released.
+        self._on_change = on_change
         self._next_id = 1
         self.connected = False
         self.last_error: str | None = None
@@ -30,7 +37,8 @@ class MigrationBuffer:
             self._next_id += 1
             self._events.append(event)
             self.received_count += 1
-            return event
+        self._notify(event)
+        return event
 
     async def update(self, event: MigrationEvent) -> None:
         """replace event with same id (after filter runs)."""
@@ -43,7 +51,17 @@ class MigrationBuffer:
                         self.filtered_pass_count += 1
                     elif was is None and event.filter_passed is False:
                         self.filtered_reject_count += 1
-                    return
+                    break
+        self._notify(event)
+
+    def _notify(self, event: MigrationEvent) -> None:
+        """tell live followers. a bad subscriber must not drop the migration."""
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(event)
+        except Exception:  # noqa: BLE001
+            return
 
     async def recent(self, limit: int = 20, filtered_only: bool = False) -> list[MigrationEvent]:
         """return up to `limit` most recent (oldest → newest)."""
