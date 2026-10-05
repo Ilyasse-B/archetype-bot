@@ -3,7 +3,7 @@ price change for the coin in focus.
 
 two feeds, neither is a tool the model calls:
 - every think: how price moved since the last peek (any size, any speed)
-- a fast move only: big % inside a few seconds, pushed by the watcher
+- a fast move only: net market-cap change over about 10 seconds, pushed by the watcher
 
 the long explanation is attached to the first fast alert for that coin.
 later alerts are just the numbers. the first line stays in the history.
@@ -13,16 +13,15 @@ from __future__ import annotations
 
 from typing import Any
 
-# two points on one line, not two separate gates.
-# 25% in 4s and 50% in 8s are both 6.25% per second.
-# 40% in 6s is faster than that line, so it alerts. 50% over a minute is not.
-# the line can dip under 25% for a 1s tick — that is still not an alert.
+# one alert per window. net move across ~10s, not every 0.5s wiggle.
+# 45k down to 3k inside that window is one alert. a 25% blip in 1s is not,
+# until the 10s net is still at least this big.
 DEFAULT_FAST_RULES: tuple[tuple[float, float], ...] = ((25.0, 4.0), (50.0, 8.0))
 DEFAULT_FAST_MOVE_PCT = 50.0
-DEFAULT_FAST_WINDOW_SEC = 8.0
+DEFAULT_FAST_WINDOW_SEC = 10.0
 MIN_FAST_MOVE_PCT = 25.0
-# keep enough ticks to tell a slow grind from a jump
-SAMPLE_KEEP_SEC = 120.0
+# samples older than the window are not part of this alert
+SAMPLE_KEEP_SEC = 10.0
 
 
 def required_pct(elapsed: float, anchors: list[tuple[float, float]]) -> float:
@@ -90,6 +89,36 @@ def detect_fast_move(
     return best
 
 
+def detect_window_move(
+    samples: list[tuple[float, float, float]],
+    price: float,
+    ts: float,
+    *,
+    window_sec: float = DEFAULT_FAST_WINDOW_SEC,
+    min_pct: float = MIN_FAST_MOVE_PCT,
+) -> tuple[float, float, float, float] | None:
+    """
+    net change from the oldest sample to this tick.
+
+    quiet until the span is at least window_sec, and quiet when the net
+    move is under min_pct. one check, not every little swing inside the window.
+    samples are (ts, price, fdv), oldest first, not including this tick.
+    returns (from_price, from_fdv, elapsed_sec, change_pct).
+    """
+    if price <= 0 or window_sec <= 0 or not samples:
+        return None
+    anchor_ts, anchor_price, anchor_fdv = samples[0]
+    if anchor_price <= 0:
+        return None
+    elapsed = ts - anchor_ts
+    if elapsed < window_sec:
+        return None
+    change = (price - anchor_price) / anchor_price * 100.0
+    if abs(change) < min_pct:
+        return None
+    return anchor_price, anchor_fdv, elapsed, change
+
+
 def trim_samples(
     samples: list[tuple[float, float, float]],
     ts: float,
@@ -119,7 +148,9 @@ def first_alert_note(
         f"market cap has {word} massively in a short space of time: "
         f"{change_pct:+.1f}% in {elapsed_sec:.1f}s "
         f"({_usd(from_mcap)} -> {_usd(to_mcap)}). "
-        "check for any events and reconsider the tp/sl values you have set"
+        "you set the take-profit and stop-loss. "
+        "reply revise_tpsl with a new profit_pct and loss_pct if you want different levels, "
+        "or sell if you want out"
     )
 
 

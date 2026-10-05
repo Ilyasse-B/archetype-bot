@@ -27,6 +27,8 @@ class PeekResult(BaseModel):
     value_sol: float | None = None
     pnl_sol: float | None = None
     pnl_pct: float | None = None
+    # seconds since the open fill. only set while we hold the coin.
+    held_sec: int | None = None
     profit_pct: float | None = None
     loss_pct: float | None = None
     source: str = "rpc"

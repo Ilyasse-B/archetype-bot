@@ -7,6 +7,7 @@ the rpc snapshot is only for a mint nobody is watching.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from archetype.execution.track import round_mark
@@ -72,10 +73,11 @@ def _from_tick(
 
         profit_pct, loss_pct = get_round_tpsl(ledger_path, int(pos.round_id))
 
-    value_sol = pnl_sol = pnl_pct = None
+    value_sol = pnl_sol = pnl_pct = held_sec = None
     holding = pos is not None and pos.tokens > 0
     if holding and pos is not None:
         value_sol, pnl_sol, pnl_pct = round_mark(pos, tick.price_sol)
+        held_sec = _held_sec(pos.opened_at)
 
     return PeekResult(
         mint=mint,
@@ -91,7 +93,21 @@ def _from_tick(
         value_sol=value_sol,
         pnl_sol=pnl_sol,
         pnl_pct=pnl_pct,
+        held_sec=held_sec,
         profit_pct=profit_pct,
         loss_pct=loss_pct,
         source=tick.source or "ws",
     )
+
+
+def _held_sec(opened_at: str | None) -> int | None:
+    """seconds since the position opened. none if the timestamp is junk."""
+    if not opened_at:
+        return None
+    try:
+        start = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - start).total_seconds()))

@@ -25,14 +25,15 @@ buy_mcap_mid_usd: 125000
 buy_sol_small: 3
 buy_sol_mid: 5
 buy_sol_large: 10
+# a buy under this market cap is refused. the agent can wait or reject.
+min_buy_mcap_usd: 20000
 
-# two points on one speed line, not two separate gates.
-# 25% in 4s and 50% in 8s are both 6.25% per second. 40% in 6s is over that line.
-# min is a floor. 7% in 1s beats the line and still does not alert.
+# one alert per window: net market-cap change over this many seconds.
+# a 25% wiggle in one second stays quiet. 45k to 3k across the window is one alert.
 price_fast_quick_pct: 25
 price_fast_quick_sec: 4
 price_fast_move_pct: 50
-price_fast_window_sec: 8
+price_fast_window_sec: 10
 price_fast_min_pct: 25
 
 # sqlite files land under data/ by default

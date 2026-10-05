@@ -54,9 +54,11 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
             console.print(f"         [dim]reason:[/dim] {reasoning}")
         return
     if kind == "buy":
+        mcap = ev.get("mcap_usd")
+        mcap_bit = f"  mcap=${mcap:,.0f}" if isinstance(mcap, (int, float)) else ""
         console.print(
             f"{head} [green]bought[/green] {label} "
-            f"{_num(ev.get('sol'))} SOL  tp={_num(ev.get('profit_pct'))}%  "
+            f"{_num(ev.get('sol'))} SOL{mcap_bit}  tp={_num(ev.get('profit_pct'))}%  "
             f"sl={_num(ev.get('loss_pct'))}%"
         )
         return
@@ -73,7 +75,12 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
     if kind == "sell":
         flat = ev.get("flat")
         tail = "flat" if flat else "still holding"
-        console.print(f"{head} [yellow]sold[/yellow] {label} ({tail})")
+        pnl = ev.get("pnl_sol")
+        pct = ev.get("pnl_pct")
+        bits = f"  sold={_num(ev.get('sol'))} SOL"
+        if pnl is not None or pct is not None:
+            bits += f"  pnl={pnl} ({pct}%)"
+        console.print(f"{head} [yellow]sold[/yellow] {label}{bits}  ({tail})")
         return
     if kind == "revise_tpsl":
         reason = str(ev.get("reasoning") or ev.get("narrative") or "").strip()
@@ -94,9 +101,10 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         text = str(ev.get("thesis") or "").strip()
         pnl = ev.get("pnl_sol")
         held = ev.get("held_sec")
-        console.print(
-            f"{head} [magenta]thesis[/magenta] {label}  pnl={pnl}  held={held}s"
-        )
+        tail = ""
+        if pnl is not None or isinstance(held, (int, float)):
+            tail = f"  pnl={pnl}  held={held}s"
+        console.print(f"{head} [magenta]thesis[/magenta] {label}{tail}")
         if text:
             console.print(f"         {text}")
         return

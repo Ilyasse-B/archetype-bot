@@ -176,6 +176,8 @@ def _is_echo(text: str) -> bool:
             "send the json",
             "timed out",
             "name or fees",
+            "take-profit",
+            "stop-loss",
         )
     )
 
@@ -218,7 +220,10 @@ def coach_text(raw: str) -> str:
     if "timeout" in low:
         return "timed out. send the json again."
     if "profit" in low or "loss" in low:
-        return "take-profit must be above 0. stop-loss must be above 0 and below 100."
+        return (
+            "that buy had no take-profit or stop-loss. "
+            "send the buy again with profit_pct and loss_pct filled in."
+        )
     if "unterminated" in low or "invalid json" in low or "not prose" in low:
         return "reply was cut off. reasoning is one short sentence."
     if "reasoning" in low:

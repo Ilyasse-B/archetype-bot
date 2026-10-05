@@ -69,13 +69,14 @@ class Settings(BaseSettings):
     buy_sol_small: float = 3.0
     buy_sol_mid: float = 5.0
     buy_sol_large: float = 10.0
+    # refuse a buy under this market cap. the agent can wait or reject.
+    min_buy_mcap_usd: float = 20_000
 
-    # two points on one line. required % = that speed times how long the move took.
-    # min pct is a floor: a 7% blip in 1s is over the line and still not an alert.
+    # net move over window_sec. under min pct stays quiet.
     price_fast_quick_pct: float = 25.0
     price_fast_quick_sec: float = 4.0
     price_fast_move_pct: float = 50.0
-    price_fast_window_sec: float = 8.0
+    price_fast_window_sec: float = 10.0
     price_fast_min_pct: float = 25.0
 
     def buy_sol_for_mcap(self, mcap_usd: float | None) -> float:
@@ -136,6 +137,7 @@ def get_settings() -> Settings:
         "buy_sol_small",
         "buy_sol_mid",
         "buy_sol_large",
+        "min_buy_mcap_usd",
         "price_fast_quick_pct",
         "price_fast_quick_sec",
         "price_fast_move_pct",

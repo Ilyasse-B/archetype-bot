@@ -20,6 +20,7 @@ from archetype.execution.fills import mark_all_positions
 from archetype.execution.tpsl import TpslEngine
 from archetype.execution.wallet import get_balance, get_position
 from archetype.filters.helius import HeliusRpc
+from archetype.price.models import PriceTick
 from archetype.tools.alerts import MoveAlertEngine
 from archetype.tools.backlog_tools import next_candidate, peek_backlog
 from archetype.tools.peek import peek_from_tick, peek_price
@@ -230,6 +231,7 @@ class AgentToolkit:
             sol: float = 0,
             profit_pct: float = 0,
             loss_pct: float = 0,
+            tick: PriceTick | None = None,
         ) -> dict[str, Any]:
             denied = kit._need("free")
             if denied:
@@ -249,6 +251,7 @@ class AgentToolkit:
                 sol,
                 profit_pct=profit_pct,
                 loss_pct=loss_pct,
+                tick=tick,
             )
             if kit.tpsl is not None:
                 await kit.tpsl.set_levels(

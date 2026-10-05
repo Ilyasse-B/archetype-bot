@@ -10,6 +10,7 @@ flat bag: one thesis call over the full history, then unlock.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -32,6 +33,7 @@ log = logging.getLogger("archetype.graph")
 
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "trader.md"
 THESIS_PATH = PROMPT_PATH.with_name("thesis.md")
+REJECT_THESIS_PATH = PROMPT_PATH.with_name("thesis_reject.md")
 
 Phase = Literal["idle", "searching", "locked"]
 _FREE_ACTIONS = frozenset({"reject", "hold", "buy"})
@@ -78,6 +80,8 @@ class LoopDeps:
     # fixed buy size from mcap. None keeps whatever the model sent.
     buy_sol: Callable[[float | None], float] | None = None
     thesis_prompt: str = ""
+    # set when take-profit or stop-loss sells the coin mid-think
+    abort: asyncio.Event | None = None
 
 
 def _fmt_num(val: float) -> str:
@@ -106,8 +110,13 @@ def load_system_prompt(settings: Any | None = None) -> str:
 
 
 def load_thesis_prompt() -> str:
-    """close-out instructions. not the trader prompt."""
+    """close-out after a buy that actually filled. take-profit, stop-loss, or a sell."""
     return THESIS_PATH.read_text(encoding="utf-8").strip()
+
+
+def load_reject_thesis_prompt() -> str:
+    """close-out after a reject. no trade happened."""
+    return REJECT_THESIS_PATH.read_text(encoding="utf-8").strip()
 
 
 def _queue_reject(deps: LoopDeps, mint: str, steps: int, reason: str) -> LoopState:
@@ -156,7 +165,7 @@ def _pool_pubkey(coin: dict[str, Any]) -> str | None:
 
 
 async def _arm_price_watch(deps: LoopDeps, mint: str, coin: dict[str, Any]) -> None:
-    """start the fast-move watcher when we focus a coin. already-on is a no-op."""
+    """start the watcher once the agent is on this coin. already-on is a no-op."""
     alerts = getattr(deps.tools, "alerts", None)
     if alerts is None or not mint:
         return
@@ -187,6 +196,50 @@ def _with_peek(update: dict[str, Any], peek_state: dict[str, Any]) -> dict[str, 
     if not peek_state:
         return update
     return {**peek_state, **update}
+
+
+def _clear_abort(deps: LoopDeps) -> None:
+    """the flat signal is for this coin only."""
+    if deps.abort is not None and deps.abort.is_set():
+        deps.abort.clear()
+
+
+def _bag_flat(deps: LoopDeps, phase: str, mint: str) -> bool:
+    """true when take-profit or stop-loss already sold this coin."""
+    if phase != "locked" or not mint:
+        return False
+    if deps.abort is not None and deps.abort.is_set():
+        return True
+    return not _is_open(deps, mint)
+
+
+async def _call_model(chat: Any, messages: list[dict[str, str]], abort: asyncio.Event | None):
+    """
+    one model call. if the bag goes flat mid-call, cancel it.
+
+    returns (message, aborted).
+    """
+    task = asyncio.create_task(chat.ainvoke(messages))
+    if abort is None:
+        return await task, False
+    stop = asyncio.create_task(abort.wait())
+    try:
+        await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        task.cancel()
+        stop.cancel()
+        raise
+    if abort.is_set():
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        stop.cancel()
+        return None, True
+    stop.cancel()
+    return task.result(), False
 
 
 def _emit(deps: LoopDeps, kind: str, **fields: Any) -> None:
@@ -288,7 +341,7 @@ def _build():
     g.add_conditional_edges(
         "think",
         _route,
-        {"apply": "apply", "stop": END},
+        {"apply": "apply", "close": "close", "stop": END},
     )
     g.add_conditional_edges(
         "apply",
@@ -321,6 +374,7 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     deps = runtime.context
     # clear focus so next_candidate is allowed
     deps.tools.set_focus("free", None)
+    _clear_abort(deps)
     result = await deps.tools.call("next_candidate")
     item = (result or {}).get("item") if isinstance(result, dict) else None
     if not item:
@@ -337,13 +391,41 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     mint = str(item.get("mint") or "").strip()
     if not mint:
         return {"phase": "idle", "route": "stop", "last_error": "backlog item had no mint"}
+    coin = item.get("coin_info") or {}
+    if not isinstance(coin, dict):
+        coin = {}
+    # backlog mcap is from migrate time. price often dies while it waits.
+    # one read now, and if it is under the floor the agent never sees it.
+    peeked = await deps.tools.call("peek_price", mint=mint)
+    live_mcap = None
+    if isinstance(peeked, dict) and peeked.get("ok"):
+        live_mcap = peeked.get("fdv_usd")
+    skip = _handoff_block(live_mcap)
+    if skip:
+        log.info("SKIP LOW MCAP %s %s", mint, skip)
+        await deps.tools.call("reject", mint=mint, reasoning=skip)
+        _emit(
+            deps,
+            "reject",
+            mint=mint,
+            name=coin.get("name") or "",
+            reasoning=skip,
+        )
+        deps.tools.set_focus("free", None)
+        return {
+            "phase": "idle",
+            "mint": None,
+            "coin": None,
+            "backlog_id": None,
+            "round_id": None,
+            "route": "stop",
+            "last_action": "reject",
+            "last_error": skip,
+        }
     # a crashed pass may still have turns. keep them before we wipe the coin.
     _flush_transcript(deps, mint, "", "unfinished")
     deps.memory.begin_focus(mint)
     deps.tools.set_focus("free", mint)
-    coin = item.get("coin_info") or {}
-    if not isinstance(coin, dict):
-        coin = {}
     name = coin.get("name") or coin.get("symbol") or ""
     log.info("FOCUS %s %s", mint, name)
     _emit(
@@ -352,12 +434,15 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         mint=mint,
         name=coin.get("name") or "",
         symbol=coin.get("symbol") or "",
-        mcap_usd=coin.get("market_cap_usd"),
+        mcap_usd=(
+            float(live_mcap)
+            if isinstance(live_mcap, (int, float))
+            else coin.get("market_cap_usd")
+        ),
         fees_sol=coin.get("estimated_global_fees_sol"),
         fees_check_needed=bool(coin.get("fees_check_needed")),
         buy_sol=_required_sol(deps, {"coin": coin}),
     )
-    await _arm_price_watch(deps, mint, coin if isinstance(coin, dict) else {})
     return {
         "phase": "searching",
         "mint": mint,
@@ -381,10 +466,15 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     phase: Phase = state.get("phase") or "searching"  # type: ignore[assignment]
     mode = "locked" if phase == "locked" else "free"
     deps.tools.set_focus(mode, mint)
+    # socket starts here, once the agent has the coin. not while it sat in the backlog.
+    coin = state.get("coin") or {}
+    await _arm_price_watch(deps, mint, coin if isinstance(coin, dict) else {})
 
     drained = deps.tools.drain_for_step()
     for alert in (drained or {}).get("alerts") or []:
         if not isinstance(alert, dict):
+            continue
+        if str(alert.get("mint") or mint) != mint:
             continue
         # keep it small. the note is only on the first fast move for this coin.
         payload = {
@@ -458,13 +548,19 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         opening=opening,
     )
     steps = int(state.get("steps") or 0) + 1
+    if _bag_flat(deps, phase, mint):
+        log.info("FLAT %s — sold while preparing the think, writing thesis", mint)
+        return {"route": "close"}
     reply = ""
     try:
         chat = deps.chat
-        # grammar picks the action. percents are optional in it.
+        # grammar picks the action. before a buy it also requires both levels.
         if hasattr(chat, "bind"):
             chat = chat.bind(format=decision_format(phase))
-        msg = await chat.ainvoke(messages)
+        msg, aborted = await _call_model(chat, messages, deps.abort)
+        if aborted or _bag_flat(deps, phase, mint):
+            log.info("FLAT %s — sold during the think, writing thesis", mint)
+            return {"route": "close"}
         reply = _message_text(msg)
         decision = decision_from_message(msg, required_sol=required)
     except (DecisionInvalid, Exception) as exc:  # noqa: BLE001
@@ -662,14 +758,32 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             reasoning=decision.reasoning,
             narrative=decision.narrative,
         )
-        return {"last_action": "reject", "route": "release"}
+        # same close as a sell: thesis, then the next coin.
+        return {"last_action": "reject", "route": "close"}
 
     if decision.action == "buy":
         fields = decision.buy_fields()
         sized = _required_sol(deps, state)
         if sized is not None and sized > 0:
             fields["sol"] = sized
-        result = await deps.tools.call("buy", mint=mint, **fields)
+        # the peek at the start of the think can be a minute old. the fill
+        # price is the live tick right now, and that is the one we gate on.
+        tick = await _live_tick(deps, mint)
+        mcap = float(tick.fdv_usd) if tick is not None else None
+        low = _buy_mcap_block(mcap)
+        if low:
+            log.info("BUY BLOCKED %s %s", mint, low)
+            deps.memory.append_event(mint, "error", {"error": low})
+            coin = state.get("coin") or {}
+            _emit(
+                deps,
+                "error",
+                mint=mint,
+                name=coin.get("name") or "",
+                error=low,
+            )
+            return {"last_error": low, "last_action": "buy", "route": "stop"}
+        result = await deps.tools.call("buy", mint=mint, tick=tick, **fields)
         if not result.get("ok"):
             return {
                 "last_error": result.get("error") or "buy failed",
@@ -689,11 +803,15 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             fields["loss_pct"],
         )
         coin = state.get("coin") or {}
+        filled = (result.get("fill") or {}).get("fdv_usd")
+        if isinstance(filled, (int, float)):
+            mcap = float(filled)
         deps.memory.append_event(
             mint,
             "buy",
             {
                 "sol": fields["sol"],
+                "buy_mcap_usd": mcap,
                 "profit_pct": fields["profit_pct"],
                 "loss_pct": fields["loss_pct"],
             },
@@ -704,6 +822,7 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             mint=mint,
             name=coin.get("name") or "",
             sol=fields["sol"],
+            mcap_usd=mcap,
             profit_pct=fields["profit_pct"],
             loss_pct=fields["loss_pct"],
         )
@@ -754,8 +873,29 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         }
     flat = (result.get("fill") or {}).get("position") is None
     log.info("SELL %s flat=%s", mint, flat)
-    deps.memory.append_event(mint, "sell", {"flat": flat, **decision.sell_fields()})
-    _emit(deps, "sell", mint=mint, flat=flat, narrative=decision.narrative)
+    sold_mcap = (result.get("fill") or {}).get("fdv_usd")
+    if not isinstance(sold_mcap, (int, float)):
+        sold_mcap = state.get("last_peek_mcap")
+    deps.memory.append_event(
+        mint,
+        "sell",
+        {
+            "flat": flat,
+            "sell_mcap_usd": sold_mcap,
+            **decision.sell_fields(),
+        },
+    )
+    fill = result.get("fill") or {}
+    _emit(
+        deps,
+        "sell",
+        mint=mint,
+        flat=flat,
+        narrative=decision.narrative,
+        sol=fill.get("sol"),
+        pnl_sol=fill.get("pnl_sol"),
+        pnl_pct=fill.get("pnl_pct"),
+    )
     if flat:
         return {"last_action": "sell", "route": "close"}
     return {"last_action": "sell", "route": "stop"}
@@ -777,6 +917,7 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         )
         deps.memory.save_reject_log(mint)
         deps.memory.drop_focus(mint)
+    _clear_abort(deps)
     deps.tools.set_focus("free", None)
     return {
         "phase": "idle",
@@ -801,11 +942,18 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     history = deps.memory.history_for_thesis(mint) if mint else []
     summary = deps.memory.prompt_window(mint).summary if mint else ""
     rid = state.get("round_id")
+    rejected = state.get("last_action") == "reject"
     facts = deps.memory.round_row(int(rid)) if rid is not None else None
     thesis = summary
     err = None
-    prompt = deps.thesis_prompt or load_thesis_prompt()
-    thesis_messages = _thesis_messages(prompt, state, history, facts)
+    prompt = (
+        load_reject_thesis_prompt()
+        if rejected
+        else (deps.thesis_prompt or load_thesis_prompt())
+    )
+    thesis_messages = _thesis_messages(
+        prompt, state, history, facts, narrative=summary
+    )
     reply = ""
     try:
         chat = deps.chat
@@ -827,7 +975,12 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
 
     saved_pnl = None
     saved_held = None
-    if rid is not None and mint:
+    if rejected and mint:
+        try:
+            deps.memory.save_reject_log(mint)
+        except Exception as exc:  # noqa: BLE001
+            log.info("REJECT LOG NOT STORED %s %s", mint, exc)
+    elif rid is not None and mint:
         try:
             deps.memory.save_round_log(int(rid), mint)
         except Exception as exc:  # noqa: BLE001
@@ -848,15 +1001,21 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             err = str(exc)
             log.info("THESIS NOT STORED %s %s", mint, exc)
     coin = state.get("coin") or {}
-    _emit(
-        deps,
-        "thesis",
-        mint=mint,
-        name=(facts or {}).get("name") or coin.get("name") or "",
-        thesis=thesis,
-        pnl_sol=saved_pnl if saved_pnl is not None else (facts or {}).get("pnl_sol"),
-        held_sec=saved_held if saved_held is not None else (facts or {}).get("time_held_seconds"),
-    )
+    thesis_emit: dict[str, Any] = {
+        "mint": mint,
+        "name": (facts or {}).get("name") or coin.get("name") or "",
+        "thesis": thesis,
+    }
+    if not rejected:
+        thesis_emit["pnl_sol"] = (
+            saved_pnl if saved_pnl is not None else (facts or {}).get("pnl_sol")
+        )
+        thesis_emit["held_sec"] = (
+            saved_held
+            if saved_held is not None
+            else (facts or {}).get("time_held_seconds")
+        )
+    _emit(deps, "thesis", **thesis_emit)
     if mint:
         await _stop_price_watch(deps, mint)
         coin_label = str(
@@ -865,8 +1024,11 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             or coin.get("name")
             or ""
         )
-        _flush_transcript(deps, mint, coin_label, "closed")
+        _flush_transcript(
+            deps, mint, coin_label, "reject" if rejected else "closed"
+        )
         deps.memory.drop_focus(mint)
+    _clear_abort(deps)
     deps.tools.set_focus("free", None)
     return {
         "phase": "idle",
@@ -944,8 +1106,6 @@ def _static_card(state: LoopState, buy_sol: float | None) -> str:
         f"mint: {state.get('mint')}",
         f"name: {coin.get('name') or ''}",
         f"symbol: {coin.get('symbol') or ''}",
-        f"fees_sol: {coin.get('estimated_global_fees_sol')}",
-        f"fees_check_needed: {bool(coin.get('fees_check_needed'))}",
         f"socials: {coin.get('socials_present') or []}",
     ]
     desc = str(coin.get("description") or "")[:400]
@@ -991,9 +1151,10 @@ def _delta(
             lines.append(f"mcap_usd: {live_mcap:,.0f}")
         holding = bool(peek.get("holding"))
         if holding:
-            lines.append(f"pnl_pct: {peek.get('pnl_pct')} owns_coin: True")
-        elif not state.get("told_flat"):
-            lines.append("owns_coin: False")
+            lines.append(f"pnl_pct: {peek.get('pnl_pct')}")
+            held = peek.get("held_sec")
+            if isinstance(held, (int, float)):
+                lines.append(f"held_sec: {int(held)}")
     elif isinstance(peek, dict):
         lines.append(f"peek_error: {peek.get('error')}")
 
@@ -1058,6 +1219,7 @@ def _thesis_messages(
     state: LoopState,
     history: list[Any],
     facts: dict[str, Any] | None,
+    narrative: str = "",
 ) -> list[dict[str, str]]:
     """close prompt. thesis.md already says what to write, so this is just the facts."""
     coin = state.get("coin") or {}
@@ -1072,6 +1234,9 @@ def _thesis_messages(
         "held_seconds": facts.get("time_held_seconds"),
         "bought_sol": facts.get("bought_sol"),
         "sold_sol": facts.get("sold_sol"),
+        "buy_mcap_usd": _event_mcap(history, "buy", "buy_mcap_usd"),
+        "sell_mcap_usd": _event_mcap(history, ("tpsl", "sell"), "sell_mcap_usd"),
+        "narrative": (narrative or "").strip() or None,
     }
     lines = [f"{key}: {val}" for key, val in fields.items() if val not in (None, "")]
     if not history:
@@ -1085,6 +1250,70 @@ def _thesis_messages(
         {"role": "system", "content": prompt},
         {"role": "user", "content": "\n".join(lines)},
     ]
+
+
+def _event_mcap(
+    history: list[Any], kind: str | tuple[str, ...], key: str
+) -> float | None:
+    """last market cap stored on a buy or a sell event."""
+    kinds = (kind,) if isinstance(kind, str) else kind
+    found: float | None = None
+    for ev in history:
+        if getattr(ev, "kind", None) not in kinds:
+            continue
+        payload = getattr(ev, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        val = payload.get(key)
+        if isinstance(val, (int, float)):
+            found = float(val)
+    return found
+
+
+def _mcap_floor() -> float:
+    from archetype.config import get_settings
+
+    return float(get_settings().min_buy_mcap_usd)
+
+
+def _mcap_seen(mcap: Any) -> str:
+    if isinstance(mcap, (int, float)):
+        return f"${float(mcap):,.0f}"
+    return "unknown"
+
+
+def _handoff_block(mcap: Any) -> str | None:
+    """coin never reaches the agent when the live market cap is under the floor."""
+    floor = _mcap_floor()
+    if isinstance(mcap, (int, float)) and float(mcap) >= floor:
+        return None
+    return (
+        f"market cap is {_mcap_seen(mcap)}, under ${floor:,.0f}. "
+        "skipped before the agent saw it."
+    )
+
+
+async def _live_tick(deps: LoopDeps, mint: str) -> Any:
+    """latest vault tick. this is the price a buy fills at, not the old peek."""
+    alerts = getattr(deps.tools, "alerts", None)
+    live = getattr(alerts, "live", None) if alerts is not None else None
+    if live is None or not mint:
+        return None
+    tick = live.latest(mint)
+    if tick is not None:
+        return tick
+    return await live.wait_latest(mint, timeout=5)
+
+
+def _buy_mcap_block(mcap: Any) -> str | None:
+    """refuse the buy when market cap is under the floor. empty means it can go through."""
+    floor = _mcap_floor()
+    if isinstance(mcap, (int, float)) and float(mcap) >= floor:
+        return None
+    return (
+        f"market cap is {_mcap_seen(mcap)}, under ${floor:,.0f}. too low to buy. "
+        "reject this coin, or wait if you think market cap will get back above that."
+    )
 
 
 def _parse_thesis(raw: str) -> str:

@@ -1,9 +1,9 @@
 """
-move-alert engine — daemon WS watcher for a fast price jump.
+move-alert engine — daemon WS watcher for a price move.
 
-one vault WS per coin in focus. a big move only counts if it happened
-inside a few seconds. a slow climb over a minute is not an alert.
-after an alert the window starts again from the new price.
+one vault WS per coin the agent is actually on. the alert is the net
+change over about 10 seconds, not every tick. after an alert the window
+starts again from the new price.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from archetype.tools.price_change import (
     DEFAULT_FAST_RULES,
     DEFAULT_FAST_WINDOW_SEC,
     MIN_FAST_MOVE_PCT,
-    detect_fast_move,
+    detect_window_move,
     first_alert_note,
     trim_samples,
 )
@@ -82,8 +82,9 @@ class MoveAlertEngine:
 
     async def start(self) -> None:
         log.info(
-            "move-alert engine: ready (fast rules=%s)",
-            ", ".join(f">={p:.0f}%/{w:.0f}s" for p, w in self.default_rules),
+            "move-alert engine: ready (net move >=%.0f%% over %.0fs)",
+            self.default_min_pct,
+            self.default_window_sec,
         )
 
     async def stop(self) -> None:
@@ -167,9 +168,9 @@ class MoveAlertEngine:
             if hook is not None:
                 self.live.add_listener(mint, hook)
         log.info(
-            "MOVE ALERT sub %s fast=±%.0f%% inside %.0fs",
+            "MOVE ALERT sub %s net >=%.0f%% over %.0fs",
             mint,
-            thr,
+            sub.min_pct,
             window,
         )
         return {
@@ -195,6 +196,8 @@ class MoveAlertEngine:
         if hook is not None and self.live is not None:
             self.live.remove_listener(mint, hook)
             await self.live.release(mint)
+        # dont let this coin's queued alerts show up on the next one
+        self._pending = deque(a for a in self._pending if a.mint != mint)
         log.info("MOVE ALERT unsub %s", mint)
         return {"ok": True, "mint": mint, "monitoring": False}
 
@@ -225,20 +228,22 @@ class MoveAlertEngine:
             sub.name = name
         if symbol:
             sub.symbol = symbol
-        hit = detect_fast_move(
+        hit = detect_window_move(
             sub.samples,
             price,
             ts,
-            rules=sub.rules or [(sub.threshold_pct, sub.window_sec)],
+            window_sec=sub.window_sec,
             min_pct=sub.min_pct,
         )
-        sub.samples.append((ts, price, fdv))
-        sub.samples = trim_samples(sub.samples, ts)
+        if hit is not None:
+            # next window starts here. dont keep the ticks that already alerted.
+            sub.samples = [(ts, price, fdv)]
+        else:
+            sub.samples.append((ts, price, fdv))
+            sub.samples = trim_samples(sub.samples, ts, keep_sec=sub.window_sec)
         if hit is None:
             return None
         from_price, from_fdv, elapsed, change = hit
-        # start the window over so the same jump doesnt alert again
-        sub.samples = [(ts, price, fdv)]
         direction = "up" if change > 0 else "down"
         note = ""
         if not sub.coached:

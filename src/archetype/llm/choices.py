@@ -18,13 +18,18 @@ def decision_format(phase: str) -> dict[str, Any]:
     """
     ollama grammar for one decision.
 
-    narrative can be left out. percents are optional here so a hold or a
-    reject does not have to invent them. buy and revise still get checked
-    after the reply comes back.
+    narrative can be left out. before a buy, the grammar requires both
+    percents so a buy cannot come back without them. wait and reject
+    still get those numbers stripped afterwards.
     """
+    searching = phase != "locked"
     actions = (
-        ["hold", "sell", "revise_tpsl"] if phase == "locked" else ["buy", "reject", "wait"]
+        ["hold", "sell", "revise_tpsl"] if not searching else ["buy", "reject", "wait"]
     )
+    required = ["action", "reasoning"]
+    # a 3b skips optional keys. force the two levels while it can still buy.
+    if searching:
+        required.extend(["profit_pct", "loss_pct"])
     return {
         "type": "object",
         "properties": {
@@ -34,7 +39,7 @@ def decision_format(phase: str) -> dict[str, Any]:
             "profit_pct": {"type": "number", "exclusiveMinimum": 0},
             "loss_pct": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 100},
         },
-        "required": ["action", "reasoning"],
+        "required": required,
     }
 
 

@@ -84,6 +84,12 @@ async def aiter_price_ticks_ws(
         resolved.symbol = label_symbol
     yield tick0
 
+    # a swap notifies base and quote separately. emitting after only one
+    # side lands makes a fake price (old base + new quote) and that fake
+    # price was firing alerts and marks. wait until both sides have moved.
+    base_fresh = False
+    quote_fresh = False
+
     ws_url = rpc.ws_url
     req_id = 0
     sub_to_kind: dict[int, str] = {}
@@ -140,11 +146,20 @@ async def aiter_price_ticks_ws(
             amount_ui, amount_raw, decimals = _parse_token_notification(value)
             if kind == "base" and amount_ui is not None:
                 base_ui = float(amount_ui)
+                base_fresh = True
             elif kind == "quote":
                 if amount_raw is not None:
                     quote_sol = int(amount_raw) / 1e9
+                    quote_fresh = True
                 elif amount_ui is not None and decimals is not None:
                     quote_sol = float(amount_ui)
+                    quote_fresh = True
+
+            # still one side of the swap. keep the reserves, dont emit yet.
+            if not (base_fresh and quote_fresh):
+                continue
+            base_fresh = False
+            quote_fresh = False
 
             now = time.monotonic()
             if now - last_sol >= sol_refresh_sec:

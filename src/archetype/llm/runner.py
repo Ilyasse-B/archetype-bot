@@ -136,6 +136,7 @@ class AgentLoop:
                 thesis_prompt=load_thesis_prompt(),
                 emit=_emit,
                 buy_sol=self.settings.buy_sol_for_mcap,
+                abort=asyncio.Event(),
             )
         )
 
@@ -210,10 +211,15 @@ class AgentLoop:
                             "sol": getattr(hit, "sol", None),
                             "pnl_sol": getattr(hit, "pnl_sol", None),
                             "pnl_pct": getattr(hit, "pnl_pct", None),
+                            "sell_mcap_usd": getattr(hit, "fdv_usd", None),
                         },
                     )
                 except Exception:  # noqa: BLE001
                     log.debug("could not store tpsl event", exc_info=True)
+                # the coin is flat. drop the think that is still running.
+                abort = getattr(getattr(self._lock, "deps", None), "abort", None)
+                if abort is not None:
+                    abort.set()
 
     async def _watch_hits(self) -> None:
         """check tp/sl about once a second so the cli is not stuck waiting on a think."""
