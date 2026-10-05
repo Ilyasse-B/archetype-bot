@@ -26,6 +26,7 @@ from archetype.tools import (
     agent_sell,
     next_candidate,
     peek_backlog,
+    peek_from_tick,
     peek_price,
 )
 from archetype.tools.alerts import MoveAlertEngine
@@ -117,8 +118,17 @@ def create_agent_router() -> APIRouter:
 
     @router.post("/peek")
     async def agent_peek(body: PeekRequest, request: Request) -> dict[str, Any]:
-        """one-shot price/FDV (+ PnL if holding)."""
+        """market cap off the live socket when this mint is in focus."""
         rpc, ledger = _rpc_ledger(request)
+        alerts = getattr(request.app.state, "move_alert_engine", None)
+        live = getattr(alerts, "live", None)
+        mint = body.mint.strip()
+        if live is not None and alerts is not None and mint in alerts._subs:
+            tick = await live.wait_latest(mint)
+            if tick is None:
+                raise HTTPException(status_code=503, detail="live price not ready")
+            result = await asyncio.to_thread(peek_from_tick, ledger, tick)
+            return {"ok": True, **result.model_dump()}
 
         def _run():
             return peek_price(

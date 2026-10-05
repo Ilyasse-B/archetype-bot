@@ -38,6 +38,8 @@ class PromptWindow:
     mint: str
     summary: str
     events: list[FocusEvent]
+    # first user card (mint, name, fees, socials). replayed every think.
+    opening: str = ""
 
 
 @dataclass
@@ -154,10 +156,30 @@ class FocusMemory:
             )
             conn.commit()
 
+    def set_opening(self, mint: str, text: str) -> None:
+        """save the first user card. later thinks replay this, they dont rebuild it."""
+        mint = mint.strip()
+        body = text.strip()
+        if not mint or not body:
+            return
+        with sqlite3.connect(self.active_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO focus_summary (mint, summary, opening, updated_at)
+                VALUES (?, '', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(mint) DO UPDATE SET
+                    opening = excluded.opening,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (mint, body),
+            )
+            conn.commit()
+
     def prompt_window(self, mint: str) -> PromptWindow:
-        """summary + last N events, oldest first. not the full history."""
+        """opening card + summary + last N events, oldest first. not the full history."""
         mint = mint.strip()
         summary = self._summary(mint)
+        opening = self._opening(mint)
         with sqlite3.connect(self.active_path) as conn:
             rows = conn.execute(
                 """
@@ -170,7 +192,9 @@ class FocusMemory:
                 (mint, self.prompt_events),
             ).fetchall()
         events = [_event_from_row(r) for r in reversed(rows)]
-        return PromptWindow(mint=mint, summary=summary, events=events)
+        return PromptWindow(
+            mint=mint, summary=summary, events=events, opening=opening
+        )
 
     def history_for_thesis(self, mint: str) -> list[FocusEvent]:
         """
@@ -259,6 +283,7 @@ class FocusMemory:
                 );
                 """
             )
+            _add_column(conn, "focus_summary", "opening", "TEXT")
             conn.commit()
 
     def _log_blob(self, mint: str) -> dict[str, Any]:
@@ -275,6 +300,20 @@ class FocusMemory:
                 for ev in self.history_for_thesis(mint)
             ],
         }
+
+    def _opening(self, mint: str) -> str:
+        with sqlite3.connect(self.active_path) as conn:
+            # old db files didnt have this column until _ensure added it
+            have = {row[1] for row in conn.execute("PRAGMA table_info(focus_summary)")}
+            if "opening" not in have:
+                return ""
+            row = conn.execute(
+                "SELECT opening FROM focus_summary WHERE mint = ?",
+                (mint,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return ""
+        return str(row[0])
 
     def _summary(self, mint: str) -> str:
         with sqlite3.connect(self.active_path) as conn:

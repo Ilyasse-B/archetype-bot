@@ -22,13 +22,19 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         return
     if kind == "thinking":
         bits = ""
-        price = ev.get("price_sol")
-        fdv = ev.get("fdv_usd")
-        if isinstance(price, (int, float)):
-            bits += f" price={price:.8g} SOL"
-        if isinstance(fdv, (int, float)):
-            bits += f" fdv=${fdv:,.0f}"
+        mcap = ev.get("mcap_usd")
+        if isinstance(mcap, (int, float)):
+            bits += f" mcap=${mcap:,.0f}"
+        moved = ev.get("since_last_pct")
+        if isinstance(moved, (int, float)):
+            sec = ev.get("since_last_sec")
+            sec_bit = f" in {sec:.0f}s" if isinstance(sec, (int, float)) else ""
+            bits += f" since_last={moved:+.1f}%{sec_bit}"
         console.print(f"{head} thinking about [bold]{label}[/bold]{bits}…")
+        return
+    if kind == "price_alert":
+        text = str(ev.get("text") or "").strip()
+        console.print(f"{head} [yellow]price alert[/yellow] {label} — {text}")
         return
     if kind == "decision":
         action = str(ev.get("action") or "")

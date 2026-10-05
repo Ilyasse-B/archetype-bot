@@ -33,11 +33,12 @@ class PeekResult(BaseModel):
 
 
 class MoveAlert(BaseModel):
-    """unsolicited % move notice for the locked agent."""
+    """fast price move. note is set only the first time for this coin."""
 
     mint: str
     direction: Literal["up", "down"]
     change_pct: float
+    elapsed_sec: float = 0
     from_price_sol: float
     to_price_sol: float
     from_fdv_usd: float
@@ -45,6 +46,8 @@ class MoveAlert(BaseModel):
     name: str | None = None
     symbol: str | None = None
     threshold_pct: float
+    # long explanation once. later alerts are numbers only.
+    note: str = ""
     seq: int
     ts: str
 

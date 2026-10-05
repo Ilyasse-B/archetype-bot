@@ -1,8 +1,9 @@
 """
-move-alert engine — daemon WS watcher that queues large %% moves for the agent.
+move-alert engine — daemon WS watcher for a fast price jump.
 
-one vault WS per subscribed mint. baseline resets after each alert so we
-dont spam the same move. independent of TP/SL (stops when unsubscribed).
+one vault WS per coin in focus. a big move only counts if it happened
+inside a few seconds. a slow climb over a minute is not an alert.
+after an alert the window starts again from the new price.
 """
 
 from __future__ import annotations
@@ -17,12 +18,24 @@ from typing import Any
 
 from archetype.execution.wallet import get_position
 from archetype.filters.helius import HeliusRpc
+from archetype.price.live import LivePrices
+from archetype.price.models import PriceTick
 from archetype.price.stream import aiter_price_ticks_ws
 from archetype.tools.models import MoveAlert
+from archetype.tools.price_change import (
+    DEFAULT_FAST_MOVE_PCT,
+    DEFAULT_FAST_RULES,
+    DEFAULT_FAST_WINDOW_SEC,
+    MIN_FAST_MOVE_PCT,
+    detect_fast_move,
+    first_alert_note,
+    trim_samples,
+)
 
 log = logging.getLogger("archetype.alerts")
 
-DEFAULT_THRESHOLD_PCT = 10.0
+# old name kept so imports dont break. this is the fast-move size, not "any 10%".
+DEFAULT_THRESHOLD_PCT = DEFAULT_FAST_MOVE_PCT
 MAX_PENDING = 50
 
 
@@ -30,11 +43,20 @@ MAX_PENDING = 50
 class _Sub:
     mint: str
     threshold_pct: float
-    baseline_price: float | None = None
-    baseline_fdv: float | None = None
+    window_sec: float = DEFAULT_FAST_WINDOW_SEC
+    # (percent or more, max seconds). either rule can fire.
+    rules: list[tuple[float, float]] = field(
+        default_factory=lambda: list(DEFAULT_FAST_RULES)
+    )
+    # nothing smaller than this alerts, even if it was very fast
+    min_pct: float = MIN_FAST_MOVE_PCT
+    # (ts, price, fdv), oldest first
+    samples: list[tuple[float, float, float]] = field(default_factory=list)
     name: str | None = None
     symbol: str | None = None
     pool: str | None = None
+    # long sentence already sent for this watch
+    coached: bool = False
 
 
 @dataclass
@@ -43,7 +65,15 @@ class MoveAlertEngine:
 
     rpc: HeliusRpc
     ledger_path: Path
+    # shared vault socket. peek reads the latest tick off this.
+    live: LivePrices | None = None
     default_threshold_pct: float = DEFAULT_THRESHOLD_PCT
+    default_window_sec: float = DEFAULT_FAST_WINDOW_SEC
+    default_min_pct: float = MIN_FAST_MOVE_PCT
+    default_rules: list[tuple[float, float]] = field(
+        default_factory=lambda: list(DEFAULT_FAST_RULES)
+    )
+    _hooks: dict[str, Any] = field(default_factory=dict)
     _subs: dict[str, _Sub] = field(default_factory=dict)
     _tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     _pending: deque[MoveAlert] = field(default_factory=deque)
@@ -52,19 +82,15 @@ class MoveAlertEngine:
 
     async def start(self) -> None:
         log.info(
-            "move-alert engine: ready (default threshold=%.1f%%)",
-            self.default_threshold_pct,
+            "move-alert engine: ready (fast rules=%s)",
+            ", ".join(f">={p:.0f}%/{w:.0f}s" for p, w in self.default_rules),
         )
 
     async def stop(self) -> None:
         async with self._lock:
-            tasks = list(self._tasks.values())
-            self._tasks.clear()
-            self._subs.clear()
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            mints = list(self._subs)
+        for mint in mints:
+            await self.unsubscribe(mint)
         log.info("move-alert engine: stopped")
 
     def status(self) -> dict[str, Any]:
@@ -73,9 +99,9 @@ class MoveAlertEngine:
                 {
                     "mint": s.mint,
                     "threshold_pct": s.threshold_pct,
-                    "monitoring": s.mint in self._tasks,
-                    "baseline_price_sol": s.baseline_price,
-                    "baseline_fdv_usd": s.baseline_fdv,
+                    "window_sec": s.window_sec,
+                    "monitoring": s.mint in self._hooks or s.mint in self._tasks,
+                    "last_price_sol": s.samples[-1][1] if s.samples else None,
                 }
                 for s in self._subs.values()
             ],
@@ -87,6 +113,10 @@ class MoveAlertEngine:
         mint: str,
         *,
         threshold_pct: float | None = None,
+        window_sec: float | None = None,
+        name: str | None = None,
+        symbol: str | None = None,
+        pool: str | None = None,
     ) -> dict[str, Any]:
         mint = mint.strip()
         thr = float(
@@ -94,33 +124,59 @@ class MoveAlertEngine:
             if threshold_pct is not None
             else self.default_threshold_pct
         )
+        window = float(
+            window_sec if window_sec is not None else self.default_window_sec
+        )
         if thr <= 0:
             raise ValueError("threshold_pct must be > 0")
+        if window <= 0:
+            raise ValueError("window_sec must be > 0")
 
-        pos = await asyncio.to_thread(get_position, self.ledger_path, mint)
-        sub = _Sub(
-            mint=mint,
-            threshold_pct=thr,
-            name=pos.name if pos else None,
-            symbol=pos.symbol if pos else None,
-            pool=pos.pool if pos else None,
-        )
         async with self._lock:
+            # already watching — dont restart or the fast window gets wiped
+            if self._is_on(mint):
+                return self._already(mint)
+        pos = await asyncio.to_thread(get_position, self.ledger_path, mint)
+        async with self._lock:
+            if self._is_on(mint):
+                return self._already(mint)
+            sub = _Sub(
+                mint=mint,
+                threshold_pct=thr,
+                window_sec=window,
+                rules=list(self.default_rules),
+                min_pct=float(self.default_min_pct),
+                name=name or (pos.name if pos else None),
+                symbol=symbol or (pos.symbol if pos else None),
+                pool=pool or (pos.pool if pos else None),
+            )
             self._subs[mint] = sub
-            existing = self._tasks.get(mint)
-            if existing is None or existing.done():
+            # same socket peek and tp/sl already use. no second one.
+            if self.live is not None:
+                hook = self._make_hook(mint)
+                self._hooks[mint] = hook
+            else:
                 self._tasks[mint] = asyncio.create_task(
                     self._watch(mint), name=f"alert-{mint[:8]}"
                 )
+        if self.live is not None:
+            await self.live.acquire(
+                mint, pool=sub.pool, name=sub.name, symbol=sub.symbol
+            )
+            hook = self._hooks.get(mint)
+            if hook is not None:
+                self.live.add_listener(mint, hook)
         log.info(
-            "MOVE ALERT sub %s threshold=±%.2f%%",
+            "MOVE ALERT sub %s fast=±%.0f%% inside %.0fs",
             mint,
             thr,
+            window,
         )
         return {
             "ok": True,
             "mint": mint,
             "threshold_pct": thr,
+            "window_sec": window,
             "monitoring": True,
         }
 
@@ -129,14 +185,95 @@ class MoveAlertEngine:
         async with self._lock:
             self._subs.pop(mint, None)
             task = self._tasks.pop(mint, None)
+            hook = self._hooks.pop(mint, None)
         if task is not None and not task.done():
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        if hook is not None and self.live is not None:
+            self.live.remove_listener(mint, hook)
+            await self.live.release(mint)
         log.info("MOVE ALERT unsub %s", mint)
         return {"ok": True, "mint": mint, "monitoring": False}
+
+    def consider(
+        self,
+        mint: str,
+        price: float,
+        fdv: float,
+        ts: float,
+        *,
+        name: str | None = None,
+        symbol: str | None = None,
+    ) -> MoveAlert | None:
+        """
+        one tick. returns an alert only when the move was fast.
+
+        tests call this directly. the websocket loop does too.
+        """
+        sub = self._subs.get(mint)
+        if sub is None:
+            return None
+        price = float(price)
+        fdv = float(fdv)
+        ts = float(ts)
+        if price <= 0:
+            return None
+        if name:
+            sub.name = name
+        if symbol:
+            sub.symbol = symbol
+        hit = detect_fast_move(
+            sub.samples,
+            price,
+            ts,
+            rules=sub.rules or [(sub.threshold_pct, sub.window_sec)],
+            min_pct=sub.min_pct,
+        )
+        sub.samples.append((ts, price, fdv))
+        sub.samples = trim_samples(sub.samples, ts)
+        if hit is None:
+            return None
+        from_price, from_fdv, elapsed, change = hit
+        # start the window over so the same jump doesnt alert again
+        sub.samples = [(ts, price, fdv)]
+        direction = "up" if change > 0 else "down"
+        note = ""
+        if not sub.coached:
+            note = first_alert_note(direction, change, elapsed, from_fdv, fdv)
+            sub.coached = True
+        self._seq += 1
+        alert = MoveAlert(
+            mint=mint,
+            direction=direction,  # type: ignore[arg-type]
+            change_pct=float(change),
+            elapsed_sec=float(elapsed),
+            from_price_sol=float(from_price),
+            to_price_sol=price,
+            from_fdv_usd=float(from_fdv),
+            to_fdv_usd=fdv,
+            name=sub.name,
+            symbol=sub.symbol,
+            threshold_pct=sub.threshold_pct,
+            note=note,
+            seq=self._seq,
+            ts=datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+        )
+        self._pending.append(alert)
+        while len(self._pending) > MAX_PENDING:
+            self._pending.popleft()
+        sign = "+" if change > 0 else ""
+        log.info(
+            "MOVE ALERT %s %s %s%.1f%% in %.1fs",
+            alert.direction.upper(),
+            alert.symbol or mint[:8],
+            sign,
+            change,
+            elapsed,
+        )
+        return alert
 
     def drain(self, *, limit: int = 20) -> list[MoveAlert]:
         """pop pending alerts oldest-first."""
@@ -144,6 +281,41 @@ class MoveAlertEngine:
         while self._pending and len(out) < max(1, limit):
             out.append(self._pending.popleft())
         return out
+
+    def _is_on(self, mint: str) -> bool:
+        """sub is live, either on the shared socket or the old private one."""
+        if mint not in self._subs:
+            return False
+        if mint in self._hooks:
+            return True
+        task = self._tasks.get(mint)
+        return task is not None and not task.done()
+
+    def _already(self, mint: str) -> dict[str, Any]:
+        sub = self._subs[mint]
+        return {
+            "ok": True,
+            "mint": mint,
+            "threshold_pct": sub.threshold_pct,
+            "window_sec": sub.window_sec,
+            "monitoring": True,
+            "already": True,
+        }
+
+    def _make_hook(self, mint: str):
+        """one listener on the shared socket. tests never hit this."""
+
+        async def _hook(tick: PriceTick) -> None:
+            self.consider(
+                mint,
+                float(tick.price_sol),
+                float(tick.fdv_usd),
+                tick.at.timestamp(),
+                name=tick.name,
+                symbol=tick.symbol,
+            )
+
+        return _hook
 
     async def _watch(self, mint: str) -> None:
         try:
@@ -162,52 +334,13 @@ class MoveAlertEngine:
                 sub = self._subs.get(mint)
                 if sub is None:
                     break
-                # seed baseline from first tick
-                if sub.baseline_price is None or sub.baseline_price <= 0:
-                    sub.baseline_price = float(tick.price_sol)
-                    sub.baseline_fdv = float(tick.fdv_usd)
-                    sub.name = tick.name or sub.name
-                    sub.symbol = tick.symbol or sub.symbol
-                    continue
-
-                base = sub.baseline_price
-                cur = float(tick.price_sol)
-                if base <= 0 or cur <= 0:
-                    continue
-                change = (cur - base) / base * 100.0
-                if abs(change) < sub.threshold_pct:
-                    continue
-
-                self._seq += 1
-                alert = MoveAlert(
-                    mint=mint,
-                    direction="up" if change > 0 else "down",
-                    change_pct=float(change),
-                    from_price_sol=base,
-                    to_price_sol=cur,
-                    from_fdv_usd=float(sub.baseline_fdv or 0),
-                    to_fdv_usd=float(tick.fdv_usd),
-                    name=tick.name or sub.name,
-                    symbol=tick.symbol or sub.symbol,
-                    threshold_pct=sub.threshold_pct,
-                    seq=self._seq,
-                    ts=datetime.now(timezone.utc).isoformat(),
-                )
-                self._pending.append(alert)
-                while len(self._pending) > MAX_PENDING:
-                    self._pending.popleft()
-                # reset baseline so next move is from here
-                sub.baseline_price = cur
-                sub.baseline_fdv = float(tick.fdv_usd)
-                sign = "+" if change > 0 else ""
-                log.info(
-                    "MOVE ALERT %s %s %s%.2f%%  FDV $%.0f → $%.0f",
-                    alert.direction.upper(),
-                    alert.symbol or mint[:8],
-                    sign,
-                    change,
-                    alert.from_fdv_usd,
-                    alert.to_fdv_usd,
+                self.consider(
+                    mint,
+                    float(tick.price_sol),
+                    float(tick.fdv_usd),
+                    tick.at.timestamp(),
+                    name=tick.name,
+                    symbol=tick.symbol,
                 )
         except asyncio.CancelledError:
             raise

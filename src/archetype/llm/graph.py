@@ -4,7 +4,7 @@ lock-loop state machine.
 one tick = one transition, then stop. the daemon (later) calls tick again.
 no model call when the backlog is empty.
 searching: pop one coin, one decision (reject / hold / buy).
-locked: one decision (hold / revise_tpsl / sell) from summary + last 5 events.
+locked: one decision (hold / revise_tpsl / sell) from the first prompt plus the last 5 events.
 flat bag: one thesis call over the full history, then unlock.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, TypedDict
@@ -24,6 +25,7 @@ from archetype.llm.choices import decision_format, decision_from_message
 from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
+from archetype.tools.price_change import alert_line, since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
 
@@ -51,6 +53,13 @@ class LoopState(TypedDict, total=False):
     last_narrative: str | None
     last_error: str | None
     pending_decision: dict[str, Any] | None
+    # previous think's market cap, so the next packet can say how it moved
+    last_peek_mcap: float | None
+    last_peek_at: float | None
+    # what the last prompt already told the model, so the next one can skip it
+    told_phase: str | None
+    told_flat: bool | None
+    told_summary_empty: bool | None
 
 
 @dataclass
@@ -135,6 +144,48 @@ def _timed_out(exc: BaseException) -> bool:
         return True
     text = exc_text(exc).lower()
     return "timeout" in text or "timed out" in text
+
+
+def _pool_pubkey(coin: dict[str, Any]) -> str | None:
+    """backlog pool_address is the pumpswap pool. the word pump-amm is not."""
+    raw = coin.get("pool_address") or ""
+    if isinstance(raw, str) and len(raw) >= 32:
+        return raw
+    return None
+
+
+async def _arm_price_watch(deps: LoopDeps, mint: str, coin: dict[str, Any]) -> None:
+    """start the fast-move watcher when we focus a coin. already-on is a no-op."""
+    alerts = getattr(deps.tools, "alerts", None)
+    if alerts is None or not mint:
+        return
+    try:
+        await alerts.subscribe(
+            mint,
+            name=coin.get("name") or None,
+            symbol=coin.get("symbol") or None,
+            pool=_pool_pubkey(coin),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.info("price watch not armed %s %s", mint, exc)
+
+
+async def _stop_price_watch(deps: LoopDeps, mint: str) -> None:
+    """drop the watcher when we leave the coin."""
+    alerts = getattr(deps.tools, "alerts", None)
+    if alerts is None or not mint:
+        return
+    try:
+        await alerts.unsubscribe(mint)
+    except Exception as exc:  # noqa: BLE001
+        log.info("price watch stop failed %s %s", mint, exc)
+
+
+def _with_peek(update: dict[str, Any], peek_state: dict[str, Any]) -> dict[str, Any]:
+    """keep the last peek on every return so the next think can diff it."""
+    if not peek_state:
+        return update
+    return {**peek_state, **update}
 
 
 def _emit(deps: LoopDeps, kind: str, **fields: Any) -> None:
@@ -273,6 +324,7 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         fees_check_needed=bool(coin.get("fees_check_needed")),
         buy_sol=_required_sol(deps, {"coin": coin}),
     )
+    await _arm_price_watch(deps, mint, coin if isinstance(coin, dict) else {})
     return {
         "phase": "searching",
         "mint": mint,
@@ -281,6 +333,11 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         "round_id": None,
         "last_error": None,
         "steps": 0,
+        "last_peek_mcap": None,
+        "last_peek_at": None,
+        "told_phase": None,
+        "told_flat": None,
+        "told_summary_empty": None,
         "route": "think",
     }
 
@@ -294,8 +351,26 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
 
     drained = deps.tools.drain_for_step()
     for alert in (drained or {}).get("alerts") or []:
-        if isinstance(alert, dict):
-            deps.memory.append_event(mint, "alert", alert)
+        if not isinstance(alert, dict):
+            continue
+        # keep it small. the note is only on the first fast move for this coin.
+        payload = {
+            "direction": alert.get("direction"),
+            "change_pct": alert.get("change_pct"),
+            "elapsed_sec": alert.get("elapsed_sec"),
+            "from_mcap_usd": alert.get("from_fdv_usd"),
+            "to_mcap_usd": alert.get("to_fdv_usd"),
+            "note": alert.get("note") or "",
+        }
+        deps.memory.append_event(mint, "alert", payload)
+        _emit(
+            deps,
+            "price_alert",
+            mint=mint,
+            name=(state.get("coin") or {}).get("name") or "",
+            symbol=(state.get("coin") or {}).get("symbol") or "",
+            text=alert_line(payload),
+        )
 
     looks_done = int(state.get("steps") or 0)
     if phase != "locked" and looks_done >= _MAX_SEARCH_LOOKS:
@@ -309,22 +384,45 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     peek = await deps.tools.call("peek_price", mint=mint)
     window = deps.memory.prompt_window(mint)
     coin = state.get("coin") or {}
-    price_sol = fdv_usd = None
+    mcap = None
     if isinstance(peek, dict) and peek.get("ok"):
-        price_sol = peek.get("price_sol")
-        fdv_usd = peek.get("fdv_usd")
+        mcap = peek.get("fdv_usd")
+    now = time.time()
+    since = since_last_peek(
+        state.get("last_peek_mcap"),
+        state.get("last_peek_at"),
+        float(mcap) if isinstance(mcap, (int, float)) else 0.0,
+        now,
+    )
+    peek_state: dict[str, Any] = {}
+    if isinstance(mcap, (int, float)):
+        peek_state = {"last_peek_mcap": float(mcap), "last_peek_at": now}
     _emit(
         deps,
         "thinking",
         mint=mint,
         name=coin.get("name") or "",
         symbol=coin.get("symbol") or "",
-        price_sol=price_sol,
-        fdv_usd=fdv_usd,
+        mcap_usd=mcap,
+        since_last_pct=since.get("since_last_pct"),
+        since_last_sec=since.get("since_last_sec"),
     )
     required = _required_sol(deps, state)
-    messages = _messages(
-        deps.prompt, state, peek, window, drained, buy_sol=required
+    opening = (getattr(window, "opening", None) or "").strip()
+    if not opening:
+        # first look at this coin. later thinks replay this card as-is.
+        opening = _static_card(state, required)
+        if mint:
+            deps.memory.set_opening(mint, opening)
+    messages, seen = _messages(
+        deps.prompt,
+        state,
+        peek,
+        window,
+        drained,
+        buy_sol=required,
+        since=since,
+        opening=opening,
     )
     steps = int(state.get("steps") or 0) + 1
     try:
@@ -354,26 +452,36 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             decision = ThinkDecision(
                 action="reject", reasoning=reason, narrative=""
             )
-            return {
-                "steps": steps,
-                "pending_decision": decision.model_dump(),
-                "last_error": reason,
-                "route": "apply",
-            }
+            return _with_peek(
+                {
+                    "steps": steps,
+                    "pending_decision": decision.model_dump(),
+                    "last_error": reason,
+                    "route": "apply",
+                    **seen,
+                },
+                peek_state,
+            )
         # third look still wasn't a decision. don't ask again.
         if phase != "locked" and steps >= _MAX_SEARCH_LOOKS:
-            return _queue_reject(
-                deps,
-                mint,
-                steps,
-                "looked 3 times without a buy or a reject",
+            return _with_peek(
+                _queue_reject(
+                    deps,
+                    mint,
+                    steps,
+                    "looked 3 times without a buy or a reject",
+                ),
+                peek_state,
             )
         # bad json — stay on the coin, do not trade
         note = coach_text(raw)
         log.info("THINK FAIL %s %s", mint, raw)
         deps.memory.append_event(mint, "error", {"error": note})
         _emit(deps, "error", mint=mint, error=note)
-        return {"steps": steps, "last_error": note, "route": "stop"}
+        return _with_peek(
+            {"steps": steps, "last_error": note, "route": "stop", **seen},
+            peek_state,
+        )
 
     # blank narrative means the old read still stands. still log the reply.
     prev = (window.summary or "").strip()
@@ -413,13 +521,17 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         profit_pct=decision.profit_pct,
         loss_pct=decision.loss_pct,
     )
-    return {
-        "steps": steps,
-        "pending_decision": decision.model_dump(),
-        "last_narrative": narrative if narrative_updated else prev,
-        "last_error": None,
-        "route": "apply",
-    }
+    return _with_peek(
+        {
+            "steps": steps,
+            "pending_decision": decision.model_dump(),
+            "last_narrative": narrative if narrative_updated else prev,
+            "last_error": None,
+            "route": "apply",
+            **seen,
+        },
+        peek_state,
+    )
 
 
 async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
@@ -618,6 +730,7 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     mint = str(state.get("mint") or "")
     if mint:
         # keep the step log on the reject row, then drop the sliding copy
+        await _stop_price_watch(deps, mint)
         deps.memory.save_reject_log(mint)
         deps.memory.drop_focus(mint)
     deps.tools.set_focus("free", None)
@@ -628,6 +741,11 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         "round_id": None,
         "backlog_id": None,
         "pending_decision": None,
+        "last_peek_mcap": None,
+        "last_peek_at": None,
+        "told_phase": None,
+        "told_flat": None,
+        "told_summary_empty": None,
         "route": "stop",
     }
 
@@ -687,6 +805,7 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         held_sec=saved_held if saved_held is not None else (facts or {}).get("time_held_seconds"),
     )
     if mint:
+        await _stop_price_watch(deps, mint)
         deps.memory.drop_focus(mint)
     deps.tools.set_focus("free", None)
     return {
@@ -696,6 +815,11 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         "round_id": None,
         "backlog_id": None,
         "pending_decision": None,
+        "last_peek_mcap": None,
+        "last_peek_at": None,
+        "told_phase": None,
+        "told_flat": None,
+        "told_summary_empty": None,
         "last_action": "thesis",
         "last_narrative": thesis,
         "last_error": err,
@@ -738,58 +862,135 @@ def _tpsl_kwargs(decision: ThinkDecision) -> dict[str, Any]:
     return out
 
 
+def _event_line(ev: Any) -> str:
+    """alerts print the sentence. everything else stays a short json blob."""
+    kind = getattr(ev, "kind", "")
+    payload = getattr(ev, "payload", None)
+    if kind == "alert" and isinstance(payload, dict):
+        return f"- alert {alert_line(payload)}"
+    blob = _compact(payload) if isinstance(payload, dict) else payload
+    return f"- {kind} {json.dumps(blob, default=str)[:300]}"
+
+
+def _compact(payload: dict[str, Any]) -> dict[str, Any]:
+    """drop nulls. a wait used to echo profit_pct: null back at the model."""
+    return {key: val for key, val in payload.items() if val is not None and val != ""}
+
+
+def _static_card(state: LoopState, buy_sol: float | None) -> str:
+    """fields that do not move. saved on the first think and replayed after that."""
+    coin = state.get("coin") or {}
+    lines = [
+        f"mint: {state.get('mint')}",
+        f"name: {coin.get('name') or ''}",
+        f"symbol: {coin.get('symbol') or ''}",
+        f"fees_sol: {coin.get('estimated_global_fees_sol')}",
+        f"fees_check_needed: {bool(coin.get('fees_check_needed'))}",
+        f"socials: {coin.get('socials_present') or []}",
+    ]
+    desc = str(coin.get("description") or "")[:400]
+    if desc:
+        lines.append(f"description: {desc}")
+    if buy_sol is not None:
+        lines.append(f"required_buy_sol: {buy_sol}")
+    return "\n".join(lines)
+
+
+def _narrative_visible(events: list[Any], summary: str) -> bool:
+    """true when one of the replayed events already says this narrative."""
+    for ev in events:
+        payload = getattr(ev, "payload", None)
+        if isinstance(payload, dict) and payload.get("narrative") == summary:
+            return True
+    return False
+
+
+def _delta(
+    state: LoopState,
+    peek: Any,
+    window: Any,
+    since: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """
+    only what changed since the last think.
+
+    the first card already has mint, name, symbol, fees, socials.
+    phase, a flat bag, and an empty summary are said once, then skipped.
+    """
+    lines: list[str] = []
+    phase = state.get("phase")
+    told_phase = state.get("told_phase")
+    if phase != told_phase:
+        lines.append(f"phase: {phase}")
+
+    holding = False
+    peek_ok = isinstance(peek, dict) and bool(peek.get("ok"))
+    if peek_ok:
+        live_mcap = peek.get("fdv_usd")
+        if isinstance(live_mcap, (int, float)):
+            lines.append(f"mcap_usd: {live_mcap:,.0f}")
+        holding = bool(peek.get("holding"))
+        if holding:
+            lines.append(f"pnl_pct: {peek.get('pnl_pct')} owns_coin: True")
+        elif not state.get("told_flat"):
+            lines.append("owns_coin: False")
+    elif isinstance(peek, dict):
+        lines.append(f"peek_error: {peek.get('error')}")
+
+    lines.append(since_last_line(since))
+
+    summary = (getattr(window, "summary", None) or "").strip()
+    events = list(getattr(window, "events", None) or [])
+    told_empty = bool(state.get("told_summary_empty"))
+    if summary:
+        told_empty = False
+        if not _narrative_visible(events, summary):
+            lines.append(f"summary: {summary}")
+    elif not told_empty:
+        lines.append("summary: (none yet)")
+        told_empty = True
+
+    lines.append("recent events (oldest first, max 5):")
+    if not events:
+        lines.append("- (none)")
+    for ev in events:
+        lines.append(_event_line(ev))
+    # alerts were just written into those events. dont print them again.
+    seen = {
+        "told_phase": phase,
+        "told_flat": True if (peek_ok and not holding) or state.get("told_flat") else False,
+        "told_summary_empty": told_empty,
+    }
+    if holding:
+        seen["told_flat"] = False
+    return "\n".join(lines), seen
+
+
 def _messages(
     prompt: str,
     state: LoopState,
     peek: Any,
     window: Any,
-    drained: Any,
+    _drained: Any,
     buy_sol: float | None = None,
-) -> list[dict[str, str]]:
-    coin = state.get("coin") or {}
-    lines = [
-        f"phase: {state.get('phase')}",
-        f"mint: {state.get('mint')}",
-        f"name: {coin.get('name') or ''}",
-        f"symbol: {coin.get('symbol') or ''}",
-        f"mcap_usd: {coin.get('market_cap_usd')}",
-        f"fees_sol: {coin.get('estimated_global_fees_sol')}",
-        f"fees_check_needed: {bool(coin.get('fees_check_needed'))}",
-        f"socials: {coin.get('socials_present') or []}",
-    ]
-    if buy_sol is not None:
-        lines.append(f"required_buy_sol: {buy_sol}")
-    desc = str(coin.get("description") or "")[:400]
-    if desc:
-        lines.append(f"description: {desc}")
-    if isinstance(peek, dict):
-        if peek.get("ok"):
-            lines.append(
-                f"price_sol: {peek.get('price_sol')} fdv_usd: {peek.get('fdv_usd')} "
-                f"pnl_pct: {peek.get('pnl_pct')} owns_coin: {bool(peek.get('holding'))}"
-            )
-        else:
-            lines.append(f"peek_error: {peek.get('error')}")
-    lines.append(f"summary: {window.summary or '(none yet)'}")
-    lines.append("recent events (oldest first, max 5):")
-    if not window.events:
-        lines.append("- (none)")
-    for ev in window.events:
-        lines.append(f"- {ev.kind} {json.dumps(ev.payload, default=str)[:300]}")
-    alerts = (drained or {}).get("alerts") if isinstance(drained, dict) else None
-    if alerts:
-        lines.append("alerts drained this step:")
-        for alert in alerts:
-            lines.append(f"- {json.dumps(alert, default=str)[:300]}")
-    if any(ev.kind == "error" for ev in window.events):
-        lines.append(
-            "The last reply was cut off. One short sentence about this coin. "
-            "Do not repeat the error line."
-        )
+    since: dict[str, Any] | None = None,
+    opening: str | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """
+    system prompt and the static card are the first think.
+
+    every later call replays those two, then a short user message of what changed
+    plus the last 5 events. the system text is not pasted again.
+    """
+    card = (opening or getattr(window, "opening", None) or "").strip()
+    if not card:
+        card = _static_card(state, buy_sol)
+    delta, seen = _delta(state, peek, window, since)
     return [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": "\n".join(lines)},
-    ]
+        {"role": "user", "content": card},
+        {"role": "user", "content": delta},
+    ], seen
 
 
 def _thesis_messages(
@@ -798,26 +999,28 @@ def _thesis_messages(
     history: list[Any],
     facts: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
-    """close prompt. the history is the trade, not a generic lesson."""
+    """close prompt. thesis.md already says what to write, so this is just the facts."""
     coin = state.get("coin") or {}
     facts = facts or {}
-    lines = [
-        "The position is flat. Summarize this trade from the history below.",
-        'Reply with JSON only: {"thesis": "..."}',
-        f"mint: {state.get('mint')}",
-        f"name: {facts.get('name') or coin.get('name') or ''}",
-        f"symbol: {facts.get('symbol') or coin.get('symbol') or ''}",
-        f"pnl_sol: {facts.get('pnl_sol')}",
-        f"pnl_pct: {facts.get('pnl_pct')}",
-        f"held_seconds: {facts.get('time_held_seconds')}",
-        f"bought_sol: {facts.get('bought_sol')}",
-        f"sold_sol: {facts.get('sold_sol')}",
-        "what you did, oldest first:",
-    ]
+    # thesis.md already told it to summarize. only the numbers that exist.
+    fields = {
+        "mint": state.get("mint"),
+        "name": facts.get("name") or coin.get("name") or "",
+        "symbol": facts.get("symbol") or coin.get("symbol") or "",
+        "pnl_sol": facts.get("pnl_sol"),
+        "pnl_pct": facts.get("pnl_pct"),
+        "held_seconds": facts.get("time_held_seconds"),
+        "bought_sol": facts.get("bought_sol"),
+        "sold_sol": facts.get("sold_sol"),
+    }
+    lines = [f"{key}: {val}" for key, val in fields.items() if val not in (None, "")]
     if not history:
         lines.append("- (no events)")
     for ev in history:
-        lines.append(f"- {ev.kind} {json.dumps(ev.payload, default=str)[:500]}")
+        payload = ev.payload if isinstance(ev.payload, dict) else {"value": ev.payload}
+        lines.append(
+            f"- {ev.kind} {json.dumps(_compact(payload), default=str)[:500]}"
+        )
     return [
         {"role": "system", "content": prompt},
         {"role": "user", "content": "\n".join(lines)},

@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     buy_sol_mid: float = 5.0
     buy_sol_large: float = 10.0
 
+    # two points on one line. required % = that speed times how long the move took.
+    # min pct is a floor: a 7% blip in 1s is over the line and still not an alert.
+    price_fast_quick_pct: float = 25.0
+    price_fast_quick_sec: float = 4.0
+    price_fast_move_pct: float = 50.0
+    price_fast_window_sec: float = 8.0
+    price_fast_min_pct: float = 25.0
+
     def buy_sol_for_mcap(self, mcap_usd: float | None) -> float:
         """sol to spend. missing mcap uses the smallest size."""
         if mcap_usd is None:
@@ -128,6 +136,11 @@ def get_settings() -> Settings:
         "buy_sol_small",
         "buy_sol_mid",
         "buy_sol_large",
+        "price_fast_quick_pct",
+        "price_fast_quick_sec",
+        "price_fast_move_pct",
+        "price_fast_window_sec",
+        "price_fast_min_pct",
     ):
         if key in yaml_data:
             flat[key] = yaml_data[key]

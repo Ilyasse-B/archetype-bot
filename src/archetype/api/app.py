@@ -35,6 +35,7 @@ from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
 from archetype.execution import ensure_wallet
 from archetype.execution.tpsl import TpslEngine
+from archetype.price.live import LivePrices
 from archetype.llm.runner import AgentLoop
 from archetype.tools.alerts import MoveAlertEngine
 
@@ -129,8 +130,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.info("cleared %s pending backlog rows from the last run", dropped)
         # ensure paper wallet tables exist
         await asyncio.to_thread(ensure_wallet, ledger)
-        tpsl = TpslEngine(rpc=rpc, ledger_path=ledger)
-        alerts = MoveAlertEngine(rpc=rpc, ledger_path=ledger)
+        # one vault socket per coin. peek and tp/sl read it, they dont open another.
+        live = LivePrices(rpc=rpc, ledger_path=ledger)
+        tpsl = TpslEngine(rpc=rpc, ledger_path=ledger, live=live)
+        alerts = MoveAlertEngine(
+            rpc=rpc,
+            ledger_path=ledger,
+            live=live,
+            default_threshold_pct=settings.price_fast_move_pct,
+            default_window_sec=settings.price_fast_window_sec,
+            default_min_pct=settings.price_fast_min_pct,
+            default_rules=[
+                (settings.price_fast_quick_pct, settings.price_fast_quick_sec),
+                (settings.price_fast_move_pct, settings.price_fast_window_sec),
+            ],
+        )
         agent_loop = AgentLoop(settings, rpc, tpsl=tpsl, alerts=alerts)
         agent_loop.feed.on_push = lambda item: hub.publish(
             {"stream": "agent", "event": item}

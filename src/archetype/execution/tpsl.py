@@ -1,7 +1,7 @@
 """
 daemon-side take-profit / stop-loss monitor.
 
-one helius vault WS per mint that has levels set — no extra polling.
+when the shared live socket is up, tp/sl reads that. otherwise one vault ws.
 on hit: full paper sell at the live tick, log, stash event for CLI watch.
 """
 
@@ -19,6 +19,8 @@ from archetype.execution.ledger import get_round_tpsl, set_round_tpsl
 from archetype.execution.track import round_mark
 from archetype.execution.wallet import get_position
 from archetype.filters.helius import HeliusRpc
+from archetype.price.live import LivePrices
+from archetype.price.models import PriceTick
 from archetype.price.stream import aiter_price_ticks_ws
 
 log = logging.getLogger("archetype.tpsl")
@@ -68,11 +70,16 @@ class TpslEngine:
 
     rpc: HeliusRpc
     ledger_path: Path
+    # same vault socket as peek / move alerts. none means we open our own.
+    live: LivePrices | None = None
     _levels: dict[str, TpslLevels] = field(default_factory=dict)
     _tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    _live_hooks: dict[str, Any] = field(default_factory=dict)
     _hits: dict[str, TpslHit] = field(default_factory=dict)
     _seq: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # one tick at a time so the seed check and the socket dont both sell
+    _gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     _started: bool = False
 
     async def start(self) -> None:
@@ -95,11 +102,17 @@ class TpslEngine:
         async with self._lock:
             tasks = list(self._tasks.values())
             self._tasks.clear()
+            hooks = dict(self._live_hooks)
+            self._live_hooks.clear()
             self._levels.clear()
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.live is not None:
+            for mint, hook in hooks.items():
+                self.live.remove_listener(mint, hook)
+                await self.live.release(mint)
         log.info("tpsl engine: stopped")
 
     def get_levels(self, mint: str) -> TpslLevels | None:
@@ -122,7 +135,7 @@ class TpslEngine:
             "profit_pct": lv.profit_pct if lv else None,
             "loss_pct": lv.loss_pct if lv else None,
             "round_id": lv.round_id if lv else None,
-            "monitoring": mint.strip() in self._tasks,
+            "monitoring": self._is_monitoring(mint.strip()),
             "last_hit": _hit_dict(hit) if hit else None,
         }
 
@@ -235,6 +248,12 @@ class TpslEngine:
             loss_pct=sl,
         )
 
+    def _is_monitoring(self, mint: str) -> bool:
+        if mint in self._live_hooks:
+            return True
+        task = self._tasks.get(mint)
+        return task is not None and not task.done()
+
     async def _ensure_monitor(self, levels: TpslLevels) -> None:
         mint = levels.mint
         async with self._lock:
@@ -242,10 +261,48 @@ class TpslEngine:
             existing = self._tasks.get(mint)
             if existing is not None and not existing.done():
                 return  # already watching; levels dict updated in place
-            task = asyncio.create_task(
-                self._monitor_loop(mint), name=f"tpsl-{mint[:8]}"
-            )
-            self._tasks[mint] = task
+            if mint in self._live_hooks:
+                return
+            # no shared socket (tests / helius off) — own vault ws
+            if self.live is None:
+                self._tasks[mint] = asyncio.create_task(
+                    self._monitor_loop(mint), name=f"tpsl-{mint[:8]}"
+                )
+                return
+            hook = self._make_hook(mint)
+            self._live_hooks[mint] = hook
+        pos = await asyncio.to_thread(get_position, self.ledger_path, mint)
+        await self.live.acquire(
+            mint,
+            pool=pos.pool if pos else None,
+            name=pos.name if pos else None,
+            symbol=pos.symbol if pos else None,
+        )
+        self.live.add_listener(mint, hook)
+        # check the price we already have, dont wait for the next trade
+        tick = self.live.latest(mint)
+        if tick is not None:
+            await hook(tick)
+
+    def _make_hook(self, mint: str):
+        """tpsl listener on the shared socket."""
+
+        async def _hook(tick: PriceTick) -> None:
+            async with self._gate:
+                stop = await self._apply_tick(mint, tick)
+                if stop:
+                    await self._detach_live(mint)
+
+        return _hook
+
+    async def _detach_live(self, mint: str) -> None:
+        """drop our ref. the socket stays if peek/alerts still want it."""
+        async with self._lock:
+            hook = self._live_hooks.pop(mint, None)
+        if hook is None or self.live is None:
+            return
+        self.live.remove_listener(mint, hook)
+        await self.live.release(mint)
 
     async def _cancel_monitor(self, mint: str) -> None:
         async with self._lock:
@@ -256,6 +313,7 @@ class TpslEngine:
                 await task
             except asyncio.CancelledError:
                 pass
+        await self._detach_live(mint)
 
     async def _monitor_loop(self, mint: str) -> None:
         """vault WS → mark pnl% → full sell on tp/sl hit."""
@@ -276,92 +334,8 @@ class TpslEngine:
                 symbol=pos0.symbol,
                 ledger_path=self.ledger_path,
             ):
-                levels = self._levels.get(mint)
-                if levels is None or not levels.active:
-                    break
-
-                pos = await asyncio.to_thread(
-                    get_position, self.ledger_path, mint
-                )
-                if pos is None:
-                    # closed elsewhere
-                    break
-
-                _value, pnl_sol, pnl_pct = round_mark(pos, tick.price_sol)
-                reason: str | None = None
-                if (
-                    levels.profit_pct is not None
-                    and pnl_pct >= levels.profit_pct
-                ):
-                    reason = "tp"
-                elif (
-                    levels.loss_pct is not None
-                    and pnl_pct <= -levels.loss_pct
-                ):
-                    reason = "sl"
-
-                if reason is None:
-                    continue
-
-                # hit — sell everything at this tick
-                try:
-                    fill = await asyncio.to_thread(
-                        sell,
-                        self.ledger_path,
-                        self.rpc,
-                        mint,
-                        tick=tick,
-                        known_pool=pos.pool,
-                        name=pos.name,
-                        symbol=pos.symbol,
-                        exit_reason=reason,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.error(
-                        "TPSL %s sell failed for %s: %s",
-                        reason.upper(),
-                        mint,
-                        exc,
-                    )
-                    # dont spin-retry forever on same tick — brief pause
-                    await asyncio.sleep(1.0)
-                    continue
-
-                self._seq += 1
-                hit = TpslHit(
-                    mint=mint,
-                    reason=reason,
-                    pnl_pct=float(fill.pnl_pct or pnl_pct),
-                    pnl_sol=float(fill.pnl_sol or pnl_sol),
-                    sol=float(fill.sol),
-                    price_sol=float(fill.price_sol),
-                    fdv_usd=float(fill.fdv_usd),
-                    round_id=fill.round_id,
-                    name=fill.name,
-                    symbol=fill.symbol,
-                    ts=datetime.now(timezone.utc).isoformat(),
-                    seq=self._seq,
-                )
-                self._hits[mint] = hit
-                sign = "+" if hit.pnl_pct >= 0 else ""
-                label = hit.symbol or hit.name or mint[:8]
-                log.info(
-                    "TPSL HIT %s %s — sold %.4f SOL  PnL=%s%.4f SOL "
-                    "(%s%.2f%%)  FDV=$%.0f  round=#%s",
-                    reason.upper(),
-                    label,
-                    hit.sol,
-                    sign,
-                    hit.pnl_sol,
-                    sign,
-                    hit.pnl_pct,
-                    hit.fdv_usd,
-                    hit.round_id,
-                )
-                async with self._lock:
-                    self._levels.pop(mint, None)
-                    self._tasks.pop(mint, None)
-                return
+                if await self._apply_tick(mint, tick):
+                    return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -370,6 +344,87 @@ class TpslEngine:
             async with self._lock:
                 self._tasks.pop(mint, None)
             log.info("TPSL WATCH stop %s", mint)
+
+    async def _apply_tick(self, mint: str, tick: PriceTick) -> bool:
+        """
+        mark this tick. true means stop watching (sold, flat, or levels gone).
+
+        false means keep going. a failed sell stays on so the next tick retries.
+        """
+        levels = self._levels.get(mint)
+        if levels is None or not levels.active:
+            return True
+
+        pos = await asyncio.to_thread(get_position, self.ledger_path, mint)
+        if pos is None:
+            return True
+
+        _value, pnl_sol, pnl_pct = round_mark(pos, tick.price_sol)
+        reason: str | None = None
+        if levels.profit_pct is not None and pnl_pct >= levels.profit_pct:
+            reason = "tp"
+        elif levels.loss_pct is not None and pnl_pct <= -levels.loss_pct:
+            reason = "sl"
+        if reason is None:
+            return False
+
+        try:
+            fill = await asyncio.to_thread(
+                sell,
+                self.ledger_path,
+                self.rpc,
+                mint,
+                tick=tick,
+                known_pool=pos.pool,
+                name=pos.name,
+                symbol=pos.symbol,
+                exit_reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "TPSL %s sell failed for %s: %s",
+                reason.upper(),
+                mint,
+                exc,
+            )
+            await asyncio.sleep(1.0)
+            return False
+
+        self._seq += 1
+        hit = TpslHit(
+            mint=mint,
+            reason=reason,
+            pnl_pct=float(fill.pnl_pct or pnl_pct),
+            pnl_sol=float(fill.pnl_sol or pnl_sol),
+            sol=float(fill.sol),
+            price_sol=float(fill.price_sol),
+            fdv_usd=float(fill.fdv_usd),
+            round_id=fill.round_id,
+            name=fill.name,
+            symbol=fill.symbol,
+            ts=datetime.now(timezone.utc).isoformat(),
+            seq=self._seq,
+        )
+        self._hits[mint] = hit
+        sign = "+" if hit.pnl_pct >= 0 else ""
+        label = hit.symbol or hit.name or mint[:8]
+        log.info(
+            "TPSL HIT %s %s — sold %.4f SOL  PnL=%s%.4f SOL "
+            "(%s%.2f%%)  FDV=$%.0f  round=#%s",
+            reason.upper(),
+            label,
+            hit.sol,
+            sign,
+            hit.pnl_sol,
+            sign,
+            hit.pnl_pct,
+            hit.fdv_usd,
+            hit.round_id,
+        )
+        async with self._lock:
+            self._levels.pop(mint, None)
+            self._tasks.pop(mint, None)
+        return True
 
 
 def _fmt_pct(pct: float | None, *, loss: bool = False) -> str:

@@ -22,7 +22,7 @@ from archetype.execution.wallet import get_balance, get_position
 from archetype.filters.helius import HeliusRpc
 from archetype.tools.alerts import MoveAlertEngine
 from archetype.tools.backlog_tools import next_candidate, peek_backlog
-from archetype.tools.peek import peek_price
+from archetype.tools.peek import peek_from_tick, peek_price
 from archetype.tools.trade_tools import agent_buy, agent_reject, agent_sell
 
 log = logging.getLogger("archetype.binder")
@@ -118,6 +118,20 @@ class AgentToolkit:
             use, err = kit._resolve_mint(mint)
             if err or use is None:
                 return err or _deny("mint required")
+            # focused coin already has a vault socket. read that, dont poll.
+            live = kit.alerts.live if kit.alerts is not None else None
+            if (
+                live is not None
+                and kit.alerts is not None
+                and use in kit.alerts._subs
+            ):
+                tick = await live.wait_latest(use)
+                if tick is None:
+                    return {"ok": False, "error": "live price not ready"}
+                result = await asyncio.to_thread(
+                    peek_from_tick, kit.ledger_path, tick
+                )
+                return {"ok": True, **result.model_dump()}
             result = await asyncio.to_thread(
                 peek_price, kit.rpc, kit.ledger_path, use
             )
@@ -126,7 +140,8 @@ class AgentToolkit:
         async def subscribe_move_alerts(
             mint: str = "", threshold_pct: float | None = None
         ) -> dict[str, Any]:
-            denied = kit._need("locked")
+            # watching starts when the coin is focused, before a buy
+            denied = kit._need("always")
             if denied:
                 return denied
             if kit.alerts is None:
@@ -137,7 +152,7 @@ class AgentToolkit:
             return await kit.alerts.subscribe(use, threshold_pct=threshold_pct)
 
         async def unsubscribe_move_alerts(mint: str = "") -> dict[str, Any]:
-            denied = kit._need("locked")
+            denied = kit._need("always")
             if denied:
                 return denied
             if kit.alerts is None:
@@ -148,7 +163,7 @@ class AgentToolkit:
             return await kit.alerts.unsubscribe(use)
 
         async def drain_move_alerts() -> dict[str, Any]:
-            denied = kit._need("locked")
+            denied = kit._need("always")
             if denied:
                 return denied
             return kit.drain_for_step()
