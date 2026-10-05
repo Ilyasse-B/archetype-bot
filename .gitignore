@@ -159,6 +159,7 @@ venv.bak/
 
 # Archetype local data / sqlite
 data/
+transcripts/
 *.db
 *.db-journal
 *.db-wal

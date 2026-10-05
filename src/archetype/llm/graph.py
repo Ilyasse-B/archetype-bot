@@ -25,6 +25,7 @@ from archetype.llm.choices import decision_format, decision_from_message
 from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
+from archetype.llm.transcript import flush_transcript, render_thesis, render_think
 from archetype.tools.price_change import alert_line, since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
@@ -199,6 +200,36 @@ def _emit(deps: LoopDeps, kind: str, **fields: Any) -> None:
         log.debug("agent feed emit failed", exc_info=True)
 
 
+def _save_think(
+    deps: LoopDeps,
+    mint: str,
+    messages: list[dict[str, str]],
+    reply: str | None,
+    *,
+    error: str | None = None,
+) -> None:
+    """keep this call. the file is written when we leave the coin."""
+    if not mint:
+        return
+    try:
+        n = len(deps.memory.turns(mint)) + 1
+        deps.memory.add_turn(
+            mint, render_think(n, messages, reply, error=error)
+        )
+    except Exception:  # noqa: BLE001
+        log.info("transcript think not stored %s", mint, exc_info=True)
+
+
+def _flush_transcript(deps: LoopDeps, mint: str, symbol: str, reason: str) -> None:
+    """append the saved chat to transcripts/<mint>.txt. misses stay in the log."""
+    if not mint:
+        return
+    try:
+        flush_transcript(deps.memory, mint, symbol, reason)
+    except Exception:  # noqa: BLE001
+        log.info("transcript not written %s", mint, exc_info=True)
+
+
 def _coin_mcap(state: LoopState) -> float | None:
     coin = state.get("coin") or {}
     mcap = coin.get("market_cap_usd")
@@ -306,6 +337,8 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     mint = str(item.get("mint") or "").strip()
     if not mint:
         return {"phase": "idle", "route": "stop", "last_error": "backlog item had no mint"}
+    # a crashed pass may still have turns. keep them before we wipe the coin.
+    _flush_transcript(deps, mint, "", "unfinished")
     deps.memory.begin_focus(mint)
     deps.tools.set_focus("free", mint)
     coin = item.get("coin_info") or {}
@@ -425,15 +458,18 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         opening=opening,
     )
     steps = int(state.get("steps") or 0) + 1
+    reply = ""
     try:
         chat = deps.chat
         # grammar picks the action. percents are optional in it.
         if hasattr(chat, "bind"):
             chat = chat.bind(format=decision_format(phase))
         msg = await chat.ainvoke(messages)
+        reply = _message_text(msg)
         decision = decision_from_message(msg, required_sol=required)
     except (DecisionInvalid, Exception) as exc:  # noqa: BLE001
         raw = exc_text(exc)
+        _save_think(deps, mint, messages, reply or None, error=raw)
         # one timeout and we drop the coin. retrying just burns another 2 minutes.
         if phase != "locked" and _timed_out(exc):
             reason = "timed out before a decision"
@@ -483,6 +519,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             peek_state,
         )
 
+    _save_think(deps, mint, messages, reply)
     # blank narrative means the old read still stands. still log the reply.
     prev = (window.summary or "").strip()
     narrative = decision.narrative.strip()
@@ -731,6 +768,13 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     if mint:
         # keep the step log on the reject row, then drop the sliding copy
         await _stop_price_watch(deps, mint)
+        coin = state.get("coin") or {}
+        _flush_transcript(
+            deps,
+            mint,
+            str(coin.get("symbol") or coin.get("name") or ""),
+            "reject",
+        )
         deps.memory.save_reject_log(mint)
         deps.memory.drop_focus(mint)
     deps.tools.set_focus("free", None)
@@ -760,17 +804,26 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     facts = deps.memory.round_row(int(rid)) if rid is not None else None
     thesis = summary
     err = None
+    prompt = deps.thesis_prompt or load_thesis_prompt()
+    thesis_messages = _thesis_messages(prompt, state, history, facts)
+    reply = ""
     try:
-        prompt = deps.thesis_prompt or load_thesis_prompt()
         chat = deps.chat
         if hasattr(chat, "bind"):
             chat = chat.bind(format="json")
-        msg = await chat.ainvoke(_thesis_messages(prompt, state, history, facts))
-        thesis = _parse_thesis(_message_text(msg)) or summary
+        msg = await chat.ainvoke(thesis_messages)
+        reply = _message_text(msg)
+        thesis = _parse_thesis(reply) or summary
+        if mint:
+            deps.memory.add_turn(mint, render_thesis(thesis_messages, reply))
     except Exception as exc:  # noqa: BLE001
         err = exc_text(exc)
         log.info("THESIS FAIL %s %s", mint, err)
         thesis = summary or f"thesis failed: {err}"
+        if mint:
+            deps.memory.add_turn(
+                mint, render_thesis(thesis_messages, reply or None, error=err)
+            )
 
     saved_pnl = None
     saved_held = None
@@ -806,6 +859,13 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     )
     if mint:
         await _stop_price_watch(deps, mint)
+        coin_label = str(
+            (facts or {}).get("symbol")
+            or coin.get("symbol")
+            or coin.get("name")
+            or ""
+        )
+        _flush_transcript(deps, mint, coin_label, "closed")
         deps.memory.drop_focus(mint)
     deps.tools.set_focus("free", None)
     return {

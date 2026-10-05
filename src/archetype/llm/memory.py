@@ -71,6 +71,38 @@ class FocusMemory:
         self.prompt_events = max(1, int(prompt_events))
         self._ensure()
 
+    def add_turn(self, mint: str, body: str) -> None:
+        """one think or the thesis call. flushed to a file when focus ends."""
+        mint = mint.strip()
+        text = body.strip()
+        if not mint or not text:
+            return
+        with sqlite3.connect(self.active_path) as conn:
+            conn.execute(
+                "INSERT INTO focus_turns (mint, body) VALUES (?, ?)",
+                (mint, text),
+            )
+            conn.commit()
+
+    def clear_turns(self, mint: str) -> None:
+        """drop saved chat blocks after they have been written to the file."""
+        with sqlite3.connect(self.active_path) as conn:
+            conn.execute(
+                "DELETE FROM focus_turns WHERE mint = ?",
+                (mint.strip(),),
+            )
+            conn.commit()
+
+    def turns(self, mint: str) -> list[str]:
+        """saved chat blocks for this mint, oldest first."""
+        mint = mint.strip()
+        with sqlite3.connect(self.active_path) as conn:
+            rows = conn.execute(
+                "SELECT body FROM focus_turns WHERE mint = ? ORDER BY id ASC",
+                (mint,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def begin_focus(self, mint: str) -> None:
         """fresh pass on this mint — drop any old events/summary for it."""
         self._clear(mint.strip())
@@ -284,6 +316,17 @@ class FocusMemory:
                 """
             )
             _add_column(conn, "focus_summary", "opening", "TEXT")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS focus_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mint TEXT NOT NULL,
+                    body TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_focus_turns_mint
+                    ON focus_turns(mint);
+                """
+            )
             conn.commit()
 
     def _log_blob(self, mint: str) -> dict[str, Any]:
@@ -331,6 +374,7 @@ class FocusMemory:
                 "DELETE FROM active_context WHERE entity_key = ?", (mint,)
             )
             conn.execute("DELETE FROM focus_summary WHERE mint = ?", (mint,))
+            conn.execute("DELETE FROM focus_turns WHERE mint = ?", (mint,))
             conn.commit()
 
     def _prune_others(self, keep_mint: str) -> None:
