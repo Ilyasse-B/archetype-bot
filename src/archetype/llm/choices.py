@@ -24,9 +24,9 @@ def decision_format(phase: str) -> dict[str, Any]:
     """
     searching = phase != "locked"
     actions = (
-        ["hold", "sell", "revise_tpsl", "metrics"]
+        ["hold", "sell", "revise_tpsl", "metrics", "safety"]
         if not searching
-        else ["buy", "reject", "wait", "metrics"]
+        else ["buy", "reject", "wait", "metrics", "safety"]
     )
     required = ["action", "reasoning"]
     # a 3b skips optional keys. force the two levels while it can still buy.

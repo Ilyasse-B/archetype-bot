@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell", "metrics"]
+ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell", "metrics", "safety"]
 
 # tool is named set_tpsl; plan action is revise_tpsl. same thing.
 _ACTION_ALIASES = {
@@ -30,6 +30,7 @@ _ACTION_ALIASES = {
     # before a buy, "wait" is the word. the loop still stores it as hold.
     "wait": "hold",
     "onchain": "metrics",
+    "rugcheck": "safety",
 }
 
 
@@ -206,7 +207,7 @@ def _coerce_payload(data: dict[str, Any]) -> dict[str, Any]:
     # schema — drop them so the reply stays a wait.
     # metrics still has to send percents (the search grammar requires them).
     # they are not levels. drop them so a refresh is not a buy.
-    if action in ("reject", "sell", "wait", "metrics", "onchain"):
+    if action in ("reject", "sell", "wait", "metrics", "onchain", "safety", "rugcheck"):
         out.pop("profit_pct", None)
         out.pop("loss_pct", None)
     elif action in ("hold", "revise_tpsl"):

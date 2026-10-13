@@ -28,23 +28,16 @@ _HOLDERS = "https://frontend-api-v3.pump.fun/coins/top-holders/{mint}"
 _ACTIVITY = "https://swap-api.pump.fun/v1/coins/{mint}/market-activity"
 _CREATED = "https://frontend-api-v3.pump.fun/coins-v2/user-created-coins/{creator}"
 
-# replayed on the opening card. numbers stay out of it so they don't go stale.
-ONCHAIN_GUIDE = (
-    "live coin metrics: "
-    "holders = the number of unique wallets holding the coin. "
-    "top10_pct = the total supply held by the top 10 wallets "
-    "dev_pct = the supply held by the developer of the coin "
-    "snipers_in_top and bundlers_in_top = flagged wallets in the top 10 which may be dangerous "
-    "trades_5m = buys, sells, unique buyers, unique sellers, and the price move over the last 5 minutes. "
-    "deployer = coins this creator has launched in the past, and how many of them graduated. "
-)
+# first payload only. later calls are just the numbers.
+_METRICS_NOTE = "a gauge of the coin right now. do not decide the trade from these."
 
 
-def fetch_onchain_metrics(mint: str, timeout: float = 12.0) -> str:
+def fetch_onchain_metrics(mint: str, timeout: float = 12.0, explain: bool = False) -> str:
     """
     tight live block for the first think, and again when the agent asks.
 
     each call hits the apis again. nothing here is cached.
+    explain sticks a short note on each field. only the first read wants that.
     """
     mint = (mint or "").strip()
     if not mint:
@@ -66,15 +59,34 @@ def fetch_onchain_metrics(mint: str, timeout: float = 12.0) -> str:
     created = _get_json(_CREATED.format(creator=creator), timeout) if creator else None
     lines = [
         "onchain (live):",
-        f"holders: {_holders_count(holders)}",
-        f"top10_pct: {_top10_pct(holders, supply)}",
-        f"dev_pct: {_dev_pct(holders, supply)}",
-        f"snipers_in_top: {_flag_count(holders, 'isSniper')}",
-        f"bundlers_in_top: {_flag_count(holders, 'isBundler')}",
-        f"trades_5m: {_trade_line(_window(activity, '5m'))}",
-        f"deployer: {_deployer_line(created)}",
+        _said("holders", _holders_count(holders), "unique wallets holding the coin", explain),
+        _said("top10_pct", _top10_pct(holders, supply), "supply held by the top 10 wallets", explain),
+        _said("dev_pct", _dev_pct(holders, supply), "supply the developer still holds", explain),
+        _said("snipers_in_top", _flag_count(holders, "isSniper"), "flagged snipers in the top 10", explain),
+        _said("bundlers_in_top", _flag_count(holders, "isBundler"), "flagged bundlers in the top 10", explain),
+        _said(
+            "trades_5m",
+            _trade_line(_window(activity, "5m")),
+            "buys, sells, buyers, sellers, and the 5 minute price move",
+            explain,
+        ),
+        _said(
+            "deployer",
+            _deployer_line(created),
+            "coins this creator launched, and how many graduated",
+            explain,
+        ),
     ]
+    if explain:
+        lines.append(_METRICS_NOTE)
     return "\n".join(lines)
+
+
+def _said(label: str, value: str, note: str, explain: bool) -> str:
+    """number on its own, or number plus a short note the first time."""
+    if not explain:
+        return f"{label}: {value}"
+    return f"{label}: {value} ({note})"
 
 
 def _first_wave(mint: str, timeout: float) -> tuple[Any, Any, Any]:

@@ -28,7 +28,8 @@ from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
-from archetype.tools.onchain import ONCHAIN_GUIDE, fetch_onchain_metrics
+from archetype.tools.onchain import fetch_onchain_metrics
+from archetype.tools.safety import fetch_safety
 from archetype.tools.price_change import alert_line, since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
@@ -542,7 +543,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         opening = _static_card(state, required, snapshot)
         if mint:
             deps.memory.set_opening(mint, opening)
-        onchain = await asyncio.to_thread(_onchain_metrics, mint)
+        onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
     messages, seen = _messages(
         deps.prompt,
         state,
@@ -622,8 +623,8 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             peek_state,
         )
 
-    if decision.action == "metrics":
-        # fresh http read. this look does not count toward the 3-look cap.
+    if decision.action in ("metrics", "safety"):
+        # tool call. fresh http read, and this look does not count.
         return await _refresh_metrics(
             deps,
             state,
@@ -1117,27 +1118,35 @@ async def _refresh_metrics(
     peek_state: dict[str, Any],
 ) -> LoopState:
     """
-    agent asked for on-chain metrics.
+    agent asked for metrics or safety.
 
     fetch again. do not trade, and do not burn a search look.
     """
+    kind = "safety" if decision.action == "safety" else "metrics"
     _save_think(deps, mint, messages, reply)
     prev = (getattr(window, "summary", None) or "").strip()
     narrative = decision.narrative.strip()
     narrative_updated = bool(narrative) and narrative != prev
     if narrative_updated:
         deps.memory.set_summary(mint, narrative)
-    text = await asyncio.to_thread(_onchain_metrics, mint)
+    # notes only the first time this tool shows up in the recent window
+    prior = list(getattr(window, "events", None) or [])
+    explain = kind == "safety" and not any(getattr(ev, "kind", "") == "safety" for ev in prior)
+    text = await asyncio.to_thread(
+        _safety if kind == "safety" else _onchain_metrics,
+        mint,
+        explain,
+    )
     deps.memory.append_event(
         mint,
-        "metrics",
+        kind,
         {"text": text, "reasoning": decision.reasoning},
     )
-    log.info("METRICS %s", mint)
+    log.info("%s %s", kind.upper(), mint)
     coin = state.get("coin") or {}
     _emit(
         deps,
-        "metrics",
+        kind,
         mint=mint,
         name=coin.get("name") or "",
         symbol=coin.get("symbol") or "",
@@ -1149,7 +1158,7 @@ async def _refresh_metrics(
             "steps": int(state.get("steps") or 0),
             "last_narrative": narrative if narrative_updated else prev,
             "last_error": None,
-            "last_action": "metrics",
+            "last_action": kind,
             "route": "stop",
             **seen,
         },
@@ -1161,6 +1170,9 @@ def _event_line(ev: Any) -> str:
     """alerts print the sentence. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
+    if kind == "safety" and isinstance(payload, dict):
+        # the block already starts with safety:. no extra reason line.
+        return str(payload.get("text") or "").strip() or "safety:"
     if kind == "metrics" and isinstance(payload, dict):
         why = str(payload.get("reasoning") or "").strip()
         text = str(payload.get("text") or "").strip()
@@ -1181,12 +1193,26 @@ def _compact(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: val for key, val in payload.items() if val is not None and val != ""}
 
 
-def _onchain_metrics(mint: str) -> str:
+def _safety(mint: str, explain: bool = False) -> str:
+    """rug score, locks, bundlers, fees. http only, called again every time."""
+    if not mint:
+        return "safety: unavailable"
+    try:
+        from archetype.config import get_settings
+
+        key = get_settings().solana_tracker_api_key
+        return fetch_safety(mint, key, explain=explain)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("safety failed %s: %s", mint, exc)
+        return "safety: unavailable"
+
+
+def _onchain_metrics(mint: str, explain: bool = False) -> str:
     """live holder and trade counts. http only, called again every time."""
     if not mint:
         return "onchain: unavailable"
     try:
-        return fetch_onchain_metrics(mint)
+        return fetch_onchain_metrics(mint, explain=explain)
     except Exception as exc:  # noqa: BLE001
         log.warning("onchain metrics failed %s: %s", mint, exc)
         return "onchain: unavailable"
@@ -1221,8 +1247,6 @@ def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") ->
     extra = (snapshot or "").strip()
     if extra:
         lines.append(extra)
-    # words only. the live numbers go on the first delta, and again on a metrics call.
-    lines.append(ONCHAIN_GUIDE)
     return "\n".join(lines)
 
 
@@ -1287,7 +1311,7 @@ def _delta(
         lines.append("summary: (none yet)")
         told_empty = True
 
-    lines.append("recent events (oldest first, max 5):")
+    lines.append("recent events:")
     if not events:
         lines.append("- (none)")
     for ev in events:
