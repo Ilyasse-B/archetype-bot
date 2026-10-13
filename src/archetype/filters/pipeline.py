@@ -169,7 +169,7 @@ def run_onchain_filters(
     else:
         result.metrics["pool"] = pool_addr
 
-    # already dead from migrate snapshot → skip 7s pool poll + fee poll
+    # already dead from migrate snapshot → skip the pool poll and the fee read
     if not result.passed:
         result.metrics["pool_poll_skipped"] = "already failing after migrate snapshot"
         return _done(result, ledger_path, finalize=finalize)
@@ -285,21 +285,14 @@ def run_onchain_filters(
 
         vault_addr = creator_vault_pda(curve.creator)
         share = max(thresholds.creator_fee_share, 0.05)
-        # one read first; only keep polling if we're already in the 1–2 SOL band
-        vault_sol, estimated_fees_sol, fee_samples = _poll_creator_fees(
-            rpc,
-            vault_addr,
-            share=share,
-            pass_fees=thresholds.min_global_fees_sol,
-            continue_fees=thresholds.fees_poll_min_sol,
-            timeout_sec=thresholds.fees_poll_sec,
-            interval_sec=thresholds.fees_poll_interval_sec,
+        # one vault read. enough for the migrate gate.
+        vault_sol, estimated_fees_sol = _read_creator_fees(
+            rpc, vault_addr, share=share
         )
         result.metrics["creator_vault_sol"] = vault_sol
         result.metrics["estimated_global_fees_sol"] = estimated_fees_sol
-        result.metrics["fees_samples"] = fee_samples
         result.metrics["fees_method"] = (
-            "creator_vault / creator_fee_share (polled post-migrate, best-effort)"
+            "creator_vault / creator_fee_share (one read, best-effort)"
         )
         # cleared 2 SOL but still under the warn bar → yellow CHECK in --trade
         fees_check = estimated_fees_sol < thresholds.fees_warn_below_sol
@@ -378,53 +371,6 @@ def _read_creator_fees(
     vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
     fees = vault_sol / share if vault_sol > 0 and share > 0 else 0.0
     return vault_sol, fees
-
-
-def _poll_creator_fees(
-    rpc: HeliusRpc,
-    vault_addr: str,
-    *,
-    share: float,
-    pass_fees: float,
-    continue_fees: float,
-    timeout_sec: float,
-    interval_sec: float,
-) -> tuple[float, float, list[float]]:
-    """
-    one read first, then maybe keep going.
-
-    already >= pass_fees → stop.
-    under continue_fees → stop (junk, don't burn more helius).
-    in between → poll until we clear pass_fees or the timer runs out.
-    takes the max estimate seen.
-    """
-    samples: list[float] = []
-    best_vault = 0.0
-    best_fees = 0.0
-
-    def _take(vault_sol: float, fees: float) -> None:
-        nonlocal best_vault, best_fees
-        samples.append(round(fees, 6))
-        if fees >= best_fees:
-            best_fees = fees
-            best_vault = vault_sol
-
-    vault_sol, fees = _read_creator_fees(rpc, vault_addr, share=share)
-    _take(vault_sol, fees)
-    # only the 1–2 SOL band gets the extra window
-    if best_fees >= pass_fees or best_fees < continue_fees:
-        return best_vault, best_fees, samples
-
-    deadline = time.monotonic() + max(0.0, timeout_sec)
-    wait = max(0.05, interval_sec)
-    while time.monotonic() < deadline:
-        time.sleep(wait)
-        wait = min(wait * 1.3, 2.0)
-        vault_sol, fees = _read_creator_fees(rpc, vault_addr, share=share)
-        _take(vault_sol, fees)
-        if best_fees >= pass_fees:
-            break
-    return best_vault, best_fees, samples
 
 
 def _poll_token_balances(
