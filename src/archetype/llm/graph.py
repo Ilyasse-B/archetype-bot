@@ -3,8 +3,8 @@ lock-loop state machine.
 
 one tick = one transition, then stop. the daemon (later) calls tick again.
 no model call when the backlog is empty.
-searching: pop one coin, one decision (reject / hold / buy).
-locked: one decision (hold / revise_tpsl / sell) from the first prompt plus the last 5 events.
+searching: pop one coin, one decision (reject / hold / buy / metrics).
+locked: one decision (hold / revise_tpsl / sell / metrics) from the first prompt plus the last 5 events.
 flat bag: one thesis call over the full history, then unlock.
 """
 
@@ -28,6 +28,7 @@ from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
+from archetype.tools.onchain import ONCHAIN_GUIDE, fetch_onchain_metrics
 from archetype.tools.price_change import alert_line, since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
@@ -533,12 +534,15 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     )
     required = _required_sol(deps, state)
     opening = (getattr(window, "opening", None) or "").strip()
+    onchain = ""
     if not opening:
         # first look at this coin. later thinks replay this card as-is.
+        # metrics stay off the card. they would go stale on the replay.
         snapshot = await asyncio.to_thread(_coin_snapshot, mint, deps)
         opening = _static_card(state, required, snapshot)
         if mint:
             deps.memory.set_opening(mint, opening)
+        onchain = await asyncio.to_thread(_onchain_metrics, mint)
     messages, seen = _messages(
         deps.prompt,
         state,
@@ -548,6 +552,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         buy_sol=required,
         since=since,
         opening=opening,
+        onchain=onchain,
     )
     steps = int(state.get("steps") or 0) + 1
     if _bag_flat(deps, phase, mint):
@@ -614,6 +619,20 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         _emit(deps, "error", mint=mint, error=note)
         return _with_peek(
             {"steps": steps, "last_error": note, "route": "stop", **seen},
+            peek_state,
+        )
+
+    if decision.action == "metrics":
+        # fresh http read. this look does not count toward the 3-look cap.
+        return await _refresh_metrics(
+            deps,
+            state,
+            mint,
+            window,
+            messages,
+            reply,
+            decision,
+            seen,
             peek_state,
         )
 
@@ -1086,10 +1105,71 @@ def _tpsl_kwargs(decision: ThinkDecision) -> dict[str, Any]:
     return out
 
 
+async def _refresh_metrics(
+    deps: LoopDeps,
+    state: LoopState,
+    mint: str,
+    window: Any,
+    messages: list[dict[str, str]],
+    reply: str,
+    decision: ThinkDecision,
+    seen: dict[str, Any],
+    peek_state: dict[str, Any],
+) -> LoopState:
+    """
+    agent asked for on-chain metrics.
+
+    fetch again. do not trade, and do not burn a search look.
+    """
+    _save_think(deps, mint, messages, reply)
+    prev = (getattr(window, "summary", None) or "").strip()
+    narrative = decision.narrative.strip()
+    narrative_updated = bool(narrative) and narrative != prev
+    if narrative_updated:
+        deps.memory.set_summary(mint, narrative)
+    text = await asyncio.to_thread(_onchain_metrics, mint)
+    deps.memory.append_event(
+        mint,
+        "metrics",
+        {"text": text, "reasoning": decision.reasoning},
+    )
+    log.info("METRICS %s", mint)
+    coin = state.get("coin") or {}
+    _emit(
+        deps,
+        "metrics",
+        mint=mint,
+        name=coin.get("name") or "",
+        symbol=coin.get("symbol") or "",
+        text=text,
+        reasoning=decision.reasoning,
+    )
+    return _with_peek(
+        {
+            "steps": int(state.get("steps") or 0),
+            "last_narrative": narrative if narrative_updated else prev,
+            "last_error": None,
+            "last_action": "metrics",
+            "route": "stop",
+            **seen,
+        },
+        peek_state,
+    )
+
+
 def _event_line(ev: Any) -> str:
     """alerts print the sentence. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
+    if kind == "metrics" and isinstance(payload, dict):
+        why = str(payload.get("reasoning") or "").strip()
+        text = str(payload.get("text") or "").strip()
+        head = "- metrics"
+        if why:
+            head += f" ({why})"
+        if not text:
+            return head
+        return head + "\n" + text
     if kind == "alert" and isinstance(payload, dict):
         return f"- alert {alert_line(payload)}"
     blob = _compact(payload) if isinstance(payload, dict) else payload
@@ -1099,6 +1179,17 @@ def _event_line(ev: Any) -> str:
 def _compact(payload: dict[str, Any]) -> dict[str, Any]:
     """drop nulls. a wait used to echo profit_pct: null back at the model."""
     return {key: val for key, val in payload.items() if val is not None and val != ""}
+
+
+def _onchain_metrics(mint: str) -> str:
+    """live holder and trade counts. http only, called again every time."""
+    if not mint:
+        return "onchain: unavailable"
+    try:
+        return fetch_onchain_metrics(mint)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("onchain metrics failed %s: %s", mint, exc)
+        return "onchain: unavailable"
 
 
 def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
@@ -1130,6 +1221,8 @@ def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") ->
     extra = (snapshot or "").strip()
     if extra:
         lines.append(extra)
+    # words only. the live numbers go on the first delta, and again on a metrics call.
+    lines.append(ONCHAIN_GUIDE)
     return "\n".join(lines)
 
 
@@ -1147,6 +1240,7 @@ def _delta(
     peek: Any,
     window: Any,
     since: dict[str, Any] | None,
+    onchain: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """
     only what changed since the last think.
@@ -1176,6 +1270,11 @@ def _delta(
         lines.append(f"peek_error: {peek.get('error')}")
 
     lines.append(since_last_line(since))
+
+    # first think only. later thinks get a fresh block when the agent asks.
+    block = (onchain or "").strip()
+    if block:
+        lines.append(block)
 
     summary = (getattr(window, "summary", None) or "").strip()
     events = list(getattr(window, "events", None) or [])
@@ -1213,6 +1312,7 @@ def _messages(
     buy_sol: float | None = None,
     since: dict[str, Any] | None = None,
     opening: str | None = None,
+    onchain: str = "",
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """
     system prompt and the static card are the first think.
@@ -1223,7 +1323,7 @@ def _messages(
     card = (opening or getattr(window, "opening", None) or "").strip()
     if not card:
         card = _static_card(state, buy_sol)
-    delta, seen = _delta(state, peek, window, since)
+    delta, seen = _delta(state, peek, window, since, onchain)
     return [
         {"role": "system", "content": prompt},
         {"role": "user", "content": card},

@@ -1,8 +1,8 @@
 """
 turn one model reply into a decision.
 
-searching: reject, hold, buy.
-locked: hold, sell, revise_tpsl.
+searching: reject, hold, buy, metrics.
+locked: hold, sell, revise_tpsl, metrics.
 the loop runs the real command after. buy size is filled in here, not by the model.
 """
 
@@ -24,7 +24,9 @@ def decision_format(phase: str) -> dict[str, Any]:
     """
     searching = phase != "locked"
     actions = (
-        ["hold", "sell", "revise_tpsl"] if not searching else ["buy", "reject", "wait"]
+        ["hold", "sell", "revise_tpsl", "metrics"]
+        if not searching
+        else ["buy", "reject", "wait", "metrics"]
     )
     required = ["action", "reasoning"]
     # a 3b skips optional keys. force the two levels while it can still buy.

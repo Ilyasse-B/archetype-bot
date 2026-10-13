@@ -108,6 +108,15 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         if text:
             console.print(f"         {text}")
         return
+    if kind == "metrics":
+        reason = str(ev.get("reasoning") or "").strip()
+        console.print(
+            f"{head} [cyan]metrics[/cyan] {label}" + (f" — {reason}" if reason else "")
+        )
+        text = str(ev.get("text") or "").strip()
+        for line in text.splitlines():
+            console.print(f"         {line}")
+        return
     if kind == "error":
         console.print(f"{head} [red]error[/red] {label} — {ev.get('error') or ''}")
         return
