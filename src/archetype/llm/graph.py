@@ -23,6 +23,7 @@ from langgraph.runtime import Runtime
 
 from archetype.execution.wallet import get_position
 from archetype.llm.choices import decision_format, decision_from_message
+from archetype.metadata.snapshot import fetch_coin_snapshot
 from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
@@ -534,7 +535,8 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     opening = (getattr(window, "opening", None) or "").strip()
     if not opening:
         # first look at this coin. later thinks replay this card as-is.
-        opening = _static_card(state, required)
+        snapshot = await asyncio.to_thread(_coin_snapshot, mint, deps)
+        opening = _static_card(state, required, snapshot)
         if mint:
             deps.memory.set_opening(mint, opening)
     messages, seen = _messages(
@@ -1099,7 +1101,19 @@ def _compact(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: val for key, val in payload.items() if val is not None and val != ""}
 
 
-def _static_card(state: LoopState, buy_sol: float | None) -> str:
+def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
+    """coins-v2 + charity + fee type. one shot, then the opening card keeps it."""
+    if not mint:
+        return ""
+    rpc = getattr(deps.tools, "rpc", None)
+    try:
+        return fetch_coin_snapshot(mint, rpc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("coin snapshot failed %s: %s", mint, exc)
+        return "coin snapshot: unavailable"
+
+
+def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") -> str:
     """fields that do not move. saved on the first think and replayed after that."""
     coin = state.get("coin") or {}
     lines = [
@@ -1113,6 +1127,9 @@ def _static_card(state: LoopState, buy_sol: float | None) -> str:
         lines.append(f"description: {desc}")
     if buy_sol is not None:
         lines.append(f"required_buy_sol: {buy_sol}")
+    extra = (snapshot or "").strip()
+    if extra:
+        lines.append(extra)
     return "\n".join(lines)
 
 
@@ -1134,7 +1151,7 @@ def _delta(
     """
     only what changed since the last think.
 
-    the first card already has mint, name, symbol, fees, socials.
+    the first card already has mint, name, symbol, socials, and the coin snapshot.
     phase, a flat bag, and an empty summary are said once, then skipped.
     """
     lines: list[str] = []
