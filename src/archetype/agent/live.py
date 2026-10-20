@@ -104,7 +104,7 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         if text:
             console.print(f"         {text}")
         return
-    if kind in ("metrics", "safety"):
+    if kind in ("metrics", "safety", "dex"):
         reason = str(ev.get("reasoning") or "").strip()
         console.print(
             f"{head} [cyan]{kind}[/cyan] {label}" + (f" — {reason}" if reason else "")

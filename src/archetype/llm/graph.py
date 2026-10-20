@@ -28,6 +28,8 @@ from archetype.llm.client import exc_text
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
+from archetype.backlog.store import update_latest_coin_info
+from archetype.tools.dex import dex_text, fetch_dex, merge_dex_links
 from archetype.tools.onchain import fetch_onchain_metrics
 from archetype.tools.safety import fetch_safety
 from archetype.tools.price_change import since_last_line, since_last_peek
@@ -663,7 +665,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             peek_state,
         )
 
-    if decision.action in ("metrics", "safety"):
+    if decision.action in ("metrics", "safety", "dex"):
         # tool call. fresh http read, and this look does not count.
         return await _refresh_metrics(
             deps,
@@ -1155,11 +1157,12 @@ async def _refresh_metrics(
     peek_state: dict[str, Any],
 ) -> LoopState:
     """
-    agent asked for metrics or safety.
+    agent asked for metrics, safety, or dex.
 
     fetch again. do not trade, and do not burn a search look.
+    dex also stores new links, the image, and the banner on the coin.
     """
-    kind = "safety" if decision.action == "safety" else "metrics"
+    kind = decision.action if decision.action in ("metrics", "safety", "dex") else "metrics"
     _save_think(deps, mint, messages, reply)
     prev = (getattr(window, "summary", None) or "").strip()
     narrative = decision.narrative.strip()
@@ -1168,19 +1171,27 @@ async def _refresh_metrics(
         deps.memory.set_summary(mint, narrative)
     # notes only the first time this tool shows up in the recent window
     prior = list(getattr(window, "events", None) or [])
-    explain = kind == "safety" and not any(getattr(ev, "kind", "") == "safety" for ev in prior)
-    text = await asyncio.to_thread(
-        _safety if kind == "safety" else _onchain_metrics,
-        mint,
-        explain,
-    )
+    explain = kind in ("safety", "dex") and not any(getattr(ev, "kind", "") == kind for ev in prior)
+    coin = dict(state.get("coin") or {})
+    if kind == "dex":
+        read = await asyncio.to_thread(fetch_dex, mint)
+        text = dex_text(read, explain)
+        coin = merge_dex_links(coin, read)
+        ledger = getattr(deps.tools, "ledger_path", None)
+        if ledger is not None:
+            update_latest_coin_info(ledger, mint, coin)
+    else:
+        text = await asyncio.to_thread(
+            _safety if kind == "safety" else _onchain_metrics,
+            mint,
+            explain,
+        )
     deps.memory.append_event(
         mint,
         kind,
         {"text": text, "reasoning": decision.reasoning},
     )
     log.info("%s %s", kind.upper(), mint)
-    coin = state.get("coin") or {}
     _emit(
         deps,
         kind,
@@ -1193,6 +1204,7 @@ async def _refresh_metrics(
     return _with_peek(
         {
             "steps": int(state.get("steps") or 0),
+            "coin": coin,
             "last_narrative": narrative if narrative_updated else prev,
             "last_error": None,
             "last_action": kind,
@@ -1207,9 +1219,9 @@ def _event_line(ev: Any) -> str:
     """tool blocks print in full. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
-    if kind == "safety" and isinstance(payload, dict):
-        # the block already starts with safety:. no extra reason line.
-        return str(payload.get("text") or "").strip() or "safety:"
+    if kind in ("safety", "dex") and isinstance(payload, dict):
+        # the block already starts with safety: or dex:. no extra reason line.
+        return str(payload.get("text") or "").strip() or f"{kind}:"
     if kind == "metrics" and isinstance(payload, dict):
         why = str(payload.get("reasoning") or "").strip()
         text = str(payload.get("text") or "").strip()

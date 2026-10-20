@@ -227,6 +227,31 @@ def list_pending(ledger_path: Path, limit: int = 50) -> list[BacklogItem]:
     return [_row_to_item(r) for r in rows]
 
 
+def update_latest_coin_info(ledger_path: Path, mint: str, coin: dict[str, Any]) -> bool:
+    """
+    write the latest backlog row for this mint.
+
+    consumed or not. later tools read this, the agent does not.
+    """
+    mint = (mint or "").strip()
+    if not mint or not isinstance(coin, dict):
+        return False
+    ensure_backlog_table(ledger_path)
+    with sqlite3.connect(ledger_path) as conn:
+        row = conn.execute(
+            "SELECT id FROM migration_backlog WHERE mint = ? ORDER BY id DESC LIMIT 1",
+            (mint,),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE migration_backlog SET coin_info = ? WHERE id = ?",
+            (json.dumps(coin), int(row[0])),
+        )
+        conn.commit()
+    return True
+
+
 def clear_pending(ledger_path: Path) -> int:
     """drop unconsumed coins left over from the last daemon run."""
     ensure_backlog_table(ledger_path)
