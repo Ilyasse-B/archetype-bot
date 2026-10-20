@@ -1,56 +1,56 @@
 # Archetype
 
-Local Solana memecoin trading agent (paper-first). Design docs live in `docs/`.
+Local Solana memecoin agent. One coin at a time, paper fills only.
 
-## Phase 3 (in progress)
+## Status
 
-Live PumpSwap FDV via Helius WS in the CLI; paper wallet buy/sell/balance via the **daemon**.
+Phase 4 is running: a LangGraph loop on local Ollama `llama3.2:3b`. It searches (buy, reject, or wait), then holds, revises levels, or sells, and writes a thesis when the trade closes.
 
-### Setup
+Phase 5 is in progress. Built: market-cap move since the last peek, live metrics, safety, and a Dexscreener check. Still ahead: tracked wallets, vamp, backlog peek, website, X, and Gemini amongst others.
+
+## Setup
 
 ```bash
-cd /home/ilyasse/Archetype/archetype-bot
 uv sync
+cp .env.example .env
 ```
 
-### Run daemon (required for paper + migrations)
+Fill `ARCHETYPE_HELIUS_API_KEY` and `ARCHETYPE_SOLANA_TRACKER_API_KEY` in `.env`.
+
+## Run
 
 ```bash
+systemctl --user start ollama
 uv run python -m archetype.daemon
+curl -fsS -X POST http://127.0.0.1:8765/agent/loop/start
+uv run archetype migrations --follow
 ```
 
-### CLI (talks to daemon, except live watch)
+The daemon does not start the agent loop on its own.
+
+Stop with:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8765/agent/loop/stop
+uv run archetype stop
+systemctl --user stop ollama
+```
+
+If port 8765 is already taken, an old daemon is still up. `uv run archetype stop` clears it.
+
+## CLI
+
+The CLI talks to the daemon.
 
 ```bash
 uv run archetype status
-uv run archetype migrations              # RAW unfiltered
-uv run archetype migrations --filtered   # PASS only
-uv run archetype migrations --filtered --trade   # interactive watch/reject/buy/sell
-uv run archetype backlog                 # pending agent queue
-
-# paper wallet (daemon)
-uv run archetype balance
-uv run archetype balance add 50
-uv run archetype balance reset
-uv run archetype buy <MINT> 5            # fill on daemon → optional local watch
-uv run archetype buy <MINT> 5 --no-track
-uv run archetype sell <MINT>
-uv run archetype sell <MINT> 25
-uv run archetype sell <MINT> init
-uv run archetype sell <MINT> 5 sol
-
-# live price (CLI ↔ Helius WS directly; PnL uses daemon position if open)
+uv run archetype migrations --follow
+uv run archetype migrations --filtered --trade
+uv run archetype backlog
+uv run archetype peek <MINT>
 uv run archetype watch <MINT>
-uv run archetype watch <MINT> --once
-
-uv run archetype stop
+uv run archetype buy <MINT> <SOL>
+uv run archetype sell <MINT>
+uv run archetype set-profit <MINT> <PCT>
+uv run archetype set-loss <MINT> <PCT>
 ```
-
-If you see `address already in use`, an old daemon is still running:
-
-```bash
-uv run archetype stop
-# or: ss -tlnp | grep 8765
-```
-
-See `docs/PROJECT_OVERVIEW.md` for architecture.
