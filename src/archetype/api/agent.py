@@ -1,7 +1,7 @@
 """
 /agent/* — clean internal API the Phase 4 LLM will call.
 
-wraps paper fills + backlog + peek + move-alerts into one catalog.
+wraps paper fills + backlog + peek into one catalog.
 human CLI keeps using /paper/* and local watch; agent uses these.
 """
 
@@ -29,7 +29,6 @@ from archetype.tools import (
     peek_from_tick,
     peek_price,
 )
-from archetype.tools.alerts import MoveAlertEngine
 from archetype.tools.trade_tools import agent_buy
 
 
@@ -38,17 +37,6 @@ class PeekRequest(BaseModel):
     known_pool: str | None = None
     name: str | None = None
     symbol: str | None = None
-
-
-class AlertSubRequest(BaseModel):
-    mint: str
-    threshold_pct: float | None = Field(
-        None, gt=0, description="abs %% move; default engine threshold"
-    )
-
-
-class AlertUnsubRequest(BaseModel):
-    mint: str
 
 
 class AgentBuyRequest(BaseModel):
@@ -98,13 +86,6 @@ def _rpc_ledger(request: Request) -> tuple[HeliusRpc, Path]:
     return rpc, ledger
 
 
-def _alerts(request: Request) -> MoveAlertEngine:
-    eng = getattr(request.app.state, "move_alert_engine", None)
-    if eng is None:
-        raise HTTPException(status_code=503, detail="move-alert engine not ready")
-    return eng
-
-
 def _tpsl(request: Request):
     eng = getattr(request.app.state, "tpsl_engine", None)
     if eng is None:
@@ -120,10 +101,9 @@ def create_agent_router() -> APIRouter:
     async def agent_peek(body: PeekRequest, request: Request) -> dict[str, Any]:
         """market cap off the live socket when this mint is in focus."""
         rpc, ledger = _rpc_ledger(request)
-        alerts = getattr(request.app.state, "move_alert_engine", None)
-        live = getattr(alerts, "live", None)
+        live = getattr(request.app.state, "live_prices", None)
         mint = body.mint.strip()
-        if live is not None and alerts is not None and mint in alerts._subs:
+        if live is not None and live.watching(mint):
             tick = await live.wait_latest(mint)
             if tick is None:
                 raise HTTPException(status_code=503, detail="live price not ready")
@@ -145,44 +125,6 @@ def create_agent_router() -> APIRouter:
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, **result.model_dump()}
-
-    @router.post("/alerts/subscribe")
-    async def alerts_subscribe(
-        body: AlertSubRequest, request: Request
-    ) -> dict[str, Any]:
-        eng = _alerts(request)
-        try:
-            return await eng.subscribe(
-                body.mint, threshold_pct=body.threshold_pct
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @router.post("/alerts/unsubscribe")
-    async def alerts_unsubscribe(
-        body: AlertUnsubRequest, request: Request
-    ) -> dict[str, Any]:
-        eng = _alerts(request)
-        return await eng.unsubscribe(body.mint)
-
-    @router.get("/alerts/pending")
-    async def alerts_pending(
-        request: Request,
-        limit: int = Query(20, ge=1, le=50),
-    ) -> dict[str, Any]:
-        eng = _alerts(request)
-        alerts = eng.drain(limit=limit)
-        return {
-            "ok": True,
-            "count": len(alerts),
-            "alerts": [a.model_dump() for a in alerts],
-            "status": eng.status(),
-        }
-
-    @router.get("/alerts/status")
-    async def alerts_status(request: Request) -> dict[str, Any]:
-        eng = _alerts(request)
-        return {"ok": True, **eng.status()}
 
     @router.get("/backlog/peek")
     async def agent_backlog_peek(
@@ -300,7 +242,6 @@ def create_agent_router() -> APIRouter:
             )
         tick = _tick_from_body(body, mint)
         tpsl = getattr(request.app.state, "tpsl_engine", None)
-        alerts = getattr(request.app.state, "move_alert_engine", None)
 
         def _run():
             return agent_sell(
@@ -324,8 +265,6 @@ def create_agent_router() -> APIRouter:
         if fill.position is None:
             if tpsl is not None:
                 await tpsl.on_position_closed(mint)
-            if alerts is not None:
-                await alerts.unsubscribe(mint)
         return {"ok": True, "fill": _fill_dict(fill)}
 
     @router.post("/tpsl")

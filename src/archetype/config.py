@@ -74,13 +74,6 @@ class Settings(BaseSettings):
     # refuse a buy under this market cap. the agent can wait or reject.
     min_buy_mcap_usd: float = 20_000
 
-    # net move over window_sec. under min pct stays quiet.
-    price_fast_quick_pct: float = 25.0
-    price_fast_quick_sec: float = 4.0
-    price_fast_move_pct: float = 50.0
-    price_fast_window_sec: float = 10.0
-    price_fast_min_pct: float = 25.0
-
     def buy_sol_for_mcap(self, mcap_usd: float | None) -> float:
         """sol to spend. missing mcap uses the smallest size."""
         if mcap_usd is None:
@@ -141,11 +134,6 @@ def get_settings() -> Settings:
         "buy_sol_mid",
         "buy_sol_large",
         "min_buy_mcap_usd",
-        "price_fast_quick_pct",
-        "price_fast_quick_sec",
-        "price_fast_move_pct",
-        "price_fast_window_sec",
-        "price_fast_min_pct",
     ):
         if key in yaml_data:
             flat[key] = yaml_data[key]

@@ -1,7 +1,7 @@
 """
 one helius vault websocket per mint.
 
-peek, the fast-move watcher, and tp/sl all read this. nobody opens a second
+peek and tp/sl all read this. nobody opens a second
 socket for the same coin, and peek does not poll rpc on its own.
 """
 

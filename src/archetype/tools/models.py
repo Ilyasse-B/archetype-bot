@@ -4,7 +4,7 @@ agent tool I/O shapes — stable JSON the LLM / LangGraph will see later.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -32,26 +32,6 @@ class PeekResult(BaseModel):
     profit_pct: float | None = None
     loss_pct: float | None = None
     source: str = "rpc"
-
-
-class MoveAlert(BaseModel):
-    """fast price move. note is set only the first time for this coin."""
-
-    mint: str
-    direction: Literal["up", "down"]
-    change_pct: float
-    elapsed_sec: float = 0
-    from_price_sol: float
-    to_price_sol: float
-    from_fdv_usd: float
-    to_fdv_usd: float
-    name: str | None = None
-    symbol: str | None = None
-    threshold_pct: float
-    # long explanation once. later alerts are numbers only.
-    note: str = ""
-    seq: int
-    ts: str
 
 
 class BacklogPeekItem(BaseModel):

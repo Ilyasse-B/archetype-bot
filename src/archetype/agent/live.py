@@ -32,10 +32,6 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
             bits += f" since_last={moved:+.1f}%{sec_bit}"
         console.print(f"{head} thinking about [bold]{label}[/bold]{bits}…")
         return
-    if kind == "price_alert":
-        text = str(ev.get("text") or "").strip()
-        console.print(f"{head} [yellow]price alert[/yellow] {label} — {text}")
-        return
     if kind == "decision":
         action = str(ev.get("action") or "")
         narrative = str(ev.get("narrative") or "").strip()

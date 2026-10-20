@@ -41,7 +41,7 @@ class AgentLoop:
         rpc: HeliusRpc,
         *,
         tpsl: Any = None,
-        alerts: Any = None,
+        live: Any = None,
         lock: LockLoop | None = None,
         idle_sec: float = 2.0,
         think_sec: float = 12.0,
@@ -49,7 +49,7 @@ class AgentLoop:
         self.settings = settings
         self.rpc = rpc
         self.tpsl = tpsl
-        self.alerts = alerts
+        self.live = live
         self.idle_sec = idle_sec
         self.think_sec = think_sec
         self._lock = lock
@@ -119,7 +119,7 @@ class AgentLoop:
             rpc=self.rpc,
             ledger_path=ledger,
             tpsl=self.tpsl,
-            alerts=self.alerts,
+            live=self.live,
         )
         memory = FocusMemory(active, ledger)
         feed = self.feed
@@ -261,7 +261,7 @@ class AgentLoop:
                         self.state.get("last_action") or "-",
                         self.last_tick_sec,
                     )
-                delay = self.idle_sec if phase == "idle" else self._think_delay()
+                delay = self.idle_sec if phase == "idle" else self.think_sec
                 await self._sleep(delay)
         except asyncio.CancelledError:
             return
@@ -271,18 +271,6 @@ class AgentLoop:
                 await hit_task
             except asyncio.CancelledError:
                 pass
-
-    def _think_delay(self) -> float:
-        """shorter wait when a move alert is already sitting in the queue."""
-        pending = 0
-        if self.alerts is not None:
-            try:
-                pending = int(self.alerts.status().get("pending_count") or 0)
-            except Exception:  # noqa: BLE001
-                pending = 0
-        if pending:
-            return min(1.0, self.think_sec)
-        return self.think_sec
 
     async def _sleep(self, sec: float) -> None:
         try:

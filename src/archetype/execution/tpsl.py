@@ -70,7 +70,7 @@ class TpslEngine:
 
     rpc: HeliusRpc
     ledger_path: Path
-    # same vault socket as peek / move alerts. none means we open our own.
+    # same vault socket as peek. none means we open our own.
     live: LivePrices | None = None
     _levels: dict[str, TpslLevels] = field(default_factory=dict)
     _tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
@@ -296,7 +296,7 @@ class TpslEngine:
         return _hook
 
     async def _detach_live(self, mint: str) -> None:
-        """drop our ref. the socket stays if peek/alerts still want it."""
+        """drop our ref. the socket stays if peek still wants it."""
         async with self._lock:
             hook = self._live_hooks.pop(mint, None)
         if hook is None or self.live is None:

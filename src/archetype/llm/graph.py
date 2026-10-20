@@ -4,7 +4,7 @@ lock-loop state machine.
 one tick = one transition, then stop. the daemon (later) calls tick again.
 no model call when the backlog is empty.
 searching: pop one coin, one decision (reject / hold / buy / metrics).
-locked: one decision (hold / revise_tpsl / sell / metrics) from the first prompt plus the last 5 events.
+locked: one decision (hold / revise_tpsl / sell / metrics) from the locked prompt plus the last 5 events.
 flat bag: one thesis call over the full history, then unlock.
 """
 
@@ -30,7 +30,7 @@ from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
 from archetype.tools.onchain import fetch_onchain_metrics
 from archetype.tools.safety import fetch_safety
-from archetype.tools.price_change import alert_line, since_last_line, since_last_peek
+from archetype.tools.price_change import since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
 
@@ -112,6 +112,63 @@ def load_system_prompt(settings: Any | None = None) -> str:
     return raw
 
 
+# dropped once the coin is owned. buying and rejecting would just confuse it.
+_LOCKED_DROP = (
+    "Before you have bought, action is buy, reject, or wait.\n"
+    "wait means you have not bought. You are looking at this coin again later. "
+    "Do not say you are holding it.\n\n",
+    "When you want to buy a given coin, the buy will not go through until you specify "
+    "profit_pct and loss_pct in that same JSON object. profit_pct is the take-profit "
+    "percentage which will automatically carry out in the background, once the target "
+    "is reached, any number above 0. loss_pct is the stop-loss percentage, which also "
+    "carry out in the background once this stop loss target is reached, any number above "
+    "0 and below 100. You do not need to choose the buy size. The system will set it "
+    "for you already based on the market cap.\n\n",
+    '{"action":"buy","narrative":"what the coin is","reasoning":"why buy",'
+    '"profit_pct":"a suitable take-profit percentage, e.g. 50",'
+    '"loss_pct":"a suitable stop-loss percentage, e.g. 25"}\n',
+    '{"action":"reject","narrative":"what the coin is","reasoning":"why skip"}\n',
+    '{"action":"wait","narrative":"what the coin is","reasoning":"why look again later. not bought."}\n',
+)
+
+
+def prompt_for_phase(prompt: str, phase: str) -> str:
+    """full prompt while searching. after a buy, the buy / wait / reject bits go."""
+    if phase != "locked":
+        return prompt
+    return _locked_prompt(prompt)
+
+
+def _locked_prompt(prompt: str) -> str:
+    """same standing text, minus the actions that only exist before a buy."""
+    text = prompt
+    for block in _LOCKED_DROP:
+        if block not in text:
+            log.warning("locked prompt is missing a block, left the full text")
+            return prompt
+        text = text.replace(block, "")
+    text = text.replace(
+        "hold does not change them.",
+        "hold does not change them. You can also call tools. They are listed below.",
+        1,
+    )
+    text = text.replace(
+        "A tool does not buy, sell, wait, or reject.",
+        "A tool does not hold, sell, or change your levels.",
+    )
+    text = text.replace(
+        "Call it before you buy, and again if you have held a long time.",
+        "Call it again if you have held a long time.",
+    )
+    text = text.replace(
+        "(buy, reject, wait, hold, or a tool)",
+        "(hold, revise_tpsl, sell, or a tool)",
+    )
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip()
+
+
 def load_thesis_prompt() -> str:
     """close-out after a buy that actually filled. take-profit, stop-loss, or a sell."""
     return THESIS_PATH.read_text(encoding="utf-8").strip()
@@ -168,28 +225,37 @@ def _pool_pubkey(coin: dict[str, Any]) -> str | None:
 
 
 async def _arm_price_watch(deps: LoopDeps, mint: str, coin: dict[str, Any]) -> None:
-    """start the watcher once the agent is on this coin. already-on is a no-op."""
-    alerts = getattr(deps.tools, "alerts", None)
-    if alerts is None or not mint:
+    """open the vault socket once for this focus. peek and tp/sl read it."""
+    live = getattr(deps.tools, "live", None)
+    if live is None or not mint:
         return
+    held = getattr(deps.tools, "price_mint", None)
+    if held == mint:
+        return
+    if held:
+        await _stop_price_watch(deps, held)
     try:
-        await alerts.subscribe(
+        await live.acquire(
             mint,
+            pool=_pool_pubkey(coin),
             name=coin.get("name") or None,
             symbol=coin.get("symbol") or None,
-            pool=_pool_pubkey(coin),
         )
+        deps.tools.price_mint = mint
     except Exception as exc:  # noqa: BLE001
         log.info("price watch not armed %s %s", mint, exc)
 
 
 async def _stop_price_watch(deps: LoopDeps, mint: str) -> None:
-    """drop the watcher when we leave the coin."""
-    alerts = getattr(deps.tools, "alerts", None)
-    if alerts is None or not mint:
+    """drop our ref when we leave the coin. tp/sl keeps its own."""
+    live = getattr(deps.tools, "live", None)
+    if live is None or not mint:
         return
+    if getattr(deps.tools, "price_mint", None) != mint:
+        return
+    deps.tools.price_mint = None
     try:
-        await alerts.unsubscribe(mint)
+        await live.release(mint)
     except Exception as exc:  # noqa: BLE001
         log.info("price watch stop failed %s %s", mint, exc)
 
@@ -473,31 +539,6 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     coin = state.get("coin") or {}
     await _arm_price_watch(deps, mint, coin if isinstance(coin, dict) else {})
 
-    drained = deps.tools.drain_for_step()
-    for alert in (drained or {}).get("alerts") or []:
-        if not isinstance(alert, dict):
-            continue
-        if str(alert.get("mint") or mint) != mint:
-            continue
-        # keep it small. the note is only on the first fast move for this coin.
-        payload = {
-            "direction": alert.get("direction"),
-            "change_pct": alert.get("change_pct"),
-            "elapsed_sec": alert.get("elapsed_sec"),
-            "from_mcap_usd": alert.get("from_fdv_usd"),
-            "to_mcap_usd": alert.get("to_fdv_usd"),
-            "note": alert.get("note") or "",
-        }
-        deps.memory.append_event(mint, "alert", payload)
-        _emit(
-            deps,
-            "price_alert",
-            mint=mint,
-            name=(state.get("coin") or {}).get("name") or "",
-            symbol=(state.get("coin") or {}).get("symbol") or "",
-            text=alert_line(payload),
-        )
-
     looks_done = int(state.get("steps") or 0)
     if phase != "locked" and looks_done >= _MAX_SEARCH_LOOKS:
         return _queue_reject(
@@ -545,11 +586,10 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             deps.memory.set_opening(mint, opening)
         onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
     messages, seen = _messages(
-        deps.prompt,
+        prompt_for_phase(deps.prompt, phase),
         state,
         peek,
         window,
-        drained,
         buy_sol=required,
         since=since,
         opening=opening,
@@ -812,9 +852,6 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
                 "last_action": "buy",
                 "route": "stop",
             }
-        sub = await deps.tools.call("subscribe_move_alerts", mint=mint)
-        if not sub.get("ok"):
-            log.warning("buy ok but alerts not armed: %s", sub.get("error"))
         deps.tools.set_focus("locked", mint)
         rid = ((result.get("fill") or {}).get("position") or {}).get("round_id")
         log.info(
@@ -1167,7 +1204,7 @@ async def _refresh_metrics(
 
 
 def _event_line(ev: Any) -> str:
-    """alerts print the sentence. everything else stays a short json blob."""
+    """tool blocks print in full. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
     if kind == "safety" and isinstance(payload, dict):
@@ -1182,8 +1219,6 @@ def _event_line(ev: Any) -> str:
         if not text:
             return head
         return head + "\n" + text
-    if kind == "alert" and isinstance(payload, dict):
-        return f"- alert {alert_line(payload)}"
     blob = _compact(payload) if isinstance(payload, dict) else payload
     return f"- {kind} {json.dumps(blob, default=str)[:300]}"
 
@@ -1316,7 +1351,6 @@ def _delta(
         lines.append("- (none)")
     for ev in events:
         lines.append(_event_line(ev))
-    # alerts were just written into those events. dont print them again.
     seen = {
         "told_phase": phase,
         "told_flat": True if (peek_ok and not holding) or state.get("told_flat") else False,
@@ -1332,7 +1366,6 @@ def _messages(
     state: LoopState,
     peek: Any,
     window: Any,
-    _drained: Any,
     buy_sol: float | None = None,
     since: dict[str, Any] | None = None,
     opening: str | None = None,
@@ -1436,8 +1469,7 @@ def _handoff_block(mcap: Any) -> str | None:
 
 async def _live_tick(deps: LoopDeps, mint: str) -> Any:
     """latest vault tick. this is the price a buy fills at, not the old peek."""
-    alerts = getattr(deps.tools, "alerts", None)
-    live = getattr(alerts, "live", None) if alerts is not None else None
+    live = getattr(deps.tools, "live", None)
     if live is None or not mint:
         return None
     tick = live.latest(mint)

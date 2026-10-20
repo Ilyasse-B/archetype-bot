@@ -6,7 +6,6 @@ calls buy / reject / sell / set_tpsl itself.
 
 if a focus mint is set, a call on any other mint is refused.
 peek_backlog is the exception — other-coin context, no second trade.
-drain_for_step() runs before each think, so alerts are not stuck.
 """
 
 from __future__ import annotations
@@ -20,8 +19,8 @@ from archetype.execution.fills import mark_all_positions
 from archetype.execution.tpsl import TpslEngine
 from archetype.execution.wallet import get_balance, get_position
 from archetype.filters.helius import HeliusRpc
+from archetype.price.live import LivePrices
 from archetype.price.models import PriceTick
-from archetype.tools.alerts import MoveAlertEngine
 from archetype.tools.backlog_tools import next_candidate, peek_backlog
 from archetype.tools.peek import peek_from_tick, peek_price
 from archetype.tools.trade_tools import agent_buy, agent_reject, agent_sell
@@ -44,14 +43,17 @@ class AgentToolkit:
         rpc: HeliusRpc,
         ledger_path: Path,
         tpsl: TpslEngine | None = None,
-        alerts: MoveAlertEngine | None = None,
+        live: LivePrices | None = None,
         mode: AgentMode = "free",
         focus_mint: str | None = None,
     ) -> None:
         self.rpc = rpc
         self.ledger_path = ledger_path
         self.tpsl = tpsl
-        self.alerts = alerts
+        # shared vault socket. peek reads the latest tick off this.
+        self.live = live
+        # mint we currently hold a ref for. one ref for the whole focus.
+        self.price_mint: str | None = None
         self.mode: AgentMode = mode
         self.focus_mint = (focus_mint or "").strip() or None
         self._handlers = self._build_handlers()
@@ -74,21 +76,6 @@ class AgentToolkit:
         if not isinstance(result, dict):
             return {"ok": True, "result": result}
         return result
-
-    def drain_for_step(self, *, limit: int = 20) -> dict[str, Any]:
-        """
-        pop pending move alerts before the model runs.
-
-        same queue as the drain_move_alerts tool.
-        """
-        if self.alerts is None:
-            return {"ok": True, "count": 0, "alerts": []}
-        alerts = self.alerts.drain(limit=limit)
-        return {
-            "ok": True,
-            "count": len(alerts),
-            "alerts": [a.model_dump() for a in alerts],
-        }
 
     def _need(self, when: str) -> dict[str, Any] | None:
         if when == "always" or when == self.mode:
@@ -120,12 +107,8 @@ class AgentToolkit:
             if err or use is None:
                 return err or _deny("mint required")
             # focused coin already has a vault socket. read that, dont poll.
-            live = kit.alerts.live if kit.alerts is not None else None
-            if (
-                live is not None
-                and kit.alerts is not None
-                and use in kit.alerts._subs
-            ):
+            live = kit.live
+            if live is not None and live.watching(use):
                 tick = await live.wait_latest(use)
                 if tick is None:
                     return {"ok": False, "error": "live price not ready"}
@@ -137,37 +120,6 @@ class AgentToolkit:
                 peek_price, kit.rpc, kit.ledger_path, use
             )
             return {"ok": True, **result.model_dump()}
-
-        async def subscribe_move_alerts(
-            mint: str = "", threshold_pct: float | None = None
-        ) -> dict[str, Any]:
-            # watching starts when the coin is focused, before a buy
-            denied = kit._need("always")
-            if denied:
-                return denied
-            if kit.alerts is None:
-                return _deny("move-alert engine not ready")
-            use, err = kit._resolve_mint(mint)
-            if err or use is None:
-                return err or _deny("mint required")
-            return await kit.alerts.subscribe(use, threshold_pct=threshold_pct)
-
-        async def unsubscribe_move_alerts(mint: str = "") -> dict[str, Any]:
-            denied = kit._need("always")
-            if denied:
-                return denied
-            if kit.alerts is None:
-                return _deny("move-alert engine not ready")
-            use, err = kit._resolve_mint(mint)
-            if err or use is None:
-                return err or _deny("mint required")
-            return await kit.alerts.unsubscribe(use)
-
-        async def drain_move_alerts() -> dict[str, Any]:
-            denied = kit._need("always")
-            if denied:
-                return denied
-            return kit.drain_for_step()
 
         async def peek_backlog_tool(limit: int = 10) -> dict[str, Any]:
             # other coins are context only — no mint lock here
@@ -295,8 +247,6 @@ class AgentToolkit:
             if fill.position is None:
                 if kit.tpsl is not None:
                     await kit.tpsl.on_position_closed(use)
-                if kit.alerts is not None:
-                    await kit.alerts.unsubscribe(use)
             return {"ok": True, "fill": _fill_dict(fill)}
 
         async def set_tpsl(
@@ -342,9 +292,6 @@ class AgentToolkit:
 
         return {
             "peek_price": peek_price_tool,
-            "subscribe_move_alerts": subscribe_move_alerts,
-            "unsubscribe_move_alerts": unsubscribe_move_alerts,
-            "drain_move_alerts": drain_move_alerts,
             "peek_backlog": peek_backlog_tool,
             "next_candidate": next_candidate_tool,
             "get_wallet": get_wallet,

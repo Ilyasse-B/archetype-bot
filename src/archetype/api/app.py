@@ -37,7 +37,6 @@ from archetype.execution import ensure_wallet
 from archetype.execution.tpsl import TpslEngine
 from archetype.price.live import LivePrices
 from archetype.llm.runner import AgentLoop
-from archetype.tools.alerts import MoveAlertEngine
 
 log = logging.getLogger("archetype.app")
 
@@ -131,36 +130,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # ensure paper wallet tables exist
         await asyncio.to_thread(ensure_wallet, ledger)
         # one vault socket per coin. peek and tp/sl read it, they dont open another.
-        live = LivePrices(rpc=rpc, ledger_path=ledger)
-        tpsl = TpslEngine(rpc=rpc, ledger_path=ledger, live=live)
-        alerts = MoveAlertEngine(
-            rpc=rpc,
-            ledger_path=ledger,
-            live=live,
-            default_threshold_pct=settings.price_fast_move_pct,
-            default_window_sec=settings.price_fast_window_sec,
-            default_min_pct=settings.price_fast_min_pct,
-            default_rules=[
-                (settings.price_fast_quick_pct, settings.price_fast_quick_sec),
-                (settings.price_fast_move_pct, settings.price_fast_window_sec),
-            ],
-        )
-        agent_loop = AgentLoop(settings, rpc, tpsl=tpsl, alerts=alerts)
+        live_prices = LivePrices(rpc=rpc, ledger_path=ledger)
+        tpsl = TpslEngine(rpc=rpc, ledger_path=ledger, live=live_prices)
+        agent_loop = AgentLoop(settings, rpc, tpsl=tpsl, live=live_prices)
         agent_loop.feed.on_push = lambda item: hub.publish(
             {"stream": "agent", "event": item}
         )
         app.state.tpsl_engine = tpsl
-        app.state.move_alert_engine = alerts
+        app.state.live_prices = live_prices
         app.state.agent_loop = agent_loop
         await tpsl.start()
-        await alerts.start()
         await feed.start()
         if settings.agent_loop_enabled:
             await agent_loop.start()
         yield
         await agent_loop.stop()
         await feed.stop()
-        await alerts.stop()
         await tpsl.stop()
         rpc.close()
 

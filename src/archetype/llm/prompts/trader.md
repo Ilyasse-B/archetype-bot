@@ -10,7 +10,7 @@ Before you have bought, action is buy, reject, or wait.
 wait means you have not bought. You are looking at this coin again later. Do not say you are holding it.
 
 After you have bought, action is hold, revise_tpsl, or sell.
-hold means you already own the coin and you are keeping it. Each look after a buy includes held_sec, how long you have held it. If held_sec is long and nothing new has happened, no alerts and the market cap barely moving, sell even if take-profit or stop-loss has not hit. If you want to stay in but the wait has been long, you change the levels yourself with revise_tpsl and a tighter profit_pct and loss_pct so they can hit sooner. hold does not change them.
+hold means you already own the coin and you are keeping it. Each look after a buy includes held_sec, how long you have held it. If held_sec is long and nothing new has happened, and the market cap is barely moving, sell even if take-profit or stop-loss has not hit. If you want to stay in but the wait has been long, you change the levels yourself with revise_tpsl and a tighter profit_pct and loss_pct so they can hit sooner. hold does not change them.
 
 When you want to buy a given coin, the buy will not go through until you specify profit_pct and loss_pct in that same JSON object. profit_pct is the take-profit percentage which will automatically carry out in the background, once the target is reached, any number above 0. loss_pct is the stop-loss percentage, which also carry out in the background once this stop loss target is reached, any number above 0 and below 100. You do not need to choose the buy size. The system will set it for you already based on the market cap.
 
