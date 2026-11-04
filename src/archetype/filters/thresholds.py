@@ -49,14 +49,11 @@ class FilterThresholds:
     """numeric gates for a single-pass migrate filter."""
 
     min_market_cap_usd: float = 10_000.0
-    # hard floor — estimate must clear this or we reject
+    # hard floor — birdeye global_fees_paid must clear this or we reject
     min_global_fees_sol: float = 2.0
     # cleared the hard floor but still under this → PASS + fees_check_needed
     fees_warn_below_sol: float = 2.25
     min_pool_sol: float = 0.5  # sanity floor on quote vault at migrate
-    # creator fee share of total fees (rough) — used to estimate global fees
-    # from unclaimed creator vault. axiom "fees" is indexed; this is best-effort.
-    creator_fee_share: float = 0.25
     pool_poll_sec: float = 6.0
     pool_poll_interval_sec: float = 0.9
 

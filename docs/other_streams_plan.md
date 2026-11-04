@@ -102,7 +102,7 @@ Paper wallet stays SOL- and/or USD-denominated for every venue. Non-SOL quote fi
 | 3 | LaunchLab platforms | **Accept all** when Wave B ships (StonkFun, letsbonk, Hot.fun, …) |
 | 4 | Paper PnL / wallet | **SOL and/or USD only.** Non-SOL quotes convert to SOL (via USD if needed). Exact conversion path researched during Wave A pump custom-quote work |
 | 5 | Buy size | **Same mcap → SOL bands** (3 / 5 / 10). Non-SOL quote coins “move” the same as SOL-quoted ones |
-| 6 | Pump global-fees ≥ 2 SOL floor | **Keep as-is** for now. Review live against your trading terminal; fix if real coins are filtered out |
+| 6 | Pump global-fees ≥ 2 SOL floor | **Birdeye** `global_fees_paid` (vault estimate removed). Still ≥ 2 SOL hard floor |
 | 7 | OTC desks | **Yes, when we reach Wave C.** On OTC coins, resolve and show the stock / basket list to the agent on the first prompt |
 | 8 | Agent treatment | **All coins are coins.** Same base card; venue / OTC / non-SOL quote only change which extra fields are attached |
 
@@ -173,7 +173,7 @@ Pass non-WSOL quotes through filters, or trade them.
 2. Generalise pool liquidity floor:
    - WSOL: keep current pool SOL floor
    - other quotes: quote vault amount → USD (helper), apply a USD floor equivalent to today’s SOL floor
-3. Keep global-fees / creator-vault ≥ 2 SOL estimate as-is (decision #6); log reject reason clearly so live review is easy
+3. Global-fees gate uses Birdeye `global_fees_paid` ≥ 2 SOL (decision #6); log reject reason clearly so live review is easy
 4. LP / pool-owner checks stay Pump AMM for `venue=pump`
 
 #### Done when

@@ -29,7 +29,7 @@ uv sync
 cp .env.example .env
 ```
 
-Fill `ARCHETYPE_HELIUS_API_KEY` and `ARCHETYPE_SOLANA_TRACKER_API_KEY` in `.env`.
+Fill `ARCHETYPE_HELIUS_API_KEY`, `ARCHETYPE_SOLANA_TRACKER_API_KEY`, and `ARCHETYPE_BIRDEYE_API_KEY` in `.env`.
 
 ## Run
 

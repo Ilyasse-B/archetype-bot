@@ -76,15 +76,6 @@ def bonding_curve_pda(mint: str) -> str:
     return str(curve)
 
 
-def creator_vault_pda(creator: str) -> str:
-    """derive creator fee vault PDA."""
-    vault, _ = Pubkey.find_program_address(
-        [b"creator-vault", bytes(Pubkey.from_string(creator))],
-        Pubkey.from_string(PUMP_PROGRAM),
-    )
-    return str(vault)
-
-
 def canonical_pool_pda(mint: str, pool_creator: str, index: int = 0) -> str:
     """derive canonical pumpswap pool PDA (index usually 0)."""
     pool, _ = Pubkey.find_program_address(

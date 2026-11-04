@@ -67,7 +67,7 @@ The product goal is an agent that **simulates a real human memecoin trader**: ov
 | 5 | **IPC** | **FastAPI on localhost** (`127.0.0.1`). |
 | 6 | **X / social (v1)** | Only tweets/accounts linked in coin metadata. Broader X later. |
 | 7 | **Tools** | One tool phase (Phase 5). The short catalogue lives in `trader.md` (name, a rank from 0 to 1, one line, when to call). No separate tools file. Callable so far: `metrics` 0.5, `safety` 0.8, `dex` 0.25. Field notes sit beside the numbers on the first result only. Full list and call rules: `docs/all-tools.md`. Call-control (cooldown, don’t repeat a tool) is later. |
-| 8 | **Data sources (hybrid)** | **PumpPortal** = migrations (incl. non-SOL quote pump pairs after Wave A mint repair). **Helius** = live price, filter RPC, fee-split / tokenized-agent PDAs. Metadata URI / DAS = socials and description. First-think **coin snapshot** = Jupiter (volume/liquidity/created) + Solana Tracker (ATH, cashback/holder-reward flags) + Donate.gg (charity) — **no pump.fun frontend HTTP**. Live **metrics** = Jupiter + Solana Tracker. Safety = Rugcheck + Streamflow + Solana Tracker. `dex` = Dexscreener. A failed line says `unavailable`. |
+| 8 | **Data sources (hybrid)** | **PumpPortal** = migrations (incl. non-SOL quote pump pairs after Wave A mint repair). **Helius** = live price, filter RPC, fee-split / tokenized-agent PDAs. **Birdeye** = deterministic filter **global fees** (`token_overview.global_fees_paid`). Metadata URI / DAS = socials and description. First-think **coin snapshot** = Jupiter (volume/liquidity/created) + Solana Tracker (ATH, cashback/holder-reward flags) + Donate.gg (charity) — **no pump.fun frontend HTTP**. Live **metrics** = Jupiter + Solana Tracker. Safety = Rugcheck + Streamflow + Solana Tracker. `dex` = Dexscreener. A failed line says `unavailable`. |
 | 9 | **Pre-agent enrich + socials gate** | Always fetch metadata before the agent. **No socials at all → reject.** **Any one** of twitter / telegram / website is enough to pass. |
 | 10 | **Migration backlog** | While busy, queue passed migrations locally (timestamp + coin info). When free, **FIFO from the top**. Same backlog is a **tool** the locked agent can peek for other-coin context (still one trade only). Human trade stream already consumes FIFO via SQLite. |
 | 11 | **Risk (paper)** | Buy size is program-owned from migration mcap: **&lt; $50k → 3 SOL**, **&lt; $125k → 5 SOL**, **≥ $125k → 10 SOL** (missing mcap uses 3). Exact $50k is the 5 SOL band; exact $125k is 10. The model does not pick size. No paper kill-switch. |
@@ -277,7 +277,7 @@ PumpPortal only gives `{signature, mint, txType, pool:"pump-amm"}`. Filters use 
 **Progress so far (as of Phase 2b close-out):**
 
 - Wired a deterministic filter pipeline into the migration feed (`src/archetype/filters/`).
-- Gates include mint/freeze authority, decimals/supply, Token-2022 allow/deny, WSOL quote, Pump AMM pool from migrate tx, LP burn heuristic, pool SOL floor, **mcap ≥ $10k**, **global fees hard floor ≥ 2 SOL** (best-effort vault estimate; **2–2.25 SOL still passes with `fees_check_needed`** for agent / `--trade`), mint/deployer blacklist tables (empty for now).
+- Gates include mint/freeze authority, decimals/supply, Token-2022 allow/deny, WSOL quote, Pump AMM pool from migrate tx, LP burn heuristic, pool SOL floor, **mcap ≥ $10k**, **global fees hard floor ≥ 2 SOL** via **Birdeye** `global_fees_paid` (**2–2.25 SOL still passes with `fees_check_needed`** for agent / `--trade`), mint/deployer blacklist tables (empty for now).
 - CLI A/B: `archetype migrations` (raw) vs `--filtered` (PASS only).
 - Live feed checked: low-mcap / low-fee / junk Token-2022 rejects look correct.
 - Fixed a false reject race (`gB4NTGkQ…`): PumpPortal can fire before Helius shows pool / curve state — **do not gate on `bonding_curve.complete`**; successful migrate tx is graduation proof. Retries added for mint account, migrate tx, and pool account visibility.
@@ -287,7 +287,7 @@ PumpPortal only gives `{signature, mint, txType, pool:"pump-amm"}`. Filters use 
 
 - Retries on `getTransaction` + mint/pool account reads (~a few seconds).
 - `curve.complete` is **informational only** (kept in metrics); not a reject reason.
-- Global fees ≈ creator-vault SOL / assumed creator fee share — not identical to Axiom’s indexed “Fees” (Pump frontend API is blocked). **Hard reject under 2 SOL.** First vault read **&lt; 1 SOL** rejects immediately (no extra polls). First read in **[1, 2) SOL** keeps polling ~6s (take max, stop early at 2). First read **≥ 2 SOL** passes immediately. **2–2.25 SOL** still passes with `fees_check_needed` (yellow **CHECK** in `--trade`).
+- **Global fees** = Birdeye `GET /defi/token_overview` → `global_fees_paid` (SOL). Same indexed “Fees” style as trading terminals — **not** a creator-vault estimate (that path was removed). Key: `ARCHETYPE_BIRDEYE_API_KEY`. No Solana Tracker fallback on this gate (keeps Tracker quota for agent tools). Missing key / HTTP failure → reject. **Hard reject under 2 SOL.** **2–2.25 SOL** still passes with `fees_check_needed` (yellow **CHECK** in `--trade`). Free Birdeye is ~1 rps; the client retries briefly on 429.
 - Pool account + vault ATAs **polled ~7s / ~4s**; if still missing, soft-continue on migrate-tx snapshot.
 
 **Gates (fail = reject):**
@@ -298,13 +298,13 @@ PumpPortal only gives `{signature, mint, txType, pool:"pump-amm"}`. Filters use 
 | Decimals | Must be 6 |
 | Supply (UI) | 100M – 10B |
 | Token-2022 extensions | Allow metadata*; reject transfer-fee / hook / permanent-delegate / non-transferable / pausable / etc. |
-| Bonding curve | Used for deployer + fee estimate only — **not** gated on `complete` |
+| Bonding curve | Used for deployer only — **not** gated on `complete` |
 | Quote mint | Pool quote must be WSOL |
 | Pool | Resolved from migrate tx; poll account ~7s; if still missing → continue on tx snapshot (`pool_account_pending`); vault ATAs get a short poll too |
 | LP burn heuristic | Largest LP accounts look burned/empty (skipped if pool never appears) |
 | Pool SOL at migrate | ≥ 0.5 SOL (sanity) |
 | Market cap (USD) | ≥ **$10,000** from migrate-tx reserves × supply × SOL/USD |
-| Global fees (SOL) | **Hard reject &lt; 2 SOL.** Extra ~6s poll only if the first read is already **≥ 1 SOL** and still under 2; otherwise one read then pass or reject. **2–2.25 → PASS + `fees_check_needed`** |
+| Global fees (SOL) | Birdeye `global_fees_paid`. **Hard reject &lt; 2 SOL.** Fetch fail → reject. **2–2.25 → PASS + `fees_check_needed`** |
 | Blacklist | Mint + deployer tables (empty for now; rows can be added later) |
 
 **CLI A/B:**
@@ -378,7 +378,7 @@ Persisted FIFO queue in `trading_ledger.db` → table `migration_backlog` (`src/
 - `GET /backlog` · `POST /backlog/pop`
 - `/status` includes `backlog_pending`
 
-**coin_info snapshot includes:** name/symbol, signature, mcap/fees/pool SOL, `fees_check_needed` (when the estimate cleared 2 SOL but is still &lt; 2.25), socials links, deployer, short description.
+**coin_info snapshot includes:** name/symbol, signature, mcap/fees/pool SOL, `fees_check_needed` (when Birdeye `global_fees_paid` cleared 2 SOL but is still &lt; 2.25), socials links, deployer, short description.
 
 ### Phase 3 step 1 — live price watch (implemented)
 

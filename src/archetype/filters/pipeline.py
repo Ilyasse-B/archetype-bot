@@ -18,9 +18,9 @@ from archetype.filters.blacklist import (
     is_mint_blacklisted,
     log_filter_reject,
 )
+from archetype.filters.birdeye import fetch_global_fees_paid
 from archetype.filters.decode import (
     bonding_curve_pda,
-    creator_vault_pda,
     extract_pool_from_migrate_tx,
     parse_bonding_curve,
     parse_mint_json_parsed,
@@ -73,7 +73,7 @@ def run_onchain_filters(
     """
     evaluate one migration (on-chain only).
 
-    order: cheap blacklist → mint → (fast-fail) → tx/pool → curve/fees → mcap.
+    order: cheap blacklist → mint → (fast-fail) → tx/pool → curve/deployer → birdeye fees → mcap.
     hard mint fails / obvious junk bail before expensive polls.
     set finalize=False if a caller (e.g. socials gate) will log the final outcome.
     """
@@ -311,7 +311,7 @@ def run_onchain_filters(
                     result.metrics["live_pool_sol"] = 0.0
                     result.metrics["live_pool_sol_error"] = str(exc)
 
-    # --- bonding curve (deployer + fees only) ---
+    # --- bonding curve (deployer only) ---
     # NOTE: we do NOT gate on curve.complete anymore.
     curve_addr = bonding_curve_pda(mint)
     curve = None
@@ -333,38 +333,33 @@ def run_onchain_filters(
         if bad:
             result.fail(f"deployer blacklisted: {why or 'no reason'}")
             return _done(result, ledger_path, finalize=finalize)
-
-        vault_addr = creator_vault_pda(curve.creator)
-        share = max(thresholds.creator_fee_share, 0.05)
-        # one vault read. enough for the migrate gate.
-        vault_sol, estimated_fees_sol = _read_creator_fees(
-            rpc, vault_addr, share=share
-        )
-        result.metrics["creator_vault_sol"] = vault_sol
-        result.metrics["estimated_global_fees_sol"] = estimated_fees_sol
-        result.metrics["fees_method"] = (
-            "creator_vault / creator_fee_share (one read, best-effort)"
-        )
-        # cleared 2 SOL but still under the warn bar → yellow CHECK in --trade
-        fees_check = estimated_fees_sol < thresholds.fees_warn_below_sol
-        result.metrics["fees_check_needed"] = fees_check
-        result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
-
-        if estimated_fees_sol < thresholds.min_global_fees_sol:
-            result.fail(
-                f"global fees too low: ~{estimated_fees_sol:.4f} SOL "
-                f"(min {thresholds.min_global_fees_sol})"
-            )
     elif migrate_ok:
-        result.metrics["fees_method"] = "skipped (no bonding curve)"
-        result.fail("could not read bonding curve for fees/deployer checks")
+        result.fail("could not read bonding curve for deployer checks")
+        return _done(result, ledger_path, finalize=finalize)
     else:
         return _reject(
             result, ledger_path, "bonding curve account missing", finalize=finalize
         )
 
-    # fees already failed → skip coingecko/mcap
-    if not result.passed:
+    # --- global fees (birdeye indexed — replaces old vault estimate) ---
+    try:
+        fees_sol = fetch_global_fees_paid(mint)
+    except Exception as exc:  # noqa: BLE001
+        result.fail(f"global fees unavailable: {exc}")
+        return _done(result, ledger_path, finalize=finalize)
+
+    result.metrics["estimated_global_fees_sol"] = fees_sol
+    result.metrics["fees_method"] = "birdeye token_overview global_fees_paid"
+    # cleared 2 SOL but still under the warn bar → yellow CHECK in --trade
+    fees_check = fees_sol < thresholds.fees_warn_below_sol
+    result.metrics["fees_check_needed"] = fees_check
+    result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
+
+    if fees_sol < thresholds.min_global_fees_sol:
+        result.fail(
+            f"global fees too low: {fees_sol:.4f} SOL "
+            f"(min {thresholds.min_global_fees_sol})"
+        )
         return _done(result, ledger_path, finalize=finalize)
 
     # --- market cap (prefer migrate snapshot so we filter at graduation) ---
@@ -412,16 +407,6 @@ def _wait_account(
             time.sleep(wait)
             wait = min(wait * 1.4, 2.0)
     return last
-
-
-def _read_creator_fees(
-    rpc: HeliusRpc, vault_addr: str, *, share: float
-) -> tuple[float, float]:
-    """one vault read → (vault SOL, estimated global fees)."""
-    vault_acct = rpc.get_account_info(vault_addr, encoding="base64")
-    vault_sol = (vault_acct.get("lamports") or 0) / 1e9 if vault_acct else 0.0
-    fees = vault_sol / share if vault_sol > 0 and share > 0 else 0.0
-    return vault_sol, fees
 
 
 def _poll_token_balances(
