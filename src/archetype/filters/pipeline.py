@@ -42,6 +42,7 @@ from archetype.filters.thresholds import (
     WSOL_MINT,
 )
 from archetype.ingest.models import MigrationEvent
+from archetype.price.convert import quote_meta, quote_ui_to_sol, quote_ui_to_usd, vault_quote_ui
 
 log = logging.getLogger("archetype.filters")
 
@@ -140,8 +141,15 @@ def run_onchain_filters(
         return _done(result, ledger_path, finalize=finalize)
 
     # --- migrate tx first (this is the graduation proof) ---
+    quote_mint = event.quote_mint or WSOL_MINT
+    result.metrics["quote_mint"] = quote_mint
+    result.metrics["venue"] = event.venue
+    if event.platform:
+        result.metrics["platform"] = event.platform
+
     pool_addr: str | None = None
-    quote_sol = 0.0
+    quote_ui = 0.0
+    quote_sol = 0.0  # SOL-equivalent of quote vault (for floors + mcap)
     base_ui = 0.0
     migrate_ok = False
     if event.signature:
@@ -154,15 +162,46 @@ def run_onchain_filters(
                 result.fail(f"migrate tx failed: {err}")
             else:
                 migrate_ok = True
-                pool_addr, quote_sol, base_ui = extract_pool_from_migrate_tx(tx, mint)
+                pool_addr, quote_ui, base_ui = extract_pool_from_migrate_tx(
+                    tx, mint, quote_mint=quote_mint
+                )
                 result.metrics["migrate_slot"] = tx.get("slot")
-                result.metrics["pool_sol_at_migrate"] = quote_sol
+                result.metrics["pool_quote_ui_at_migrate"] = quote_ui
                 result.metrics["pool_base_ui_at_migrate"] = base_ui
+                try:
+                    quote_sol = quote_ui_to_sol(rpc, quote_mint, quote_ui)
+                    result.metrics["pool_sol_at_migrate"] = quote_sol
+                    result.metrics["pool_quote_usd_at_migrate"] = quote_ui_to_usd(
+                        rpc, quote_mint, quote_ui
+                    )
+                    if quote_mint != WSOL_MINT:
+                        qm = quote_meta(rpc, quote_mint)
+                        result.metrics["quote_symbol"] = qm.symbol
+                        result.metrics["quote_name"] = qm.name
+                except Exception as exc:  # noqa: BLE001
+                    result.fail(f"quote→SOL convert failed: {exc}")
     else:
         result.fail("missing migrate signature")
 
-    if quote_sol < thresholds.min_pool_sol:
-        result.fail(f"pool SOL at migrate too low: {quote_sol:.4f} (min {thresholds.min_pool_sol})")
+    # liquidity floor: WSOL uses SOL units; other quotes use USD ≡ min_pool_sol * sol_usd
+    if result.passed and quote_mint == WSOL_MINT:
+        if quote_sol < thresholds.min_pool_sol:
+            result.fail(
+                f"pool SOL at migrate too low: {quote_sol:.4f} "
+                f"(min {thresholds.min_pool_sol})"
+            )
+    elif result.passed:
+        try:
+            sol_usd = get_sol_usd(rpc)
+            min_usd = thresholds.min_pool_sol * sol_usd
+            quote_usd = float(result.metrics.get("pool_quote_usd_at_migrate") or 0)
+            if quote_usd < min_usd:
+                result.fail(
+                    f"pool quote liquidity too low: ${quote_usd:,.2f} "
+                    f"(min ${min_usd:,.2f} ≈ {thresholds.min_pool_sol} SOL)"
+                )
+        except Exception as exc:  # noqa: BLE001
+            result.fail(f"liquidity floor check failed: {exc}")
 
     if not pool_addr:
         result.fail("could not resolve pumpswap pool from migrate tx")
@@ -213,8 +252,13 @@ def run_onchain_filters(
 
             if pool.base_mint != mint:
                 result.fail("pool base_mint mismatch")
-            if pool.quote_mint != WSOL_MINT:
-                result.fail(f"quote mint not WSOL: {pool.quote_mint}")
+            # any quote is fine for pump — just must match what repair found
+            if pool.quote_mint != quote_mint:
+                result.fail(
+                    f"pool quote_mint mismatch: pool={pool.quote_mint} "
+                    f"event={quote_mint}"
+                )
+            result.metrics["pool_quote_mint"] = pool.quote_mint
             if not result.passed:
                 return _done(result, ledger_path, finalize=finalize)
 
@@ -256,9 +300,16 @@ def run_onchain_filters(
                 )
             else:
                 live_base = float((base_bal or {}).get("uiAmount") or 0)
-                live_quote = int((quote_bal or {}).get("amount") or 0) / 1e9
+                live_quote_ui = vault_quote_ui(quote_bal)
                 result.metrics["live_pool_base_ui"] = live_base
-                result.metrics["live_pool_sol"] = live_quote
+                result.metrics["live_pool_quote_ui"] = live_quote_ui
+                try:
+                    result.metrics["live_pool_sol"] = quote_ui_to_sol(
+                        rpc, pool.quote_mint, live_quote_ui
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    result.metrics["live_pool_sol"] = 0.0
+                    result.metrics["live_pool_sol_error"] = str(exc)
 
     # --- bonding curve (deployer + fees only) ---
     # NOTE: we do NOT gate on curve.complete anymore.

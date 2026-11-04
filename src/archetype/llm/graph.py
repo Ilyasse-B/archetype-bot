@@ -587,8 +587,9 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         if mint:
             deps.memory.set_opening(mint, opening)
         onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
+    base_prompt = prompt_for_phase(deps.prompt, phase)
     messages, seen = _messages(
-        prompt_for_phase(deps.prompt, phase),
+        _prompt_with_pairing(base_prompt, coin if isinstance(coin, dict) else None),
         state,
         peek,
         window,
@@ -1277,6 +1278,40 @@ def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
         return "coin snapshot: unavailable"
 
 
+_WSOL = "So11111111111111111111111111111111111111112"
+
+# only appended when the focused coin is non-SOL quoted (saves tokens otherwise)
+_PAIRING_NOTE = (
+    "pairing names the other token in this coin's pool (full name and ticker). "
+    "Use it as context for the narrative: a thematically related pairing can "
+    "support the story, an unrelated one can weaken it. It is a signal, not a rule."
+)
+
+
+def _is_paired_coin(coin: dict[str, Any] | None) -> bool:
+    """true when quote is set and not WSOL."""
+    if not isinstance(coin, dict):
+        return False
+    quote = coin.get("quote_mint")
+    return bool(quote) and quote != _WSOL
+
+
+def _pairing_label(coin: dict[str, Any]) -> str:
+    """'Dogecoin (DOGE)' — name first, ticker in parens when we have both."""
+    name = (coin.get("quote_name") or "").strip() or None
+    symbol = (coin.get("quote_symbol") or "").strip() or None
+    if name and symbol:
+        return f"{name} ({symbol})"
+    return name or symbol or "unknown"
+
+
+def _prompt_with_pairing(prompt: str, coin: dict[str, Any] | None) -> str:
+    """add the pairing blurb only for non-SOL quoted coins."""
+    if not _is_paired_coin(coin):
+        return prompt
+    return f"{prompt.rstrip()}\n\n{_PAIRING_NOTE}"
+
+
 def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") -> str:
     """fields that do not move. saved on the first think and replayed after that."""
     coin = state.get("coin") or {}
@@ -1286,6 +1321,15 @@ def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") ->
         f"symbol: {coin.get('symbol') or ''}",
         f"socials: {coin.get('socials_present') or []}",
     ]
+    # venue / pair extras — same card shape, just more fields when they matter
+    venue = coin.get("venue")
+    if venue and venue != "pump":
+        lines.append(f"venue: {venue}")
+    platform = coin.get("platform")
+    if platform:
+        lines.append(f"platform: {platform}")
+    if _is_paired_coin(coin):
+        lines.append(f"pairing: {_pairing_label(coin)}")
     desc = str(coin.get("description") or "")[:400]
     if desc:
         lines.append(f"description: {desc}")

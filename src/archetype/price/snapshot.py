@@ -9,6 +9,8 @@ from pathlib import Path
 
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
+from archetype.filters.thresholds import WSOL_MINT
+from archetype.price.convert import quote_meta, quote_ui_to_sol, vault_quote_ui
 from archetype.price.models import PriceTick, build_tick
 from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
 
@@ -32,6 +34,9 @@ def fetch_price_tick(
 
     market_cap_* uses on-chain mint supply.
     fdv_* uses 1B (axiom-style pump display).
+
+    for non-WSOL quotes, quote vault is converted to SOL-equivalent so
+    price_sol / wallet math stay SOL-denominated.
     """
     pool_res = resolved or resolve_pumpswap_pool(
         rpc,
@@ -52,8 +57,17 @@ def fetch_price_tick(
         raise RuntimeError("pool vault balances not available yet")
 
     base_ui = float(base_bal.get("uiAmount") or 0)
-    quote_sol = int(quote_bal.get("amount") or 0) / 1e9
+    quote_ui = vault_quote_ui(quote_bal)
+    quote_mint = pool.quote_mint or WSOL_MINT
+    quote_sol = quote_ui_to_sol(rpc, quote_mint, quote_ui)
     usd = float(sol_usd) if sol_usd is not None else float(get_sol_usd(rpc))
+
+    quote_symbol: str | None = None
+    if quote_mint != WSOL_MINT:
+        try:
+            quote_symbol = quote_meta(rpc, quote_mint).symbol
+        except Exception as exc:  # noqa: BLE001
+            log.debug("quote symbol lookup failed: %s", exc)
 
     return build_tick(
         mint=mint,
@@ -66,6 +80,9 @@ def fetch_price_tick(
         name=pool_res.name or name,
         symbol=pool_res.symbol or symbol,
         source=source,
+        quote_mint=quote_mint,
+        quote_symbol=quote_symbol,
+        pool_quote_ui=quote_ui,
     )
 
 

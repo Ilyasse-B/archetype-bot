@@ -10,7 +10,7 @@ from pathlib import Path
 
 from archetype.filters.decode import PoolInfo, parse_mint_json_parsed, parse_pool
 from archetype.filters.helius import HeliusRpc
-from archetype.filters.thresholds import PUMP_AMM_PROGRAM, WSOL_MINT
+from archetype.filters.thresholds import PUMP_AMM_PROGRAM
 from archetype.price.cache import cache_get, cache_put
 
 log = logging.getLogger("archetype.price")
@@ -45,7 +45,7 @@ def resolve_pumpswap_pool(
     order:
       1) memory/sqlite cache
       2) known_pool account (from migrate/backlog/position)
-      3) top holders → ATA owner that is a Pump AMM pool (WSOL quote)
+      3) top holders → ATA owner that is a Pump AMM pool (any quote)
     """
     if use_cache:
         cached = cache_get(mint, ledger_path=ledger_path)
@@ -131,8 +131,7 @@ def resolve_pumpswap_pool(
                 continue
             if pool.base_mint != mint:
                 continue
-            if pool.quote_mint != WSOL_MINT:
-                continue
+            # any quote mint is fine (WSOL, PUMP, xStock, …)
             resolved = ResolvedPool(
                 mint=mint,
                 pool=pool,
@@ -146,7 +145,7 @@ def resolve_pumpswap_pool(
             return resolved
 
     raise RuntimeError(
-        f"no PumpSwap WSOL pool found for {mint} "
+        f"no PumpSwap pool found for {mint} "
         "(is it migrated / still on bonding curve?)"
     )
 
@@ -170,8 +169,6 @@ def _from_pool_account(
     pool = parse_pool(pool_addr, pa["data"][0])
     if pool.base_mint != mint:
         raise RuntimeError("pool base_mint mismatch")
-    if pool.quote_mint != WSOL_MINT:
-        raise RuntimeError(f"quote mint not WSOL: {pool.quote_mint}")
     return ResolvedPool(
         mint=mint,
         pool=pool,

@@ -111,7 +111,8 @@ class HeliusRpc:
         """
         params = {
             "encoding": "jsonParsed",
-            "maxSupportedTransactionVersion": 0,
+            # v0 txs (and migrate_v2) need this ≥ 0; 1 is the safe default
+            "maxSupportedTransactionVersion": 1,
             "commitment": "confirmed",
         }
         last: dict[str, Any] | None = None

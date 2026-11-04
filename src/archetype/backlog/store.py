@@ -69,6 +69,12 @@ def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
     meta = event.metadata or metrics.get("metadata") or {}
     return {
         "mint": event.mint,
+        "coin_mint": event.coin_mint or event.mint,
+        "quote_mint": event.quote_mint or metrics.get("quote_mint"),
+        "quote_symbol": metrics.get("quote_symbol"),
+        "quote_name": metrics.get("quote_name"),
+        "venue": event.venue,
+        "platform": event.platform or metrics.get("platform"),
         "name": event.name,
         "symbol": event.symbol,
         "signature": event.signature,
@@ -84,6 +90,7 @@ def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
         "fees_check_needed": bool(metrics.get("fees_check_needed")),
         "fees_warn_below_sol": metrics.get("fees_warn_below_sol"),
         "pool_sol_at_migrate": metrics.get("pool_sol_at_migrate"),
+        "pool_quote_ui_at_migrate": metrics.get("pool_quote_ui_at_migrate"),
         "socials_present": metrics.get("socials_present") or meta.get("socials_present"),
         "twitter": meta.get("twitter"),
         "telegram": meta.get("telegram"),

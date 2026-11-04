@@ -27,6 +27,7 @@ class PriceTick:
     fdv_usd: float
     fdv_sol: float
     pool_base_ui: float
+    # SOL-equivalent of the quote vault (WSOL ui, or converted)
     pool_sol: float
     supply_ui: float
     fdv_supply: float
@@ -34,6 +35,10 @@ class PriceTick:
     decimals: int
     name: str | None = None
     symbol: str | None = None
+    quote_mint: str | None = None
+    quote_symbol: str | None = None
+    # raw quote vault ui (quote-token units); None when unknown
+    pool_quote_ui: float | None = None
     slot: int | None = None
     source: str = "rpc"  # rpc | ws
     at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -56,6 +61,9 @@ class PriceTick:
             "fdv_supply": self.fdv_supply,
             "sol_usd": self.sol_usd,
             "decimals": self.decimals,
+            "quote_mint": self.quote_mint,
+            "quote_symbol": self.quote_symbol,
+            "pool_quote_ui": self.pool_quote_ui,
             "slot": self.slot,
             "source": self.source,
             "at": self.at.isoformat(),
@@ -76,8 +84,15 @@ def build_tick(
     slot: int | None = None,
     source: str = "rpc",
     fdv_supply: float = PUMP_FDV_SUPPLY,
+    quote_mint: str | None = None,
+    quote_symbol: str | None = None,
+    pool_quote_ui: float | None = None,
 ) -> PriceTick:
-    """shared math for websocket / snapshot paths."""
+    """shared math for websocket / snapshot paths.
+
+    quote_sol is the SOL-equivalent of the quote vault (already converted
+    when the pair isnt WSOL).
+    """
     if base_ui <= 0:
         raise ValueError("pool base reserve is zero")
     price_sol = quote_sol / base_ui
@@ -103,6 +118,9 @@ def build_tick(
         decimals=decimals,
         name=name,
         symbol=symbol,
+        quote_mint=quote_mint,
+        quote_symbol=quote_symbol,
+        pool_quote_ui=pool_quote_ui,
         slot=slot,
         source=source,
         at=datetime.now(timezone.utc),

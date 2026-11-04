@@ -99,20 +99,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ledger = settings.resolved_trading_ledger_db()
 
     async def _filter_hook(event: MigrationEvent) -> MigrationEvent:
-        """run deterministic filters off the event loop; enqueue PASS."""
+        """repair mint → run deterministic filters off the event loop; enqueue PASS."""
         if not rpc.enabled:
             event.filter_passed = False
             event.filter_reasons = ["helius api key missing — cannot filter"]
             return event
 
         def _run() -> MigrationEvent:
-            result = run_full_filters(event, rpc, ledger)
-            event.filter_passed = result.passed
-            event.filter_reasons = list(result.reasons)
-            event.filter_metrics = dict(result.metrics)
+            from archetype.ingest.repair import repair_migration_event
+
+            # fix quote-as-mint frames BEFORE blacklist / on-chain gates
+            ev = event
+            outcome = repair_migration_event(ev, rpc)
+            ev = outcome.event
+            if outcome.reject_reason:
+                ev.filter_passed = False
+                ev.filter_reasons = [outcome.reject_reason]
+                ev.filter_metrics = {
+                    "repair_rejected": True,
+                    "venue": ev.venue,
+                    "quote_mint": ev.quote_mint,
+                }
+                log.info("FILTER REJECT %s — %s", ev.mint, outcome.reject_reason)
+                return ev
+
+            result = run_full_filters(ev, rpc, ledger)
+            ev.filter_passed = result.passed
+            ev.filter_reasons = list(result.reasons)
+            ev.filter_metrics = dict(result.metrics)
             if result.passed:
-                enqueue_passed(ledger, event)
-            return event
+                enqueue_passed(ledger, ev)
+            return ev
 
         return await asyncio.to_thread(_run)
 

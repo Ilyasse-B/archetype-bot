@@ -170,17 +170,20 @@ def parse_pool(address: str, data_b64: str) -> PoolInfo:
     )
 
 
-def extract_pool_from_migrate_tx(tx: dict[str, Any], mint: str) -> tuple[str | None, float, float]:
+def extract_pool_from_migrate_tx(
+    tx: dict[str, Any],
+    mint: str,
+    *,
+    quote_mint: str = WSOL_MINT,
+) -> tuple[str | None, float, float]:
     """
-    find pool address + quote SOL + base ui amount from migrate tx balances.
+    find pool address + quote ui amount + base ui from migrate tx balances.
 
-    returns (pool_address, quote_sol, base_ui).
+    quote_mint defaults to WSOL (classic pump). for custom quotes pass PUMP / MSTRx / …
+    returns (pool_address, quote_ui, base_ui) — quote_ui is in quote-token units,
+    NOT assumed to be SOL. caller converts to SOL via quote→USD→SOL when needed.
     """
     meta = tx.get("meta") or {}
-    msg = (tx.get("transaction") or {}).get("message") or {}
-    keys: list[str] = []
-    for a in msg.get("accountKeys") or []:
-        keys.append(a["pubkey"] if isinstance(a, dict) else str(a))
 
     quote_by_owner: dict[str, float] = {}
     base_by_owner: dict[str, float] = {}
@@ -190,17 +193,13 @@ def extract_pool_from_migrate_tx(tx: dict[str, Any], mint: str) -> tuple[str | N
         if not owner:
             continue
         amt = bal.get("uiTokenAmount") or {}
-        if m == WSOL_MINT:
-            raw = amt.get("amount")
-            if raw is not None:
-                quote_by_owner[owner] = int(raw) / 1e9
+        ui = _ui_amount(amt)
+        if ui is None:
+            continue
+        if m == quote_mint:
+            quote_by_owner[owner] = float(ui)
         elif m == mint:
-            ui = amt.get("uiAmount")
-            if ui is None and amt.get("amount") is not None:
-                dec = int(amt.get("decimals") or 0)
-                ui = int(amt["amount"]) / (10 ** dec)
-            if ui:
-                base_by_owner[owner] = float(ui)
+            base_by_owner[owner] = float(ui)
 
     # pool owner appears in both maps with the biggest quote among shared
     shared = set(quote_by_owner) & set(base_by_owner)
@@ -213,6 +212,24 @@ def extract_pool_from_migrate_tx(tx: dict[str, Any], mint: str) -> tuple[str | N
 
     pool = max(shared, key=lambda o: quote_by_owner.get(o, 0.0))
     return pool, quote_by_owner.get(pool, 0.0), base_by_owner.get(pool, 0.0)
+
+
+def _ui_amount(amt: dict[str, Any]) -> float | None:
+    """uiAmount, or raw/decimals if ui missing."""
+    ui = amt.get("uiAmount")
+    if ui is not None:
+        try:
+            return float(ui)
+        except (TypeError, ValueError):
+            pass
+    raw = amt.get("amount")
+    if raw is None:
+        return None
+    try:
+        dec = int(amt.get("decimals") or 0)
+        return int(raw) / (10 ** dec)
+    except (TypeError, ValueError):
+        return None
 
 
 def is_known_token_program(program_id: str) -> bool:
