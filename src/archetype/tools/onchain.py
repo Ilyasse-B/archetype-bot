@@ -1,8 +1,8 @@
 """
-live on-chain metrics for the coin in focus.
+live metrics for the coin in focus.
 
-http only. holders, 5m trades, deployer history.
-no helius. a miss on one call leaves that line unavailable.
+jupiter + solana tracker. no pump.fun http. no helius.
+a miss on one call leaves that line unavailable.
 """
 
 from __future__ import annotations
@@ -15,24 +15,21 @@ import httpx
 
 log = logging.getLogger("archetype.tools.onchain")
 
-_UA = "Mozilla/5.0 (compatible; ArchetypeBot/0.1; +https://localhost)"
-_HEADERS = {
-    "User-Agent": _UA,
-    "Accept": "application/json",
-    "Origin": "https://pump.fun",
-    "Referer": "https://pump.fun/",
-}
-
-_COINS_V2 = "https://frontend-api-v3.pump.fun/coins-v2/{mint}"
-_HOLDERS = "https://frontend-api-v3.pump.fun/coins/top-holders/{mint}"
-_ACTIVITY = "https://swap-api.pump.fun/v1/coins/{mint}/market-activity"
-_CREATED = "https://frontend-api-v3.pump.fun/coins-v2/user-created-coins/{creator}"
+_ACCEPT = {"Accept": "application/json"}
+_JUPITER = "https://lite-api.jup.ag/tokens/v2/search"
+_TRACKER = "https://data.solanatracker.io/tokens/{mint}"
+_TRACKER_STATS = "https://data.solanatracker.io/stats/{mint}"
 
 # first payload only. later calls are just the numbers.
 _METRICS_NOTE = "a gauge of the coin right now. do not decide the trade from these."
 
 
-def fetch_onchain_metrics(mint: str, timeout: float = 12.0, explain: bool = False) -> str:
+def fetch_onchain_metrics(
+    mint: str,
+    tracker_api_key: str = "",
+    timeout: float = 12.0,
+    explain: bool = False,
+) -> str:
     """
     tight live block for the first think, and again when the agent asks.
 
@@ -43,36 +40,57 @@ def fetch_onchain_metrics(mint: str, timeout: float = 12.0, explain: bool = Fals
     if not mint:
         return "onchain: unavailable"
     try:
-        coin, holders, activity = _first_wave(mint, timeout)
+        jup, tracker, stats = _first_wave(mint, tracker_api_key, timeout)
     except Exception as exc:  # noqa: BLE001
         log.warning("onchain metrics failed %s: %s", mint, exc)
         return "onchain: unavailable"
 
-    creator = ""
-    supply = None
-    if isinstance(coin, dict):
-        raw_creator = coin.get("creator")
-        if isinstance(raw_creator, str) and raw_creator.strip():
-            creator = raw_creator.strip()
-        supply = _ui_supply(coin.get("total_supply"))
+    if not isinstance(jup, dict) and not isinstance(tracker, dict) and not isinstance(
+        stats, dict
+    ):
+        return "onchain: unavailable"
 
-    created = _get_json(_CREATED.format(creator=creator), timeout) if creator else None
     lines = [
         "onchain (live):",
-        _said("holders", _holders_count(holders), "unique wallets holding the coin", explain),
-        _said("top10_pct", _top10_pct(holders, supply), "supply held by the top 10 wallets", explain),
-        _said("dev_pct", _dev_pct(holders, supply), "supply the developer still holds", explain),
-        _said("snipers_in_top", _flag_count(holders, "isSniper"), "flagged snipers in the top 10", explain),
-        _said("bundlers_in_top", _flag_count(holders, "isBundler"), "flagged bundlers in the top 10", explain),
+        _said(
+            "holders",
+            _holders(jup, tracker),
+            "unique wallets holding the coin",
+            explain,
+        ),
+        _said(
+            "top10_pct",
+            _top10(jup),
+            "supply held by the top 10 wallets",
+            explain,
+        ),
+        _said(
+            "dev_pct",
+            _dev_pct(tracker),
+            "supply the developer still holds",
+            explain,
+        ),
+        _said(
+            "snipers",
+            _snipers(tracker),
+            "flagged sniper wallets that still hold supply",
+            explain,
+        ),
+        _said(
+            "bundlers",
+            _bundlers(tracker),
+            "flagged bundler wallets that still hold supply",
+            explain,
+        ),
         _said(
             "trades_5m",
-            _trade_line(_window(activity, "5m")),
+            _trades_5m(stats, jup),
             "buys, sells, buyers, sellers, and the 5 minute price move",
             explain,
         ),
         _said(
             "deployer",
-            _deployer_line(created),
+            _deployer(jup),
             "coins this creator launched, and how many graduated",
             explain,
         ),
@@ -89,24 +107,66 @@ def _said(label: str, value: str, note: str, explain: bool) -> str:
     return f"{label}: {value} ({note})"
 
 
-def _first_wave(mint: str, timeout: float) -> tuple[Any, Any, Any]:
-    """coins-v2, holders, and trade windows. none of these need the others."""
-    urls = (
-        _COINS_V2.format(mint=mint),
-        _HOLDERS.format(mint=mint),
-        _ACTIVITY.format(mint=mint),
-    )
+def _first_wave(
+    mint: str, tracker_api_key: str, timeout: float
+) -> tuple[Any, Any, Any]:
+    """jupiter + tracker token + tracker stats. independent."""
+    key = (tracker_api_key or "").strip()
+    th = dict(_ACCEPT)
+    if key:
+        th["x-api-key"] = key
+
+    def jup() -> Any:
+        return _get_jupiter(mint, timeout)
+
+    def tok() -> Any:
+        if not key:
+            return None
+        return _get_json(_TRACKER.format(mint=mint), timeout, th)
+
+    def stats() -> Any:
+        if not key:
+            return None
+        return _get_json(_TRACKER_STATS.format(mint=mint), timeout, th)
+
     with ThreadPoolExecutor(max_workers=3) as pool:
-        coin, holders, activity = pool.map(lambda url: _get_json(url, timeout), urls)
-    return coin, holders, activity
+        return pool.submit(jup).result(), pool.submit(tok).result(), pool.submit(stats).result()
 
 
-def _get_json(url: str, timeout: float) -> dict[str, Any] | None:
-    """one get. 404 and junk are None, not a second data source."""
+def _get_jupiter(mint: str, timeout: float) -> dict[str, Any] | None:
+    try:
+        resp = httpx.get(
+            _JUPITER,
+            params={"query": mint},
+            headers=_ACCEPT,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("jupiter onchain failed %s: %s", mint[:8], exc)
+        return None
+    if resp.status_code != 200:
+        log.warning("jupiter onchain %s -> %s", mint[:8], resp.status_code)
+        return None
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(body, list):
+        return None
+    for row in body:
+        if isinstance(row, dict) and row.get("id") == mint:
+            return row
+    return body[0] if body and isinstance(body[0], dict) else None
+
+
+def _get_json(
+    url: str, timeout: float, headers: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     try:
         resp = httpx.get(
             url,
-            headers=_HEADERS,
+            headers=headers or _ACCEPT,
             timeout=timeout,
             follow_redirects=True,
         )
@@ -123,133 +183,136 @@ def _get_json(url: str, timeout: float) -> dict[str, Any] | None:
     return body if isinstance(body, dict) else None
 
 
-def _ui_supply(raw: Any) -> float | None:
-    """coins-v2 total_supply is raw. pump mints use 6 decimals."""
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
-        return None
-    return float(raw) / 1_000_000
+def _holders(jup: Any, tracker: Any) -> str:
+    if isinstance(jup, dict):
+        n = _as_int(jup.get("holderCount"))
+        if n is not None:
+            return f"{n:,}"
+    if isinstance(tracker, dict):
+        n = _as_int(tracker.get("holders"))
+        if n is not None:
+            return f"{n:,}"
+    return "unavailable"
 
 
-def _holder_ui(amount: Any, ui_supply: float | None) -> float | None:
-    """
-    top-holders amount is ui tokens.
-
-    if a row comes back in raw units it is bigger than the whole supply,
-    so scale that one down. don't guess a supply when coins-v2 missed.
-    """
-    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-        return None
-    val = float(amount)
-    if val < 0:
-        return None
-    if ui_supply and val > ui_supply:
-        val = val / 1_000_000
-    return val
-
-
-def _holder_rows(body: Any) -> list[dict[str, Any]]:
-    if not isinstance(body, dict):
-        return []
-    rows = body.get("topHolders")
-    if not isinstance(rows, list):
-        return []
-    return [row for row in rows if isinstance(row, dict)]
-
-
-def _holders_count(body: Any) -> str:
-    if not isinstance(body, dict):
+def _top10(jup: Any) -> str:
+    if not isinstance(jup, dict):
         return "unavailable"
-    return _count(body.get("totalHolders"))
-
-
-def _top10_pct(body: Any, ui_supply: float | None) -> str:
-    if not ui_supply:
+    audit = jup.get("audit")
+    if not isinstance(audit, dict):
         return "unavailable"
-    ranked: list[float] = []
-    for row in _holder_rows(body):
-        amt = _holder_ui(row.get("amount"), ui_supply)
-        if amt is None:
-            continue
-        ranked.append(amt)
-    if not ranked:
+    pct = audit.get("topHoldersPercentage")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
         return "unavailable"
-    ranked.sort(reverse=True)
-    share = sum(ranked[:10]) / ui_supply * 100.0
-    return _pct(share)
+    return _pct(float(pct))
 
 
-def _dev_pct(body: Any, ui_supply: float | None) -> str:
-    if not ui_supply:
+def _dev_pct(tracker: Any) -> str:
+    if not isinstance(tracker, dict):
         return "unavailable"
-    total = 0.0
-    seen = False
-    for row in _holder_rows(body):
-        if row.get("isDev") is not True:
-            continue
-        amt = _holder_ui(row.get("amount"), ui_supply)
-        if amt is None:
-            continue
-        seen = True
-        total += amt
-    if not seen:
-        # not in the top list. that is 0, not a failed call.
-        return "0" if _holder_rows(body) else "unavailable"
-    return _pct(total / ui_supply * 100.0)
-
-
-def _flag_count(body: Any, key: str) -> str:
-    rows = _holder_rows(body)
-    if not isinstance(body, dict):
+    risk = tracker.get("risk")
+    if not isinstance(risk, dict):
         return "unavailable"
-    if not rows and body.get("totalHolders") in (None, ""):
+    dev = risk.get("dev")
+    if not isinstance(dev, dict):
         return "unavailable"
-    return str(sum(1 for row in rows if row.get(key) is True))
-
-
-def _window(body: Any, key: str) -> dict[str, Any] | None:
-    if not isinstance(body, dict):
-        return None
-    window = body.get(key)
-    return window if isinstance(window, dict) else None
-
-
-def _trade_line(window: dict[str, Any] | None) -> str:
-    if not isinstance(window, dict):
+    pct = dev.get("percentage")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
         return "unavailable"
-    buys = _as_int(window.get("numBuys"))
-    sells = _as_int(window.get("numSells"))
-    buyers = _as_int(window.get("numBuyers"))
-    sellers = _as_int(window.get("numSellers"))
-    move = window.get("priceChangePercent")
-    if None in (buys, sells, buyers, sellers) or isinstance(move, bool) or not isinstance(
-        move, (int, float)
-    ):
-        return "unavailable"
-    return (
-        f"{buys:,} buys, {sells:,} sells, "
-        f"{buyers:,} buyers, {sellers:,} sellers, "
-        f"price {_signed(float(move))}%"
-    )
+    return _pct(float(pct))
 
 
-def _deployer_line(body: Any) -> str:
-    if not isinstance(body, dict):
+def _snipers(tracker: Any) -> str:
+    """count of flagged snipers that still hold (balance > 0)."""
+    if not isinstance(tracker, dict):
         return "unavailable"
-    count = body.get("count")
-    coins = body.get("coins")
-    if isinstance(count, bool) or not isinstance(count, int) or not isinstance(coins, list):
+    risk = tracker.get("risk")
+    if not isinstance(risk, dict) or not isinstance(risk.get("snipers"), dict):
         return "unavailable"
-    graduated = sum(1 for coin in coins if isinstance(coin, dict) and coin.get("complete") is True)
-    if count > len(coins):
-        return f"{count} launched, {graduated} graduated among the latest {len(coins)}"
-    return f"{count} launched, {graduated} graduated"
+    group = risk["snipers"]
+    wallets = group.get("wallets")
+    if isinstance(wallets, list):
+        holding = 0
+        for row in wallets:
+            if not isinstance(row, dict):
+                continue
+            bal = row.get("balance")
+            if isinstance(bal, (int, float)) and not isinstance(bal, bool) and bal > 0:
+                holding += 1
+        return str(holding)
+    # no wallet list — fall back to count only when they still hold pct
+    count = _as_int(group.get("count"))
+    pct = group.get("totalPercentage")
+    if count is None:
+        return "unavailable"
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool) and pct <= 0:
+        return "0"
+    return str(count)
 
 
-def _count(value: Any) -> str:
-    n = _as_int(value)
-    if n is None:
+def _bundlers(tracker: Any) -> str:
+    if not isinstance(tracker, dict):
         return "unavailable"
-    return f"{n:,}"
+    risk = tracker.get("risk")
+    if not isinstance(risk, dict) or not isinstance(risk.get("bundlers"), dict):
+        return "unavailable"
+    group = risk["bundlers"]
+    count = _as_int(group.get("count"))
+    pct = group.get("totalPercentage")
+    if count is None:
+        return "unavailable"
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        return f"{count} holding {_pct(float(pct))}%"
+    return str(count)
+
+
+def _trades_5m(stats: Any, jup: Any) -> str:
+    """prefer tracker stats (has buyers/sellers); else jupiter stats5m."""
+    if isinstance(stats, dict):
+        window = stats.get("5m")
+        if isinstance(window, dict):
+            buys = _as_int(window.get("buys"))
+            sells = _as_int(window.get("sells"))
+            buyers = _as_int(window.get("buyers"))
+            sellers = _as_int(window.get("sellers"))
+            move = window.get("priceChangePercentage")
+            if None not in (buys, sells, buyers, sellers) and isinstance(
+                move, (int, float)
+            ) and not isinstance(move, bool):
+                return (
+                    f"{buys:,} buys, {sells:,} sells, "
+                    f"{buyers:,} buyers, {sellers:,} sellers, "
+                    f"price {_signed(float(move))}%"
+                )
+    if isinstance(jup, dict) and isinstance(jup.get("stats5m"), dict):
+        s = jup["stats5m"]
+        buys = _as_int(s.get("numBuys"))
+        sells = _as_int(s.get("numSells"))
+        traders = _as_int(s.get("numTraders"))
+        move = s.get("priceChange")
+        if None not in (buys, sells) and isinstance(move, (int, float)) and not isinstance(
+            move, bool
+        ):
+            # jupiter has traders, not buyers/sellers — say so clearly
+            traders_s = f"{traders:,} traders" if traders is not None else "traders n/a"
+            return (
+                f"{buys:,} buys, {sells:,} sells, {traders_s}, "
+                f"price {_signed(float(move))}%"
+            )
+    return "unavailable"
+
+
+def _deployer(jup: Any) -> str:
+    if not isinstance(jup, dict):
+        return "unavailable"
+    audit = jup.get("audit")
+    if not isinstance(audit, dict):
+        return "unavailable"
+    launched = _as_int(audit.get("devMints"))
+    graduated = _as_int(audit.get("devMigrations"))
+    if launched is None or graduated is None:
+        return "unavailable"
+    return f"{launched} launched, {graduated} graduated"
 
 
 def _as_int(value: Any) -> int | None:

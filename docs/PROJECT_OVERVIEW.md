@@ -67,13 +67,13 @@ The product goal is an agent that **simulates a real human memecoin trader**: ov
 | 5 | **IPC** | **FastAPI on localhost** (`127.0.0.1`). |
 | 6 | **X / social (v1)** | Only tweets/accounts linked in coin metadata. Broader X later. |
 | 7 | **Tools** | One tool phase (Phase 5). The short catalogue lives in `trader.md` (name, a rank from 0 to 1, one line, when to call). No separate tools file. Callable so far: `metrics` 0.5, `safety` 0.8, `dex` 0.25. Field notes sit beside the numbers on the first result only. Full list and call rules: `docs/all-tools.md`. Call-control (cooldown, don’t repeat a tool) is later. |
-| 8 | **Data sources (hybrid)** | **PumpPortal** = migrations. **Helius** = live price. Metadata URI / DAS = socials and description. First think also reads pump.fun `coins-v2`, Donate.gg (charity coins), and two on-chain accounts (fee split, tokenized agent). Safety reads Rugcheck and Streamflow with no key, and Solana Tracker with `ARCHETYPE_SOLANA_TRACKER_API_KEY`. `dex` reads Dexscreener orders and token pairs, no key. Extra links, `imageUrl`, and `header` are stored on the coin and not shown. A failed line says `unavailable`. No Helius substitute for those reads. |
+| 8 | **Data sources (hybrid)** | **PumpPortal** = migrations (incl. non-SOL quote pump pairs after Wave A mint repair). **Helius** = live price, filter RPC, fee-split / tokenized-agent PDAs. Metadata URI / DAS = socials and description. First-think **coin snapshot** = Jupiter (volume/liquidity/created) + Solana Tracker (ATH, cashback/holder-reward flags) + Donate.gg (charity) — **no pump.fun frontend HTTP**. Live **metrics** = Jupiter + Solana Tracker. Safety = Rugcheck + Streamflow + Solana Tracker. `dex` = Dexscreener. A failed line says `unavailable`. |
 | 9 | **Pre-agent enrich + socials gate** | Always fetch metadata before the agent. **No socials at all → reject.** **Any one** of twitter / telegram / website is enough to pass. |
 | 10 | **Migration backlog** | While busy, queue passed migrations locally (timestamp + coin info). When free, **FIFO from the top**. Same backlog is a **tool** the locked agent can peek for other-coin context (still one trade only). Human trade stream already consumes FIFO via SQLite. |
 | 11 | **Risk (paper)** | Buy size is program-owned from migration mcap: **&lt; $50k → 3 SOL**, **&lt; $125k → 5 SOL**, **≥ $125k → 10 SOL** (missing mcap uses 3). Exact $50k is the 5 SOL band; exact $125k is 10. The model does not pick size. No paper kill-switch. |
 | 12 | **Fine-tuning** | Weekly Unsloth/Colab. Maximize **PnL**. Closed trade: final thesis + PnL + time held + timestamps (+ meta). |
 | 13 | **Live gate** | Net profitable paper week (even 0.1 SOL). |
-| 14 | **Launchpads v1** | **Pump.fun / PumpSwap only** for trading. StonkFun / Raydium LaunchLab = deferred (see §14.5). |
+| 14 | **Launchpads v1** | **Pump.fun / PumpSwap** for discovery + paper trade, including **custom quote** pairs (PUMP, xStocks, DOGE, AMD bag, …). Paper wallet stays SOL/USD via quote→USD→SOL. LaunchLab / Meteora = Wave B (see `docs/other_streams_plan.md`). |
 | 15 | **Buy requires predictions** | Buy only if the agent outputs **TP + SL**. Any profit **&gt; 0**. Any stop-loss **&gt; 0 and &lt; 100**. No fixed menus. Size is injected from mcap (row 11). A `wait` or `reject` that also sends percents has those percents dropped. Human CLI can still set TP/SL via `set-profit` / `set-loss`. |
 | 16 | **Exits** | Agent continuously revises TP/SL. Deterministic price/exec hits levels every tick. **Daemon TP/SL auto-exits implemented** (human CLI `set-profit` / `set-loss` + in-watch commands). |
 | 17 | **Price shown to agent** | Latest engine price + % since last check + current unrealized PnL. |
@@ -358,7 +358,7 @@ Runs **after** on-chain filters pass (`src/archetype/metadata/` + `run_full_filt
 
 **Not gated (kept as metadata only):** description content, image presence, `createdOn`, `showName`, `coin_community`, video.
 
-The URI JSON does **not** say where fees go. Coin type, ATH, volume, liquidity, livestream, and charity text are fetched later, on the first think. See **Coin snapshot** under Phase 4.
+The URI JSON does **not** say where fees go. Coin type, ATH, volume, liquidity, and charity text are fetched later, on the first think (Jupiter / Tracker / Donate.gg / Helius — not pump.fun HTTP). See **Coin snapshot** under Phase 4.
 
 ### Phase 2c — migration backlog (implemented)
 
@@ -489,21 +489,20 @@ Clean internal surface for the Phase 4 LLM — separate from human `/paper/*` + 
 - One timeout while searching logs and auto-rejects (`timed out before a decision`). A timeout while locked logs and retries (an open bag is not rejected).
 - Daemon startup clears pending backlog rows.
 
-**What the model sees each think:** `trader.md` (system, including the short tool catalogue), then a saved opening card, then a short user message of what changed. While searching, that system text includes buy, reject, and wait. Once the coin is bought, those examples and the before-buy instructions are removed, and the hold paragraph says the agent can call tools, which are listed below. The opening card is mint, name, symbol, which socials exist, description, required buy size, and the **coin snapshot** below. It is built once and replayed on later thinks. Field notes are not on that card. The changing message is phase, live market cap, pnl and hold time if owned, market-cap change since the last peek, and on the **first think only** the live metrics block (a short note beside each number, then a line that the block is a gauge and does not decide the trade). Then the rolling summary and the last 5 events for this coin. A later `metrics`, `safety`, or `dex` result shows up in those events. The catalogue gives each tool a rank from 0 to 1. The first `safety` result has notes beside each field and a closing line: weigh it with everything else, and only reject or sell on it alone if the coin clearly looks dangerous. The first `dex` result is `dex paid` and `active boosts`, with a note beside each. Later calls for the same tool are the numbers only. A `safety` or `dex` event is the block itself, starting at `safety:` or `dex:`. Global fees stay a filter and are not shown. No token price. Output is JSON constrained by `decision_format` (not `bind_tools`). `num_predict=-1` so a reply is not cut mid-JSON.
+**What the model sees each think:** `trader.md` (system, including the short tool catalogue), then a saved opening card, then a short user message of what changed. While searching, that system text includes buy, reject, and wait. Once the coin is bought, those examples and the before-buy instructions are removed, and the hold paragraph says the agent can call tools, which are listed below. The opening card is mint, name, symbol, which socials exist, description, required buy size, optional **`pairing: Name (TICKER)`** when quote ≠ SOL, and the **coin snapshot** below. For paired coins the system prompt also gets a short pairing note (omitted on classic SOL pairs to save tokens). The card is built once and replayed on later thinks. The changing message is phase, live market cap, pnl and hold time if owned, market-cap change since the last peek, and on the **first think only** the live metrics block. Then the rolling summary and the last 5 events. Output is JSON constrained by `decision_format`. `num_predict=-1` so a reply is not cut mid-JSON.
 
-**Coin snapshot (first think):** `src/archetype/metadata/snapshot.py`. One shot when the agent starts on a coin. Not part of the migration filter.
+**Coin snapshot (first think):** `src/archetype/metadata/snapshot.py`. One shot when the agent starts on a coin. Not part of the migration filter. **No pump.fun frontend HTTP** (Cloudflare-blocked from this host).
 
 | What | Source | On the card |
 |------|--------|-------------|
-| ATH, 1h volume, pool liquidity, livestream on/off, created time | `GET https://frontend-api-v3.pump.fun/coins-v2/{mint}` | Yes |
-| Coin type: creator fees, cashback, holder rewards, charity | Same `coins-v2` body (`is_cashback_enabled`, `is_holder_reward`, `is_charity`) | Yes, one `coin_type` line |
-| Fee redirect | Helius `getMultipleAccounts` on the Pump Fees sharing-config PDA. A missing account, or 100% still with the admin, is not a redirect. | Shareholder address and percent |
-| Tokenized agent | Same Helius batch, agent-payments PDA. Missing account means the line is omitted. | Buyback percent when the account exists |
-| Charity name, mission, website, country | `GET https://www.donate.gg/api/v1/101/tokens/{mint}` only when `is_charity` is true (or when `coins-v2` did not answer) | Yes |
+| ATH mcap | Solana Tracker `GET /tokens/{mint}/ath` | Yes |
+| 1h volume, liquidity, created time | Jupiter `lite-api.jup.ag/tokens/v2/search` | Yes |
+| Coin type: cashback, holder rewards | Solana Tracker `pools[].pumpfun-amm.isCashbackCoin` / `isHolderReward` | Yes, on `coin_type` |
+| Charity | Donate.gg `GET /api/v1/101/tokens/{mint}` (probe every coin; 404 = not charity) | Yes when present |
+| Fee redirect | Helius sharing-config PDA | Shareholder address and percent |
+| Tokenized agent | Same Helius batch, agent-payments PDA | Buyback percent when present |
 
-Not on the card: NSFW, banned, boost, quote mint, Donate.gg’s own cut, mayhem. Research notes for those are in `docs/metadata.md`.
-
-No new key and no new subscription. `coins-v2` and the Donate.gg read are unauthenticated. The account batch is 1 Helius credit on the key already in `.env`. Pump.fun returns 403 from the UK (geo-block); the daemon needs a VPN or a non-UK path or those market lines come back `unknown`. Charity text and the fee split still fill in from Donate.gg and Helius. Details and sources: `docs/metadata.md`.
+Not on the card: livestream (pump-only; dropped), NSFW, banned, boost, raw quote mint, mayhem, Donate.gg’s cut. See `docs/metadata.md` for mode research. Keys: existing Helius + `ARCHETYPE_SOLANA_TRACKER_API_KEY`. Jupiter and Donate.gg need no key.
 
 **Buy / levels:** size comes from mcap (decision 11). Buy must include `profit_pct` &gt; 0 and `loss_pct` &gt; 0 and &lt; 100. `wait`, `reject`, `metrics`, `safety`, and `dex` do not use those percents. Percents on those replies are ignored, including zeros (those used to fail the step). The buy examples in `trader.md` say “a suitable take-profit percentage, e.g. 50” and “a suitable stop-loss percentage, e.g. 25” so the model is not stuck on one pair of numbers.
 
@@ -523,7 +522,7 @@ Spec and build order: `docs/all-tools.md`. The catalogue the model actually sees
 
 1. **Price change (fed).** Every think says how market cap moved since the last peek. Any size. The first look says none yet. There is no fast-move alert: it was removed so a price jump does not interrupt a think or add another event. `src/archetype/tools/price_change.py`. The vault socket still opens on focus so peek and TP/SL share it.
 
-2. **Live metrics (both).** `src/archetype/tools/onchain.py`. Fed once, on the first think, in the changing message so a replay of the opening card cannot go stale. The agent can reply `metrics` while searching or locked. That call does not count as a look. HTTP only: pump.fun top holders, 5-minute market activity, and the creator’s launched coins. No API key. No Helius. Fields: holders, top-10 % of supply, developer % in that list, sniper and bundler flags inside that same list, 5-minute buys/sells/buyers/sellers and the price move, and how many coins this creator launched versus how many of the returned page graduated. Those sniper and bundler counts are not a scan of every holder. Reply count and the 1-hour trade window are not shown. A failed line says `unavailable`.
+2. **Live metrics (both).** `src/archetype/tools/onchain.py`. Fed once, on the first think, in the changing message so a replay of the opening card cannot go stale. The agent can reply `metrics` while searching or locked. That call does not count as a look. **Jupiter** (holders, top-10 %, deployer launched/graduated via `audit.devMints` / `devMigrations`, 5m trades fallback) + **Solana Tracker** (dev %, snipers still holding, bundlers, preferred 5m stats). No pump.fun HTTP. No Helius. A failed line says `unavailable`.
 
 3. **Safety (agent).** `src/archetype/tools/safety.py`. One action, `safety`. Not on the first prompt. The old one-call legitimacy idea is this tool. Four reads in parallel, no Helius:
    - Rugcheck report, no key: score (`score_normalised`, lower is safer), risk names and levels (empty means none), insider networks as active wallets and the supply they still hold. Total wallet count is not shown.
@@ -534,7 +533,7 @@ Spec and build order: `docs/all-tools.md`. The catalogue the model actually sees
 
 **Still ahead:** dev wallet, tracked wallets, vamp, backlog peek, website legitimacy, X, Gemini. Call-control (don’t call the same tool again while its last result is still the latest read, a short cooldown, and a nudge toward metrics and safety before narrative tools) is written in `docs/all-tools.md` and not implemented.
 
-**Keys:** Solana Tracker is the only new env key (`ARCHETYPE_SOLANA_TRACKER_API_KEY` in `.env.example`). Rugcheck’s public report and Streamflow do not need one. Pump.fun `coins-v2` is geo-blocked in the UK; the daemon needs a VPN or a non-UK path or those market lines come back unavailable. Charity text and the fee split still fill in from Donate.gg and Helius.
+**Keys:** Solana Tracker (`ARCHETYPE_SOLANA_TRACKER_API_KEY`) is required for ATH, cashback/holder-reward flags, and the richer metrics lines. Rugcheck / Streamflow / Jupiter / Donate.gg need no key. Pump.fun frontend APIs are **not used** (Cloudflare bot wall).
 
 ---
 
@@ -573,7 +572,8 @@ Unattended daemon; Pump migrations via Helius; rejects logged; single-coin lock;
 - **PumpPortal** for migration discovery (initial fetch).  
 - **Helius free-tier WebSockets** for live price / pool updates on the active coin.  
 - **Metadata URI / Helius DAS** once per candidate for off-chain socials (before agent; socials guardrail).
-- **First-think coin snapshot:** pump.fun `coins-v2` plus Donate.gg for charity coins, and one Helius account batch for fee-split and tokenized-agent. See Phase 4.
+- **First-think coin snapshot:** Jupiter + Solana Tracker + Donate.gg + Helius fee/agent PDAs. No pump.fun frontend. See Phase 4.
+- **Wave A (other streams):** PumpPortal custom-quote migrations repair mint via migrate tx; filters/price/fills allow any PumpSwap quote; paper PnL in SOL via quote→USD→SOL; agent card shows `pairing: Name (TICKER)` for non-SOL quotes. Plan: `docs/other_streams_plan.md`.
 - **Safety tool:** Rugcheck and Streamflow (no key) plus Solana Tracker (one key). See Phase 5.
 - **Dex tool:** Dexscreener orders and token pairs (no key). The agent sees paid status and active boosts. New links, the image, and the banner are stored on the coin and not shown.
 
@@ -622,7 +622,7 @@ Pump.fun tokens use **Metaplex Token Metadata**. On-chain metadata stores a **`u
 1. **PumpPortal** → “what just migrated?” (initial fetch).  
 2. **Helius** → live price / pool state for the active coin.  
 3. **Metadata URI / DAS** → socials and description once per candidate (before agent; feeds socials guardrail).
-4. **First think** → pump.fun `coins-v2`, Donate.gg if it is a charity coin, and one Helius read for fee redirect / tokenized agent. That block is the coin snapshot on the opening card. The same first think also fetches live holder metrics (not saved on the card).
+4. **First think** → Jupiter + Solana Tracker + Donate.gg + Helius fee/agent PDAs for the coin snapshot on the opening card. Same think fetches live metrics (Jupiter + Tracker; not saved on the card). Non-SOL quote coins also get a `pairing` line and a short system-prompt note.
 5. **When the agent asks** → `safety` hits Rugcheck, Streamflow, and Solana Tracker. A later `metrics` call refreshes the holder block. `dex` hits Dexscreener for paid status and active boosts, and stores any new links plus the image and banner on the coin.
 
 ### 14.4 Paper trading (v1 implemented)

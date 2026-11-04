@@ -1,8 +1,12 @@
 """
-coins-v2 snapshot for the first agent card.
+first-think coin snapshot for the agent card.
 
-one http get, plus donate.gg when the coin is a charity, plus one helius
-batch for fee-split and tokenized-agent. mayhem is left out on purpose.
+sources (no pump.fun http):
+  jupiter lite-api — volume 1h, liquidity, created
+  solana tracker  — ATH, cashback / holder-reward flags
+  donate.gg       — charity detection + details
+  helius          — fee-split + tokenized-agent PDAs
+livestream is not available without pump.fun; that line is omitted.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import base64
 import logging
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,9 +25,11 @@ from archetype.filters.helius import HeliusRpc
 
 log = logging.getLogger("archetype.metadata.snapshot")
 
-_UA = "Mozilla/5.0 (compatible; ArchetypeBot/0.1; +https://localhost)"
-_COINS_V2 = "https://frontend-api-v3.pump.fun/coins-v2/{mint}"
+_ACCEPT = {"Accept": "application/json"}
 _DONATE_TOKEN = "https://www.donate.gg/api/v1/101/tokens/{mint}"
+_JUPITER = "https://lite-api.jup.ag/tokens/v2/search"
+_TRACKER = "https://data.solanatracker.io/tokens/{mint}"
+_TRACKER_ATH = "https://data.solanatracker.io/tokens/{mint}/ath"
 
 # pump fees program. sharing-config pda lives here.
 _PUMP_FEES = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
@@ -34,65 +41,163 @@ _SHARING_DISC = bytes([216, 74, 9, 0, 56, 140, 93, 75])
 _AGENT_DISC = bytes([136, 241, 242, 217, 173, 77, 112, 186])
 
 
-def fetch_coin_snapshot(mint: str, rpc: HeliusRpc | None = None, timeout: float = 12.0) -> str:
+def fetch_coin_snapshot(
+    mint: str,
+    rpc: HeliusRpc | None = None,
+    tracker_api_key: str = "",
+    timeout: float = 12.0,
+) -> str:
     """
-    text block for the first prompt. empty string if coins-v2 did not answer.
+    text block for the first prompt.
 
-    fails soft. a bad donate.gg or helius read does not drop the rest.
+    fails soft. a miss on one source leaves that line unknown / omitted.
     """
     mint = (mint or "").strip()
     if not mint:
         return "coin snapshot: unavailable"
-    body = _get_json(_COINS_V2.format(mint=mint), timeout=timeout)
-    have_http = isinstance(body, dict)
-    if not have_http:
-        log.warning("coins-v2 miss for %s", mint)
-        body = {}
 
-    charity = body.get("is_charity") is True
-    donate: dict[str, Any] | None = None
-    # no coins-v2 flag (or it said charity): ask donate.gg. 404 just means not a charity coin.
-    if charity or not have_http:
-        donate = _get_json(_DONATE_TOKEN.format(mint=mint), timeout=timeout)
-        if isinstance(donate, dict) and (donate.get("activeConfig") or {}).get("charities"):
-            charity = True
-        else:
-            donate = None
+    jup, tracker, ath, donate = _fetch_http(mint, tracker_api_key, timeout)
+
+    charity = False
+    if isinstance(donate, dict) and (donate.get("activeConfig") or {}).get("charities"):
+        charity = True
+    else:
+        donate = None
+
+    cashback = False
+    holder_reward = False
+    if isinstance(tracker, dict):
+        cashback, holder_reward = _pump_flags(tracker)
 
     fee_split: list[tuple[str, int]] | None = None
     agent_bps: int | None = None
     if rpc is not None and rpc.enabled:
         fee_split, agent_bps = _onchain_modes(rpc, mint)
 
-    if not have_http and not charity and not fee_split and agent_bps is None:
+    have_market = isinstance(jup, dict) or isinstance(tracker, dict) or isinstance(ath, dict)
+    if not have_market and not charity and not fee_split and agent_bps is None:
         return "coin snapshot: unavailable"
+
     return _render(
-        body,
+        jup=jup if isinstance(jup, dict) else None,
+        tracker=tracker if isinstance(tracker, dict) else None,
+        ath=ath if isinstance(ath, dict) else None,
         donate=donate,
         charity=charity,
+        cashback=cashback,
+        holder_reward=holder_reward,
         fee_split=fee_split,
         agent_bps=agent_bps,
-        have_http=have_http,
+        modes_known=isinstance(tracker, dict),
     )
 
 
+def _fetch_http(
+    mint: str, tracker_api_key: str, timeout: float
+) -> tuple[Any, Any, Any, Any]:
+    """jupiter + tracker token + tracker ath + donate.gg in parallel."""
+    th: dict[str, str] = dict(_ACCEPT)
+    key = (tracker_api_key or "").strip()
+    if key:
+        th["x-api-key"] = key
+
+    def jup() -> Any:
+        return _get_jupiter(mint, timeout)
+
+    def tok() -> Any:
+        if not key:
+            return None
+        return _get_json(_TRACKER.format(mint=mint), timeout, th)
+
+    def ath() -> Any:
+        if not key:
+            return None
+        return _get_json(_TRACKER_ATH.format(mint=mint), timeout, th)
+
+    def don() -> Any:
+        return _get_json(_DONATE_TOKEN.format(mint=mint), timeout, _ACCEPT)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_jup = pool.submit(jup)
+        f_tok = pool.submit(tok)
+        f_ath = pool.submit(ath)
+        f_don = pool.submit(don)
+        return f_jup.result(), f_tok.result(), f_ath.result(), f_don.result()
+
+
+def _get_jupiter(mint: str, timeout: float) -> dict[str, Any] | None:
+    """lite-api search returns a list; pick the exact mint row."""
+    try:
+        resp = httpx.get(
+            _JUPITER,
+            params={"query": mint},
+            headers=_ACCEPT,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("jupiter snapshot failed %s: %s", mint[:8], exc)
+        return None
+    if resp.status_code != 200:
+        log.warning("jupiter snapshot %s -> %s", mint[:8], resp.status_code)
+        return None
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(body, list):
+        return None
+    for row in body:
+        if isinstance(row, dict) and row.get("id") == mint:
+            return row
+    return body[0] if body and isinstance(body[0], dict) else None
+
+
+def _pump_flags(tracker: dict[str, Any]) -> tuple[bool, bool]:
+    """read isCashbackCoin / isHolderReward off pumpfun-amm pool rows."""
+    cashback = False
+    holder_reward = False
+    for pool in tracker.get("pools") or []:
+        if not isinstance(pool, dict):
+            continue
+        flags = pool.get("pumpfun-amm")
+        if not isinstance(flags, dict):
+            continue
+        if flags.get("isCashbackCoin") is True:
+            cashback = True
+        if flags.get("isHolderReward") is True:
+            holder_reward = True
+    return cashback, holder_reward
+
+
 def _render(
-    body: dict[str, Any],
     *,
+    jup: dict[str, Any] | None,
+    tracker: dict[str, Any] | None,
+    ath: dict[str, Any] | None,
     donate: dict[str, Any] | None,
     charity: bool,
+    cashback: bool,
+    holder_reward: bool,
     fee_split: list[tuple[str, int]] | None,
     agent_bps: int | None,
-    have_http: bool = True,
+    modes_known: bool,
 ) -> str:
-    """turn the json into short lines. the model reads these, not the raw body."""
+    """short lines for the model."""
+    ath_usd = None
+    if isinstance(ath, dict):
+        ath_usd = ath.get("highest_market_cap")
+
+    vol_1h = _volume_1h(jup)
+    liq = _liquidity(jup, tracker)
+    created = _created_label(jup, tracker)
+
     lines = [
-        f"ath_mcap_usd: {_usd(body.get('ath_market_cap'))}",
-        f"volume_1h_usd: {_usd(body.get('volume_1h_usd'))}",
-        f"liquidity_usd: {_usd(body.get('canonical_pool_liquidity_usd'))}",
-        f"livestream: {_on_off(body.get('is_currently_live'))}",
-        f"created: {_created(body.get('created_timestamp'))}",
-        f"coin_type: {_coin_type(body, charity=charity, fee_split=fee_split, agent_bps=agent_bps, have_http=have_http)}",
+        f"ath_mcap_usd: {_usd(ath_usd)}",
+        f"volume_1h_usd: {_usd(vol_1h)}",
+        f"liquidity_usd: {_usd(liq)}",
+        f"created: {created}",
+        f"coin_type: {_coin_type(cashback, holder_reward, charity, fee_split, agent_bps, modes_known)}",
     ]
     if fee_split:
         bits = ", ".join(f"{addr} {bps / 100:g}%" for addr, bps in fee_split)
@@ -104,19 +209,72 @@ def _render(
     return "\n".join(lines)
 
 
+def _volume_1h(jup: dict[str, Any] | None) -> float | None:
+    if not jup:
+        return None
+    stats = jup.get("stats1h")
+    if not isinstance(stats, dict):
+        return None
+    buy = stats.get("buyVolume")
+    sell = stats.get("sellVolume")
+    if not isinstance(buy, (int, float)) or not isinstance(sell, (int, float)):
+        return None
+    if isinstance(buy, bool) or isinstance(sell, bool):
+        return None
+    return float(buy) + float(sell)
+
+
+def _liquidity(
+    jup: dict[str, Any] | None, tracker: dict[str, Any] | None
+) -> float | None:
+    if jup and isinstance(jup.get("liquidity"), (int, float)) and not isinstance(
+        jup.get("liquidity"), bool
+    ):
+        return float(jup["liquidity"])
+    if not tracker:
+        return None
+    best = 0.0
+    found = False
+    for pool in tracker.get("pools") or []:
+        if not isinstance(pool, dict):
+            continue
+        liq = pool.get("liquidity")
+        usd = None
+        if isinstance(liq, dict):
+            usd = liq.get("usd")
+        elif isinstance(liq, (int, float)) and not isinstance(liq, bool):
+            usd = liq
+        if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+            found = True
+            best = max(best, float(usd))
+    return best if found else None
+
+
+def _created_label(
+    jup: dict[str, Any] | None, tracker: dict[str, Any] | None
+) -> str:
+    if jup and isinstance(jup.get("createdAt"), str) and jup["createdAt"].strip():
+        return _format_created(jup["createdAt"])
+    if tracker:
+        creation = (tracker.get("token") or {}).get("creation") or {}
+        if isinstance(creation, dict) and creation.get("created_time") is not None:
+            return _format_created(creation.get("created_time"))
+    return "unknown"
+
+
 def _coin_type(
-    body: dict[str, Any],
-    *,
+    cashback: bool,
+    holder_reward: bool,
     charity: bool,
     fee_split: list[tuple[str, int]] | None,
     agent_bps: int | None,
-    have_http: bool = True,
+    modes_known: bool,
 ) -> str:
-    """which fee / launch modes are actually on. mayhem is not one of them."""
+    """which fee / launch modes are on. mayhem left out on purpose."""
     kinds: list[str] = []
-    if body.get("is_cashback_enabled") is True:
+    if cashback:
         kinds.append("cashback")
-    if body.get("is_holder_reward") is True:
+    if holder_reward:
         kinds.append("holder rewards")
     if charity:
         kinds.append("charity")
@@ -125,8 +283,8 @@ def _coin_type(
     if agent_bps is not None:
         kinds.append("tokenized agent")
     if not kinds:
-        # coins-v2 never answered, so "creator fees" would be a guess
-        return "creator fees" if have_http else "unknown"
+        # tracker answered with no special flags → normal creator fees
+        return "creator fees" if modes_known else "unknown"
     return ", ".join(kinds)
 
 
@@ -204,8 +362,6 @@ def _decode_sharing(account: dict[str, Any] | None) -> list[tuple[str, int]] | N
     shareholders when fees are actually redirected.
 
     a missing account, or the default 100% to the admin, is not a redirect.
-    layout is the pump sharingConfig account (disc + bump, version, status,
-    mint, admin, admin_revoked, then vec of pubkey + u16).
     """
     raw = _account_bytes(account)
     if raw is None or len(raw) < 80 or raw[:8] != _SHARING_DISC:
@@ -225,7 +381,6 @@ def _decode_sharing(account: dict[str, Any] | None) -> list[tuple[str, int]] | N
         offset += 34
     if not shares:
         return None
-    # creator still has the whole fee. not a redirect.
     if len(shares) == 1 and shares[0][0] == admin and shares[0][1] == 10_000:
         return None
     return shares
@@ -234,19 +389,20 @@ def _decode_sharing(account: dict[str, Any] | None) -> list[tuple[str, int]] | N
 def _decode_agent(account: dict[str, Any] | None) -> int | None:
     """buyback bps when the token-agent-payments account exists. else None."""
     raw = _account_bytes(account)
-    # disc + bump + mint + authority + u16
     if raw is None or len(raw) < 75 or raw[:8] != _AGENT_DISC:
         return None
     (bps,) = struct.unpack_from("<H", raw, 73)
     return int(bps)
 
 
-def _get_json(url: str, timeout: float) -> dict[str, Any] | None:
+def _get_json(
+    url: str, timeout: float, headers: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     """one get. 404 and junk are None, not a crash."""
     try:
         resp = httpx.get(
             url,
-            headers={"User-Agent": _UA, "Accept": "application/json"},
+            headers=headers or _ACCEPT,
             timeout=timeout,
             follow_redirects=True,
         )
@@ -271,16 +427,18 @@ def _usd(value: Any) -> str:
     return f"{value:,.0f}"
 
 
-def _on_off(value: Any) -> str:
-    if value is True:
-        return "on"
-    if value is False:
-        return "off"
-    return "unknown"
-
-
-def _created(value: Any) -> str:
-    """coins-v2 sends milliseconds. older payloads sometimes send seconds."""
+def _format_created(value: Any) -> str:
+    """iso string, unix seconds, or unix ms → utc label."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "unknown"
+        try:
+            # 2026-11-03T21:21:43Z
+            when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            return "unknown"
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "unknown"
     ts = float(value)

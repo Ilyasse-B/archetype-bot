@@ -52,7 +52,7 @@ These are not Phase 5 work. They already feed the agent.
 | What | Label | What it does |
 |------|-------|----------------|
 | Filter snapshot | **fed** | Name, symbol, description, mcap, socials. Taken once when the migration passes. Global fees stay a deterministic filter and are not shown to the agent. |
-| Coin snapshot | **fed** | Once, on the first think, then replayed. ATH, 1h volume, liquidity, livestream, created time, and coin type (creator fees, cashback, holder rewards, charity, fee redirect, tokenized agent). A charity coin also gets the Donate.gg name, mission, website, and country. Mayhem is not included. |
+| Coin snapshot | **fed** | Once, on the first think, then replayed. ATH (Solana Tracker), 1h volume / liquidity / created (Jupiter), coin type (Tracker cashback/holder-reward flags; Donate.gg charity; Helius fee redirect / tokenized agent). No pump.fun frontend. Livestream omitted. Mayhem is not included. Non-SOL pairs also get a `pairing` line on the card. |
 | Price peek | **fed** | Latest market cap off the focused coin's live vault websocket, plus PnL if we already hold it. Not a separate Helius poll. |
 | TP/SL engine | — | Daemon sells when the levels hit. Not a research tool. The agent sets the levels; it does not watch every tick. |
 
@@ -75,18 +75,15 @@ Fed once, on the first think, in that think’s changing message. That first blo
 
 The agent can reply `metrics` while searching or locked. That call does not count as a look. The next think gets a new HTTP read.
 
-No API key. No Helius. If one call fails, that line says `unavailable`. There is no fallback source.
+Uses Jupiter (no key) and Solana Tracker (`ARCHETYPE_SOLANA_TRACKER_API_KEY`). No pump.fun HTTP. No Helius. If one call fails, that line says `unavailable`.
 
-Fields the agent actually sees: `holders`, `top10_pct`, `dev_pct`, `snipers_in_top`, `bundlers_in_top`, `trades_5m`, `deployer`. Reply count and the 1-hour trade window were dropped.
+Fields the agent sees: `holders`, `top10_pct`, `dev_pct`, `snipers`, `bundlers`, `trades_5m`, `deployer`.
 
-- Holders, top-10 % of supply, creator % in that list, and sniper / bundler counts inside the same list: `GET https://frontend-api-v3.pump.fun/coins/top-holders/{mint}`. `limit=200` still returns about 50 wallets. Those flags are not a count across every holder. That is tool 3.
-- Whether price is being pushed, last 5 minutes only: `GET https://swap-api.pump.fun/v1/coins/{mint}/market-activity` (`numBuys`, `numSells`, `numBuyers`, `numSellers`, `priceChangePercent`). The same payload also has 1h, 6h, and 24h. Those stay off so the block stays short.
-- Creator wallet and raw supply (for the percents): `GET https://frontend-api-v3.pump.fun/coins-v2/{mint}`. Reply count is on that payload and is not shown.
-- Deployer history: `GET https://frontend-api-v3.pump.fun/coins-v2/user-created-coins/{creator}` (`count`, and how many of the returned coins have `complete`). One page. If the creator has more coins than the page, the line says the graduated count is only among the latest page.
+- Holders / top-10 % / deployer launched+graduated: Jupiter `tokens/v2/search` (`holderCount`, `audit.topHoldersPercentage`, `audit.devMints`, `audit.devMigrations`).
+- Dev % / snipers still holding / bundlers: Solana Tracker `GET /tokens/{mint}` `risk.*`.
+- 5m trades: Tracker `GET /stats/{mint}` `5m` when available; else Jupiter `stats5m` (traders instead of buyers/sellers).
 
-Global fees already paid are not in this tool. Total fees are tool 3, from Solana Tracker. The creator-vault read used by the migrate filter is a different number, and it is not used here.
-
-`GET /trades/count/{mint}` and `GET /trades/all/{mint}` on frontend-api-v3 reject the request (they want a `chainId` that did not match the coins-v2 chain id we tried). Buy and sell counts come from market-activity instead.
+Global fees already paid are not in this tool. Total fees are tool 3 (safety), from Solana Tracker.
 
 ### 3. Safety — **agent** (built, rank 0.8)
 

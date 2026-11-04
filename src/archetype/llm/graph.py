@@ -1256,23 +1256,29 @@ def _safety(mint: str, explain: bool = False) -> str:
 
 
 def _onchain_metrics(mint: str, explain: bool = False) -> str:
-    """live holder and trade counts. http only, called again every time."""
+    """live holder and trade counts. jupiter + tracker, called again every time."""
     if not mint:
         return "onchain: unavailable"
     try:
-        return fetch_onchain_metrics(mint, explain=explain)
+        from archetype.config import get_settings
+
+        key = get_settings().solana_tracker_api_key
+        return fetch_onchain_metrics(mint, key, explain=explain)
     except Exception as exc:  # noqa: BLE001
         log.warning("onchain metrics failed %s: %s", mint, exc)
         return "onchain: unavailable"
 
 
 def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
-    """coins-v2 + charity + fee type. one shot, then the opening card keeps it."""
+    """jupiter + tracker + donate.gg + helius fee modes. one shot, then replayed."""
     if not mint:
         return ""
     rpc = getattr(deps.tools, "rpc", None)
     try:
-        return fetch_coin_snapshot(mint, rpc)
+        from archetype.config import get_settings
+
+        key = get_settings().solana_tracker_api_key
+        return fetch_coin_snapshot(mint, rpc, tracker_api_key=key)
     except Exception as exc:  # noqa: BLE001
         log.warning("coin snapshot failed %s: %s", mint, exc)
         return "coin snapshot: unavailable"
