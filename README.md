@@ -8,11 +8,13 @@ Phase 4 is running: a LangGraph loop on local Ollama `llama3.2:3b`. It searches 
 
 Phase 5 is in progress. Built: market-cap move since the last peek, live metrics, safety, and a Dexscreener check. Still ahead: tracked wallets, vamp, backlog peek, website, X, and Gemini amongst others.
 
+**Venues:** migrations from **PumpSwap**, **Raydium CPMM** (LaunchLab and any launchpad on it — Float, StonkFun, higher.fun, letsbonk, …), and **Meteora DAMM v2** (DBC / Bags, …). Paper fills work on all three AMMs. **OTC desks** is not an AMM: after a filter PASS we look up the mint on otcdesks; if it hits, the agent card gets the reward stock basket.
+
 ## How it works
 
-New Solana coins show up when they migrate. Those arrivals come in through PumpPortal and land in a daemon that stays running.
+New Solana coins show up when they migrate. Pump grads come through PumpPortal; LaunchLab and Meteora DBC grads come through Helius parsed streams. Both land in a daemon that stays running.
 
-The daemon looks the coin up on the chain through Helius and runs a fixed set of checks. Coins that fail are dropped. Coins that pass are handed to a local Ollama agent, along with the basic details of the coin.
+The daemon looks the coin up on the chain through Helius and runs a fixed set of checks. Coins that fail are dropped. Coins that pass are handed to a local Ollama agent, along with the basic details of the coin (amm, launchpad, quote pairing when non-SOL, and OTC basket when listed).
 
 The agent also has a catalogue of tools it can call when it wants to know more. That catalogue is still being built. With what it has, the agent can buy the coin or reject it.
 

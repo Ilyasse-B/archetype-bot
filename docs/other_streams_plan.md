@@ -313,19 +313,38 @@ An Etchy-class coin can be peeked and paper round-tripped.
 
 ## Wave C — OTC desks enrichment
 
-**Outcome:** OTC is not a feed. When a focused mint (any venue) is an OTC desk coin, the agent’s **first** card includes the stock / reward basket list.
+**Status (5 Nov 2026):** Implemented. OTC is venue-agnostic enrichment on filter **PASS** only (not a discovery feed).
 
-#### Steps
+**Outcome:** When a PASSED mint is listed on OTC desks, backlog `coin_info` and the agent’s first card include the reward stock / basket. Non-OTC PASSes unchanged.
 
-1. On first think / snapshot: `GET https://otcdesks.cash/api/coins` (or per-mint if they add one) — no key today
-2. Match mint → attach reward symbol(s) / basket / stock names to coin info (not as socials)
-3. Surface that list prominently on the opening prompt (decision #7)
-4. Do not enqueue from this list alone
-5. Note: some OTC coins are pump, some may be Meteora DBC — enrichment must be venue-agnostic
+### What OTC is (and is not)
+
+- OTC desks is a **fee-routing / rewards overlay**, not an AMM.
+- A coin can trade on **pumpswap, raydium CPMM, or meteora DAMM** (docs: pump launcher + Meteora launcher). The AMM quote is unrelated to the reward basket.
+- There is **no** OTC flag on migrate txs / pool accounts. Membership = HTTP mint lookup.
+
+### API facts (checked 5 Nov 2026)
+
+| Call | Result |
+| --- | --- |
+| `GET https://otcdesks.cash/api/coins` | ~12 newest board rows; `total` ≈ 70k — **do not** use this as the full catalog |
+| `GET https://otcdesks.cash/api/coins?mint={mint}` | Hit → `{coins:[row]}` with `rewardMint`, `rewardSymbol`, `rewardBasket`; miss → `{coins:[]}` |
+| Docs | https://otcdesks.cash/docs — no API key for reads |
+
+### Implementation (locked to the flow above)
+
+1. After on-chain + socials **PASS** in `filters/full.py`, call `metadata/otc.py` → `attach_otc_to_event`
+2. One GET per PASS: `?mint=<coin>`. Empty list → not OTC (no card fields).
+3. On hit: stash `otc`, `otc_reward_symbol`, `otc_basket` (human labels via Jupiter), `otc_basket_mints` on `filter_metrics` → backlog `coin_info`
+4. Agent card (`llm/graph.py`): `otc_basket: Name (TICKER), …`. Separate from AMM `pairing:`. Snapshot uses `coin_type: OTC stocks basket` and omits `fee_split` (OTC reward wallet).
+5. Do **not** enqueue from the OTC list alone; do **not** query OTC on rejects / raw migrations
 
 #### Done when
 
-An OTC mint in focus shows the paired stocks / basket on the first agent card; non-OTC coins unchanged.
+- [x] PASS path queries `?mint=`
+- [x] OTC hit → basket on backlog + agent card
+- [x] Non-OTC PASS → no otc fields
+- [x] Docs / README updated
 
 ---
 
@@ -350,7 +369,7 @@ An OTC mint in focus shows the paired stocks / basket on the first agent card; n
 | **M5** | B2 | LaunchLab CPMM trade (all quotes) | M4 |
 | **M6** | B3 | Meteora DAMM trade (all quotes) | M4 |
 | **M7** | B4 | Wave B live gate | M5 + M6 |
-| **M8** | C | OTC stock/basket on first prompt | M7 |
+| **M8** | C | OTC stock/basket on PASS → agent card (**done 5 Nov 2026**) | M7 |
 | **M9** | Polish | Docs, config, follow CLI, optional paid streams | as needed |
 
 Next implementation instruction should start at **M1** (A0 + A1).

@@ -103,6 +103,13 @@ def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
         "description": (meta.get("description") or "")[:500] or None,
         "deployer": metrics.get("deployer"),
         "pool_address": metrics.get("pool"),
+        # wave C — otc desks basket (only set when mint lookup hits)
+        "otc": bool(metrics.get("otc")),
+        "otc_category": metrics.get("otc_category"),
+        "otc_reward_symbol": metrics.get("otc_reward_symbol"),
+        "otc_reward_mint": metrics.get("otc_reward_mint"),
+        "otc_basket": metrics.get("otc_basket"),
+        "otc_basket_mints": metrics.get("otc_basket_mints"),
     }
 
 

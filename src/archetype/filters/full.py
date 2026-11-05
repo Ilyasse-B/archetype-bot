@@ -62,15 +62,30 @@ def run_full_filters(
         log.info("FILTER REJECT %s — %s", event.mint, reason)
         return result
 
-    fees = float(result.metrics.get("estimated_global_fees_sol") or 0)
+    # wave C — only on PASS: mint lookup on otcdesks (empty = not otc)
+    try:
+        from archetype.metadata.otc import attach_otc_to_event
+
+        otc = attach_otc_to_event(event)
+        if otc is not None:
+            result.metrics.update(otc.to_metrics())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("otc enrichment skipped %s: %s", event.mint, exc)
+        result.metrics["otc"] = False
+        result.metrics["otc_error"] = str(exc)
+
+    fees = result.metrics.get("estimated_global_fees_sol")
+    fees_s = f"{float(fees):.2f}" if fees is not None else "-"
     fees_note = " fees=CHECK" if result.metrics.get("fees_check_needed") else ""
+    otc_note = " otc=yes" if result.metrics.get("otc") else ""
     log.info(
-        "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL%s socials=%s name=%s",
+        "FILTER PASS %s — mcap=$%.0f fees~%sSOL%s socials=%s name=%s%s",
         event.mint,
         float(result.metrics.get("market_cap_usd") or 0),
-        fees,
+        fees_s,
         fees_note,
         ",".join(gate.socials_present) or "-",
-        (meta.name or "?")[:32],
+        (meta.name or event.name or "?")[:32],
+        otc_note,
     )
     return result

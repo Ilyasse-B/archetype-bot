@@ -23,11 +23,12 @@ from langgraph.runtime import Runtime
 
 from archetype.execution.wallet import get_position
 from archetype.llm.choices import decision_format, decision_from_message
-from archetype.metadata.snapshot import fetch_coin_snapshot
 from archetype.llm.client import exc_text
+from archetype.llm.coin_prompt import assemble_trader_prompt, render_coin_block
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
 from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
+from archetype.metadata.snapshot import fetch_coin_snapshot
 from archetype.backlog.store import update_latest_coin_info
 from archetype.tools.dex import dex_text, fetch_dex, merge_dex_links
 from archetype.tools.onchain import fetch_onchain_metrics
@@ -96,12 +97,17 @@ def _fmt_num(val: float) -> str:
 
 
 def load_system_prompt(settings: Any | None = None) -> str:
-    """standing trader instructions, with the buy-size settings filled in."""
+    """
+    trader.md template with {{COIN}} / phase markers still in place.
+
+    coin + phase are filled per think via assemble_trader_prompt.
+    """
     raw = PROMPT_PATH.read_text(encoding="utf-8").strip()
     if settings is None:
         from archetype.config import get_settings
 
         settings = get_settings()
+    # keep legacy placeholders working if someone re-adds buy-size text
     repl = {
         "{{MCAP_SMALL}}": _fmt_num(settings.buy_mcap_small_usd),
         "{{MCAP_MID}}": _fmt_num(settings.buy_mcap_mid_usd),
@@ -114,61 +120,9 @@ def load_system_prompt(settings: Any | None = None) -> str:
     return raw
 
 
-# dropped once the coin is owned. buying and rejecting would just confuse it.
-_LOCKED_DROP = (
-    "Before you have bought, action is buy, reject, or wait.\n"
-    "wait means you have not bought. You are looking at this coin again later. "
-    "Do not say you are holding it.\n\n",
-    "When you want to buy a given coin, the buy will not go through until you specify "
-    "profit_pct and loss_pct in that same JSON object. profit_pct is the take-profit "
-    "percentage which will automatically carry out in the background, once the target "
-    "is reached, any number above 0. loss_pct is the stop-loss percentage, which also "
-    "carry out in the background once this stop loss target is reached, any number above "
-    "0 and below 100. You do not need to choose the buy size. The system will set it "
-    "for you already based on the market cap.\n\n",
-    '{"action":"buy","narrative":"what the coin is","reasoning":"why buy",'
-    '"profit_pct":"a suitable take-profit percentage, e.g. 50",'
-    '"loss_pct":"a suitable stop-loss percentage, e.g. 25"}\n',
-    '{"action":"reject","narrative":"what the coin is","reasoning":"why skip"}\n',
-    '{"action":"wait","narrative":"what the coin is","reasoning":"why look again later. not bought."}\n',
-)
-
-
-def prompt_for_phase(prompt: str, phase: str) -> str:
-    """full prompt while searching. after a buy, the buy / wait / reject bits go."""
-    if phase != "locked":
-        return prompt
-    return _locked_prompt(prompt)
-
-
-def _locked_prompt(prompt: str) -> str:
-    """same standing text, minus the actions that only exist before a buy."""
-    text = prompt
-    for block in _LOCKED_DROP:
-        if block not in text:
-            log.warning("locked prompt is missing a block, left the full text")
-            return prompt
-        text = text.replace(block, "")
-    text = text.replace(
-        "hold does not change them.",
-        "hold does not change them. You can also call tools. They are listed below.",
-        1,
-    )
-    text = text.replace(
-        "A tool does not buy, sell, wait, or reject.",
-        "A tool does not hold, sell, or change your levels.",
-    )
-    text = text.replace(
-        "Call it before you buy, and again if you have held a long time.",
-        "Call it again if you have held a long time.",
-    )
-    text = text.replace(
-        "(buy, reject, wait, hold, or a tool)",
-        "(hold, revise_tpsl, sell, or a tool)",
-    )
-    while "\n\n\n" in text:
-        text = text.replace("\n\n\n", "\n\n")
-    return text.strip()
+def prompt_for_phase(prompt: str, phase: str, *, coin_block: str = "") -> str:
+    """inject this coin's fields and keep only searching or locked actions."""
+    return assemble_trader_prompt(prompt, phase=phase, coin_block=coin_block)
 
 
 def load_thesis_prompt() -> str:
@@ -577,19 +531,24 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         since_last_sec=since.get("since_last_sec"),
     )
     required = _required_sol(deps, state)
+    # opening = static coin field block (injected into system prompt). not a user card.
     opening = (getattr(window, "opening", None) or "").strip()
     onchain = ""
     if not opening:
-        # first look at this coin. later thinks replay this card as-is.
-        # metrics stay off the card. they would go stale on the replay.
-        snapshot = await asyncio.to_thread(_coin_snapshot, mint, deps)
-        opening = _static_card(state, required, snapshot)
+        is_otc = bool(isinstance(coin, dict) and coin.get("otc"))
+        snapshot = await asyncio.to_thread(_coin_snapshot, mint, deps, is_otc)
+        opening = render_coin_block(
+            mint=mint,
+            coin=coin if isinstance(coin, dict) else None,
+            buy_sol=required,
+            snapshot=snapshot,
+        )
         if mint:
             deps.memory.set_opening(mint, opening)
         onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
-    base_prompt = prompt_for_phase(deps.prompt, phase)
+    system_prompt = prompt_for_phase(deps.prompt, phase, coin_block=opening)
     messages, seen = _messages(
-        _prompt_with_pairing(base_prompt, coin if isinstance(coin, dict) else None),
+        system_prompt,
         state,
         peek,
         window,
@@ -1269,7 +1228,7 @@ def _onchain_metrics(mint: str, explain: bool = False) -> str:
         return "onchain: unavailable"
 
 
-def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
+def _coin_snapshot(mint: str, deps: LoopDeps, otc: bool = False) -> str:
     """jupiter + tracker + donate.gg + helius fee modes. one shot, then replayed."""
     if not mint:
         return ""
@@ -1278,97 +1237,10 @@ def _coin_snapshot(mint: str, deps: LoopDeps) -> str:
         from archetype.config import get_settings
 
         key = get_settings().solana_tracker_api_key
-        return fetch_coin_snapshot(mint, rpc, tracker_api_key=key)
+        return fetch_coin_snapshot(mint, rpc, tracker_api_key=key, otc=otc)
     except Exception as exc:  # noqa: BLE001
         log.warning("coin snapshot failed %s: %s", mint, exc)
         return "coin snapshot: unavailable"
-
-
-_WSOL = "So11111111111111111111111111111111111111112"
-
-# only appended when the focused coin is non-SOL quoted (saves tokens otherwise)
-_PAIRING_NOTE = (
-    "pairing names the other token in this coin's pool (full name and ticker). "
-    "Use it as context for the narrative: a thematically related pairing can "
-    "support the story, an unrelated one can weaken it. It is a signal, not a rule."
-)
-
-
-def _amm_from_venue(venue: Any) -> str | None:
-    """venue key → agent-facing amm label."""
-    from archetype.filters.thresholds import AMM_BY_VENUE
-
-    if not venue:
-        return None
-    return AMM_BY_VENUE.get(str(venue), str(venue))
-
-
-def _launchpad_fallback(venue: Any, mint: Any) -> str | None:
-    """when platform was never set — pure pump / raydium / meteora launch."""
-    from archetype.ingest.platform import launchpad_for_event
-
-    if not venue:
-        return None
-    return launchpad_for_event(
-        venue=str(venue),
-        platform=None,
-        mint=str(mint) if mint else None,
-    )
-
-
-def _is_paired_coin(coin: dict[str, Any] | None) -> bool:
-    """true when quote is set and not WSOL."""
-    if not isinstance(coin, dict):
-        return False
-    quote = coin.get("quote_mint")
-    return bool(quote) and quote != _WSOL
-
-
-def _pairing_label(coin: dict[str, Any]) -> str:
-    """'Dogecoin (DOGE)' — name first, ticker in parens when we have both."""
-    name = (coin.get("quote_name") or "").strip() or None
-    symbol = (coin.get("quote_symbol") or "").strip() or None
-    if name and symbol:
-        return f"{name} ({symbol})"
-    return name or symbol or "unknown"
-
-
-def _prompt_with_pairing(prompt: str, coin: dict[str, Any] | None) -> str:
-    """add the pairing blurb only for non-SOL quoted coins."""
-    if not _is_paired_coin(coin):
-        return prompt
-    return f"{prompt.rstrip()}\n\n{_PAIRING_NOTE}"
-
-
-def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") -> str:
-    """fields that do not move. saved on the first think and replayed after that."""
-    coin = state.get("coin") or {}
-    lines = [
-        f"mint: {state.get('mint')}",
-        f"name: {coin.get('name') or ''}",
-        f"symbol: {coin.get('symbol') or ''}",
-        f"socials: {coin.get('socials_present') or []}",
-    ]
-    # amm + launchpad — always shown so the agent knows where it came from
-    amm = coin.get("amm") or _amm_from_venue(coin.get("venue"))
-    launchpad = coin.get("launchpad") or coin.get("platform") or _launchpad_fallback(
-        coin.get("venue"), coin.get("mint") or state.get("mint")
-    )
-    if amm:
-        lines.append(f"amm: {amm}")
-    if launchpad:
-        lines.append(f"launchpad: {launchpad}")
-    if _is_paired_coin(coin):
-        lines.append(f"pairing: {_pairing_label(coin)}")
-    desc = str(coin.get("description") or "")[:400]
-    if desc:
-        lines.append(f"description: {desc}")
-    if buy_sol is not None:
-        lines.append(f"required_buy_sol: {buy_sol}")
-    extra = (snapshot or "").strip()
-    if extra:
-        lines.append(extra)
-    return "\n".join(lines)
 
 
 def _narrative_visible(events: list[Any], summary: str) -> bool:
@@ -1390,7 +1262,7 @@ def _delta(
     """
     only what changed since the last think.
 
-    the first card already has mint, name, symbol, socials, and the coin snapshot.
+    static coin fields live in the system prompt. this user message is live state.
     phase, a flat bag, and an empty summary are said once, then skipped.
     """
     lines: list[str] = []
@@ -1458,18 +1330,14 @@ def _messages(
     onchain: str = "",
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """
-    system prompt and the static card are the first think.
+    system prompt already has this coin's fields + phase actions.
 
-    every later call replays those two, then a short user message of what changed
-    plus the last 5 events. the system text is not pasted again.
+    user message is only the live delta (mcap, onchain first look, events).
     """
-    card = (opening or getattr(window, "opening", None) or "").strip()
-    if not card:
-        card = _static_card(state, buy_sol)
+    del buy_sol, opening  # coin block is already baked into `prompt`
     delta, seen = _delta(state, peek, window, since, onchain)
     return [
         {"role": "system", "content": prompt},
-        {"role": "user", "content": card},
         {"role": "user", "content": delta},
     ], seen
 

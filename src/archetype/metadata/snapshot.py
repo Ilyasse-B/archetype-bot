@@ -46,11 +46,15 @@ def fetch_coin_snapshot(
     rpc: HeliusRpc | None = None,
     tracker_api_key: str = "",
     timeout: float = 12.0,
+    *,
+    otc: bool = False,
 ) -> str:
     """
     text block for the first prompt.
 
     fails soft. a miss on one source leaves that line unknown / omitted.
+    otc=True → coin_type is "OTC stocks basket" and fee_split is omitted
+    (that wallet is just otc's reward router, not useful to the agent).
     """
     mint = (mint or "").strip()
     if not mint:
@@ -74,8 +78,12 @@ def fetch_coin_snapshot(
     if rpc is not None and rpc.enabled:
         fee_split, agent_bps = _onchain_modes(rpc, mint)
 
+    # otc fee share points at their reward wallet — hide it from the card
+    if otc:
+        fee_split = None
+
     have_market = isinstance(jup, dict) or isinstance(tracker, dict) or isinstance(ath, dict)
-    if not have_market and not charity and not fee_split and agent_bps is None:
+    if not have_market and not charity and not fee_split and agent_bps is None and not otc:
         return "coin snapshot: unavailable"
 
     return _render(
@@ -89,6 +97,7 @@ def fetch_coin_snapshot(
         fee_split=fee_split,
         agent_bps=agent_bps,
         modes_known=isinstance(tracker, dict),
+        otc=otc,
     )
 
 
@@ -182,6 +191,7 @@ def _render(
     fee_split: list[tuple[str, int]] | None,
     agent_bps: int | None,
     modes_known: bool,
+    otc: bool = False,
 ) -> str:
     """short lines for the model."""
     ath_usd = None
@@ -197,7 +207,7 @@ def _render(
         f"volume_1h_usd: {_usd(vol_1h)}",
         f"liquidity_usd: {_usd(liq)}",
         f"created: {created}",
-        f"coin_type: {_coin_type(cashback, holder_reward, charity, fee_split, agent_bps, modes_known)}",
+        f"coin_type: {_coin_type(cashback, holder_reward, charity, fee_split, agent_bps, modes_known, otc=otc)}",
     ]
     if fee_split:
         bits = ", ".join(f"{addr} {bps / 100:g}%" for addr, bps in fee_split)
@@ -269,8 +279,13 @@ def _coin_type(
     fee_split: list[tuple[str, int]] | None,
     agent_bps: int | None,
     modes_known: bool,
+    *,
+    otc: bool = False,
 ) -> str:
     """which fee / launch modes are on. mayhem left out on purpose."""
+    # otc replaces the generic "fee redirect" label — basket is on the card
+    if otc:
+        return "OTC stocks basket"
     kinds: list[str] = []
     if cashback:
         kinds.append("cashback")
