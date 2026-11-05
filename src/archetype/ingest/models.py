@@ -1,11 +1,12 @@
 """
 normalized migration event from pumpportal (or later other sources).
 
-field notes for later venues (wave B+):
+field notes:
   coin_mint  — the graduated token (authoritative). `mint` aliases this.
   quote_mint — what the pool is paired against (WSOL, PUMP, xStock, …)
-  venue      — pump | launchlab | meteora_dbc | unknown
-  platform   — optional launchpad label (e.g. StonkFun); unused on classic pump
+  venue      — pump | launchlab | meteora_dbc | unknown  (routing key)
+  platform   — launchpad label (Float, Bags, StonkFun, …); agent card also
+               gets amm (pumpswap/raydium/meteora) + launchpad derived from this
 """
 
 from __future__ import annotations

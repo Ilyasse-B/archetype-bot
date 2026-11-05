@@ -1,8 +1,8 @@
 """
-repair pumpportal frames where `mint` is actually the quote.
+repair migration frames so coin_mint / quote_mint / pool are authoritative.
 
-custom-quote graduations often put PUMP / an xStock / USDC in `mint`.
-the migrate signature has the real coin (migrate_v2 account 2) and quote (3).
+pumpportal custom-quote frames often put the quote in `mint`.
+helius launchlab / meteora frames already carry the migrate sig — decode it.
 """
 
 from __future__ import annotations
@@ -11,9 +11,17 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from archetype.filters.decode import (
+    decode_migrate_to_cpswap_accounts,
+    decode_migration_damm_v2_accounts,
+)
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.thresholds import PUMP_PROGRAM, WSOL_MINT
-from archetype.ingest.models import MigrationEvent
+from archetype.ingest.models import MigrationEvent, Venue
+from archetype.ingest.platform import (
+    enrich_launchlab_platform,
+    guess_platform_heuristic,
+)
 
 log = logging.getLogger("archetype.repair")
 
@@ -63,16 +71,22 @@ def decode_migrate_v2_accounts(tx: dict[str, Any]) -> tuple[str, str, str] | Non
 
 def repair_migration_event(event: MigrationEvent, rpc: HeliusRpc) -> RepairOutcome:
     """
-    fix coin/quote on a pumpportal event using the migrate signature.
+    fix coin/quote/pool/platform using the migrate signature (+ launchlab http).
 
-    wave A: only decodes pump migrate_v2. launchlab/meteora wait for wave B.
     never invents a coin from the quote alone — no sig / no decode → reject
     when the payload mint looks like a shared quote.
     """
-    # non-pump venues: leave alone for now (filters will reject wrong pool owner)
-    if event.venue not in ("pump", "unknown"):
-        return RepairOutcome(event=event)
+    venue = event.venue or "unknown"
 
+    if venue in ("launchlab", "meteora_dbc"):
+        return _repair_non_pump(event, rpc, venue)
+
+    # pump / unknown — try pump migrate_v2 first, then launchlab/meteora
+    return _repair_pumpish(event, rpc)
+
+
+def _repair_pumpish(event: MigrationEvent, rpc: HeliusRpc) -> RepairOutcome:
+    """classic pump path; may reclassify if the sig is actually launchlab/meteora."""
     sig = (event.signature or "").strip()
     payload_mint = event.mint
 
@@ -85,6 +99,7 @@ def repair_migration_event(event: MigrationEvent, rpc: HeliusRpc) -> RepairOutco
                     f"(payload mint looks like quote {payload_mint[:8]}…)"
                 ),
             )
+        _apply_platform_defaults(event)
         return RepairOutcome(event=event)
 
     try:
@@ -99,36 +114,192 @@ def repair_migration_event(event: MigrationEvent, rpc: HeliusRpc) -> RepairOutco
                 event=event,
                 reject_reason=f"migrate tx not found for repair (sig={sig[:16]}…)",
             )
+        _apply_platform_defaults(event)
         return RepairOutcome(event=event)
 
     decoded = decode_migrate_v2_accounts(tx)
-    if decoded is None:
-        if _looks_like_shared_quote(payload_mint):
+    if decoded is not None:
+        coin, quote, pool = decoded
+        out = _apply_decoded(
+            event, coin, quote, pool, venue="pump", payload_mint=payload_mint
+        )
+        _apply_platform_defaults(out.event)
+        return out
+
+    # pumpportal sometimes tags wrong — try other migrate ixs on same sig
+    decoded = decode_migrate_to_cpswap_accounts(tx)
+    if decoded is not None:
+        coin, quote, pool = decoded
+        out = _apply_decoded(
+            event, coin, quote, pool, venue="launchlab", payload_mint=payload_mint
+        )
+        _enrich_launchlab(out.event)
+        return out
+
+    decoded = decode_migration_damm_v2_accounts(tx)
+    if decoded is not None:
+        coin, quote, pool = decoded
+        out = _apply_decoded(
+            event, coin, quote, pool, venue="meteora_dbc", payload_mint=payload_mint
+        )
+        _enrich_meteora_platform(out.event)
+        return out
+
+    if _looks_like_shared_quote(payload_mint):
+        return RepairOutcome(
+            event=event,
+            reject_reason="no migrate accounts in migrate tx",
+        )
+    _apply_platform_defaults(event)
+    return RepairOutcome(event=event)
+
+
+def _repair_non_pump(
+    event: MigrationEvent,
+    rpc: HeliusRpc,
+    venue: Venue,
+) -> RepairOutcome:
+    """launchlab / meteora — decode migrate ix, then platform label."""
+    sig = (event.signature or "").strip()
+    payload_mint = event.mint
+
+    if not sig:
+        # may already have real mint from parsed stream — still need pool
+        if venue == "launchlab":
+            _enrich_launchlab(event)
+        else:
+            _enrich_meteora_platform(event)
+        if not event.pool:
             return RepairOutcome(
                 event=event,
-                reject_reason="no pump migrate_v2 accounts in migrate tx",
+                reject_reason="missing migrate signature for non-pump venue",
             )
         return RepairOutcome(event=event)
 
+    try:
+        tx = rpc.get_transaction(sig)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("repair getTransaction failed %s: %s", sig[:16], exc)
+        tx = None
+
+    if not tx:
+        if venue == "launchlab":
+            _enrich_launchlab(event)
+        else:
+            _enrich_meteora_platform(event)
+        return RepairOutcome(event=event)
+
+    decoded: tuple[str, str, str] | None = None
+    if venue == "launchlab":
+        decoded = decode_migrate_to_cpswap_accounts(tx)
+    else:
+        decoded = decode_migration_damm_v2_accounts(tx)
+
+    # allow cross-decode if venue guess was wrong
+    if decoded is None and venue == "launchlab":
+        decoded = decode_migration_damm_v2_accounts(tx)
+        if decoded is not None:
+            venue = "meteora_dbc"
+    if decoded is None and venue == "meteora_dbc":
+        decoded = decode_migrate_to_cpswap_accounts(tx)
+        if decoded is not None:
+            venue = "launchlab"
+
+    if decoded is None:
+        if venue == "launchlab":
+            _enrich_launchlab(event)
+        else:
+            _enrich_meteora_platform(event)
+        return RepairOutcome(event=event)
+
     coin, quote, pool = decoded
-    changed = coin != payload_mint or event.quote_mint != quote
+    out = _apply_decoded(event, coin, quote, pool, venue=venue, payload_mint=payload_mint)
+    if out.event.venue == "launchlab":
+        _enrich_launchlab(out.event)
+    else:
+        _enrich_meteora_platform(out.event)
+    return out
+
+
+def _apply_decoded(
+    event: MigrationEvent,
+    coin: str,
+    quote: str,
+    pool: str,
+    *,
+    venue: Venue,
+    payload_mint: str,
+) -> RepairOutcome:
+    """stamp coin/quote/pool/venue onto the event."""
+    changed = (
+        coin != payload_mint
+        or event.quote_mint != quote
+        or event.venue != venue
+        or (pool and event.pool != pool)
+    )
     event.coin_mint = coin
     event.mint = coin
     event.quote_mint = quote
-    event.venue = "pump"
-    # prefer on-chain pool pubkey over pumpportal's "pump-amm" tag
-    if pool and (not event.pool or event.pool.lower() in {"pump", "pump-amm", "pumpswap"}):
+    event.venue = venue
+    if pool and (not event.pool or _is_tag_pool(event.pool)):
         event.pool = pool
-
     if changed:
         log.info(
-            "repaired mint %s… → coin=%s… quote=%s… pool=%s…",
+            "repaired mint %s… → coin=%s… quote=%s… venue=%s pool=%s…",
             payload_mint[:8],
             coin[:8],
             quote[:8],
+            venue,
             (pool or "?")[:8],
         )
     return RepairOutcome(event=event, repaired=changed)
+
+
+def _enrich_launchlab(event: MigrationEvent) -> None:
+    """pull platform + migrate amm id from raydium mint api."""
+    platform, pool, quote = enrich_launchlab_platform(event.mint)
+    if platform and not event.platform:
+        event.platform = platform
+    if pool and (not event.pool or _is_tag_pool(event.pool)):
+        event.pool = pool
+    if quote and (not event.quote_mint or event.quote_mint == WSOL_MINT):
+        # only overwrite default WSOL when api gives a real quote
+        if quote != WSOL_MINT or event.quote_mint == WSOL_MINT:
+            event.quote_mint = quote
+    if not event.platform:
+        event.platform = guess_platform_heuristic(event.mint, "launchlab")
+
+
+def _enrich_meteora_platform(event: MigrationEvent) -> None:
+    """bags etc — no raydium row; heuristic / leave blank → pure meteora."""
+    if event.platform:
+        return
+    event.platform = guess_platform_heuristic(event.mint, "meteora_dbc")
+
+
+def _apply_platform_defaults(event: MigrationEvent) -> None:
+    """pump coins get launchpad=pump unless something else set it."""
+    if event.venue == "pump" and not event.platform:
+        event.platform = "pump"
+
+
+def _is_tag_pool(pool: str) -> bool:
+    """pumpportal sends tags like pump-amm / raydium-cpmm instead of pubkeys."""
+    p = (pool or "").lower()
+    if not p:
+        return True
+    return p in {
+        "pump",
+        "pump-amm",
+        "pumpswap",
+        "raydium",
+        "raydium-cpmm",
+        "cpmm",
+        "meteora",
+        "meteora-dbc",
+        "damm",
+        "dbc",
+    }
 
 
 def _looks_like_shared_quote(mint: str) -> bool:

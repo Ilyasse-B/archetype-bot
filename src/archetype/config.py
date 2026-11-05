@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # lock loop task — off so the human trade stream keeps the backlog
     agent_loop_enabled: bool = False
 
+    # wave B migration feeds (helius parsed streams → launchlab / meteora)
+    ingest_launchlab: bool = True
+    ingest_meteora_dbc: bool = True
+
     # fixed buy size from migration mcap. the prompt and the buy path both use these.
     buy_mcap_small_usd: float = 50_000
     buy_mcap_mid_usd: float = 125_000
@@ -131,6 +135,8 @@ def get_settings() -> Settings:
         "ollama_timeout_sec",
         "ollama_num_thread",
         "agent_loop_enabled",
+        "ingest_launchlab",
+        "ingest_meteora_dbc",
         "buy_mcap_small_usd",
         "buy_mcap_mid_usd",
         "buy_sol_small",

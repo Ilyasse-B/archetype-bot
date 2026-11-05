@@ -1,7 +1,8 @@
 """
-deterministic single-pass filters for a pump.fun migration event.
+deterministic single-pass filters for a migration event.
 
-runs once per mint right after pumpportal fires — not continuous metrics.
+runs once per mint right after a feed fires — not continuous metrics.
+venue-aware: pump keeps bonding-curve + birdeye fees; launchlab/meteora skip those.
 """
 
 from __future__ import annotations
@@ -24,27 +25,36 @@ from archetype.filters.decode import (
     extract_pool_from_migrate_tx,
     parse_bonding_curve,
     parse_mint_json_parsed,
-    parse_pool,
+    parse_pool_by_owner,
     PoolInfo,
+    venue_for_pool_owner,
 )
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
 from archetype.filters.thresholds import (
+    ALLOWED_DECIMALS_NON_PUMP,
     DANGEROUS_TOKEN2022_EXTENSIONS,
     DEFAULT_THRESHOLDS,
     EXPECTED_DECIMALS,
     FilterThresholds,
     MAX_UI_SUPPLY,
+    METEORA_DAMM_V2_PROGRAM,
     MIN_UI_SUPPLY,
     PUMP_AMM_PROGRAM,
+    RAYDIUM_CPMM_PROGRAM,
     SAFE_TOKEN2022_EXTENSIONS,
     TOKEN_2022_PROGRAM,
     WSOL_MINT,
 )
 from archetype.ingest.models import MigrationEvent
+from archetype.ingest.platform import amm_for_venue, launchpad_for_event
 from archetype.price.convert import quote_meta, quote_ui_to_sol, quote_ui_to_usd, vault_quote_ui
 
 log = logging.getLogger("archetype.filters")
+
+_AMM_OWNERS = frozenset(
+    {PUMP_AMM_PROGRAM, RAYDIUM_CPMM_PROGRAM, METEORA_DAMM_V2_PROGRAM}
+)
 
 
 @dataclass
@@ -73,13 +83,14 @@ def run_onchain_filters(
     """
     evaluate one migration (on-chain only).
 
-    order: cheap blacklist → mint → (fast-fail) → tx/pool → curve/deployer → birdeye fees → mcap.
-    hard mint fails / obvious junk bail before expensive polls.
-    set finalize=False if a caller (e.g. socials gate) will log the final outcome.
+    order: cheap blacklist → mint → tx/pool → (pump: curve/fees) → mcap.
     """
     ensure_blacklist_tables(ledger_path)
     result = FilterResult(passed=True, mint=event.mint)
     mint = event.mint
+
+    if not mint or mint == "pending":
+        return _reject(result, ledger_path, "mint still unresolved after repair", finalize=finalize)
 
     # --- blacklist ---
     bad, why = is_mint_blacklisted(ledger_path, mint)
@@ -88,7 +99,7 @@ def run_onchain_filters(
             result, ledger_path, f"mint blacklisted: {why or 'no reason'}", finalize=finalize
         )
 
-    # --- mint account (retry — pumpportal can beat rpc visibility) ---
+    # --- mint account ---
     mint_acct = _wait_account(rpc, mint, encoding="jsonParsed", attempts=8, delay=0.35)
     if not mint_acct:
         return _reject(result, ledger_path, "mint account missing", finalize=finalize)
@@ -112,8 +123,17 @@ def run_onchain_filters(
         result.fail("mint authority still enabled")
     if mint_info.freeze_authority is not None:
         result.fail("freeze authority still enabled")
-    if mint_info.decimals != EXPECTED_DECIMALS:
-        result.fail(f"unexpected decimals={mint_info.decimals} (want {EXPECTED_DECIMALS})")
+
+    venue = event.venue or "pump"
+    if venue == "pump":
+        if mint_info.decimals != EXPECTED_DECIMALS:
+            result.fail(f"unexpected decimals={mint_info.decimals} (want {EXPECTED_DECIMALS})")
+    elif mint_info.decimals not in ALLOWED_DECIMALS_NON_PUMP:
+        result.fail(
+            f"unexpected decimals={mint_info.decimals} "
+            f"(want {sorted(ALLOWED_DECIMALS_NON_PUMP)})"
+        )
+
     if not (MIN_UI_SUPPLY <= mint_info.supply_ui <= MAX_UI_SUPPLY):
         result.fail(f"supply_ui out of range: {mint_info.supply_ui}")
 
@@ -127,31 +147,34 @@ def run_onchain_filters(
         if dangerous:
             result.fail(f"dangerous token-2022 extensions: {dangerous}")
         if unknown:
-            # unknown = fail-closed for now
             result.fail(f"unknown token-2022 extensions: {unknown}")
-    elif mint_info.token_program not in {TOKEN_2022_PROGRAM, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}:
-        # allow classic SPL too
+    elif mint_info.token_program not in {
+        TOKEN_2022_PROGRAM,
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    }:
         from archetype.filters.thresholds import TOKEN_PROGRAM
 
         if mint_info.token_program != TOKEN_PROGRAM:
             result.fail(f"unknown token program: {mint_info.token_program}")
 
-    # hard mint fails → bail before getTransaction / pool poll / fee poll
     if not result.passed:
         return _done(result, ledger_path, finalize=finalize)
 
-    # --- migrate tx first (this is the graduation proof) ---
     quote_mint = event.quote_mint or WSOL_MINT
     result.metrics["quote_mint"] = quote_mint
-    result.metrics["venue"] = event.venue
+    result.metrics["venue"] = venue
+    result.metrics["amm"] = amm_for_venue(venue)
+    launchpad = launchpad_for_event(venue=venue, platform=event.platform, mint=mint)
+    result.metrics["launchpad"] = launchpad
     if event.platform:
         result.metrics["platform"] = event.platform
 
-    pool_addr: str | None = None
+    pool_addr: str | None = event.pool if event.pool and len(event.pool) >= 32 else None
     quote_ui = 0.0
-    quote_sol = 0.0  # SOL-equivalent of quote vault (for floors + mcap)
+    quote_sol = 0.0
     base_ui = 0.0
     migrate_ok = False
+
     if event.signature:
         tx = rpc.get_transaction(event.signature)
         if not tx:
@@ -162,9 +185,11 @@ def run_onchain_filters(
                 result.fail(f"migrate tx failed: {err}")
             else:
                 migrate_ok = True
-                pool_addr, quote_ui, base_ui = extract_pool_from_migrate_tx(
+                found_pool, quote_ui, base_ui = extract_pool_from_migrate_tx(
                     tx, mint, quote_mint=quote_mint
                 )
+                if not pool_addr:
+                    pool_addr = found_pool
                 result.metrics["migrate_slot"] = tx.get("slot")
                 result.metrics["pool_quote_ui_at_migrate"] = quote_ui
                 result.metrics["pool_base_ui_at_migrate"] = base_ui
@@ -179,41 +204,44 @@ def run_onchain_filters(
                         result.metrics["quote_symbol"] = qm.symbol
                         result.metrics["quote_name"] = qm.name
                 except Exception as exc:  # noqa: BLE001
-                    result.fail(f"quote→SOL convert failed: {exc}")
+                    # non-pump may still recover liquidity from live vaults
+                    if venue == "pump":
+                        result.fail(f"quote→SOL convert failed: {exc}")
+                    else:
+                        result.metrics["quote_convert_error"] = str(exc)
     else:
         result.fail("missing migrate signature")
 
-    # liquidity floor: WSOL uses SOL units; other quotes use USD ≡ min_pool_sol * sol_usd
-    if result.passed and quote_mint == WSOL_MINT:
-        if quote_sol < thresholds.min_pool_sol:
-            result.fail(
-                f"pool SOL at migrate too low: {quote_sol:.4f} "
-                f"(min {thresholds.min_pool_sol})"
-            )
-    elif result.passed:
-        try:
-            sol_usd = get_sol_usd(rpc)
-            min_usd = thresholds.min_pool_sol * sol_usd
-            quote_usd = float(result.metrics.get("pool_quote_usd_at_migrate") or 0)
-            if quote_usd < min_usd:
+    # liquidity floor from migrate snapshot when we have it
+    if result.passed and quote_ui > 0:
+        if quote_mint == WSOL_MINT:
+            if quote_sol < thresholds.min_pool_sol:
                 result.fail(
-                    f"pool quote liquidity too low: ${quote_usd:,.2f} "
-                    f"(min ${min_usd:,.2f} ≈ {thresholds.min_pool_sol} SOL)"
+                    f"pool SOL at migrate too low: {quote_sol:.4f} "
+                    f"(min {thresholds.min_pool_sol})"
                 )
-        except Exception as exc:  # noqa: BLE001
-            result.fail(f"liquidity floor check failed: {exc}")
+        else:
+            try:
+                sol_usd = get_sol_usd(rpc)
+                min_usd = thresholds.min_pool_sol * sol_usd
+                quote_usd = float(result.metrics.get("pool_quote_usd_at_migrate") or 0)
+                if quote_usd < min_usd:
+                    result.fail(
+                        f"pool quote liquidity too low: ${quote_usd:,.2f} "
+                        f"(min ${min_usd:,.2f} ≈ {thresholds.min_pool_sol} SOL)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                result.fail(f"liquidity floor check failed: {exc}")
 
     if not pool_addr:
-        result.fail("could not resolve pumpswap pool from migrate tx")
+        result.fail("could not resolve pool from migrate tx")
     else:
         result.metrics["pool"] = pool_addr
 
-    # already dead from migrate snapshot → skip the pool poll and the fee read
     if not result.passed:
         result.metrics["pool_poll_skipped"] = "already failing after migrate snapshot"
         return _done(result, ledger_path, finalize=finalize)
 
-    # poll pool account only while still a candidate
     pool_attempts = max(
         1, int(thresholds.pool_poll_sec / max(thresholds.pool_poll_interval_sec, 0.1)) + 1
     )
@@ -234,135 +262,148 @@ def run_onchain_filters(
             mint,
             pool_addr[:8],
         )
-    elif pool_acct.get("owner") != PUMP_AMM_PROGRAM:
-        result.fail(f"pool owner not Pump AMM: {pool_acct.get('owner')}")
-        return _done(result, ledger_path, finalize=finalize)
     else:
+        owner = pool_acct.get("owner") or ""
+        expected = _expected_owner(venue)
+        if owner not in _AMM_OWNERS:
+            result.fail(f"pool owner not a known amm: {owner}")
+            return _done(result, ledger_path, finalize=finalize)
+        if expected and owner != expected:
+            # reclassify if the account tells a clearer story
+            inferred = venue_for_pool_owner(owner)
+            if inferred:
+                venue = inferred
+                event.venue = inferred  # type: ignore[assignment]
+                result.metrics["venue"] = venue
+                result.metrics["amm"] = amm_for_venue(venue)
+            else:
+                result.fail(f"pool owner mismatch for venue={venue}: {owner}")
+                return _done(result, ledger_path, finalize=finalize)
+
         result.metrics["pool_account_pending"] = False
         try:
-            pool = parse_pool(pool_addr, pool_acct["data"][0])
+            pool = parse_pool_by_owner(
+                pool_addr, owner, pool_acct["data"][0], coin_mint=mint
+            )
         except Exception as exc:  # noqa: BLE001
             result.fail(f"pool parse failed: {exc}")
             return _done(result, ledger_path, finalize=finalize)
-        else:
-            result.metrics["pool_creator"] = pool.creator
-            result.metrics["coin_creator"] = pool.coin_creator
-            result.metrics["lp_mint"] = pool.lp_mint
-            result.metrics["lp_supply"] = pool.lp_supply
 
-            if pool.base_mint != mint:
-                result.fail("pool base_mint mismatch")
-            # any quote is fine for pump — just must match what repair found
-            if pool.quote_mint != quote_mint:
+        result.metrics["pool_creator"] = pool.creator
+        result.metrics["coin_creator"] = pool.coin_creator
+        result.metrics["lp_mint"] = pool.lp_mint
+        result.metrics["lp_supply"] = pool.lp_supply
+
+        if pool.base_mint != mint:
+            result.fail("pool base_mint mismatch")
+        if pool.quote_mint != quote_mint:
+            # trust on-chain pool if event quote was still default WSOL
+            if quote_mint == WSOL_MINT and pool.quote_mint != WSOL_MINT:
+                quote_mint = pool.quote_mint
+                event.quote_mint = quote_mint
+                result.metrics["quote_mint"] = quote_mint
+            else:
                 result.fail(
                     f"pool quote_mint mismatch: pool={pool.quote_mint} "
                     f"event={quote_mint}"
                 )
-            result.metrics["pool_quote_mint"] = pool.quote_mint
-            if not result.passed:
-                return _done(result, ledger_path, finalize=finalize)
+        result.metrics["pool_quote_mint"] = pool.quote_mint
+        if not result.passed:
+            return _done(result, ledger_path, finalize=finalize)
 
+        if venue == "pump":
             lp_ok, lp_note = _check_lp_burned(pool)
             result.metrics["lp_burn_check"] = lp_note
             if not lp_ok:
                 result.fail(lp_note)
                 return _done(result, ledger_path, finalize=finalize)
+        else:
+            result.metrics["lp_burn_check"] = "skipped (non-pump venue)"
 
-            # stash pool for later price resolves (cache)
-            try:
-                from archetype.price.cache import cache_put
-                from archetype.price.resolve import ResolvedPool
-
-                cache_put(
-                    ResolvedPool(
-                        mint=mint,
-                        pool=pool,
-                        decimals=mint_info.decimals,
-                        supply_ui=mint_info.supply_ui,
-                        name=event.name,
-                        symbol=event.symbol,
-                    ),
-                    ledger_path=ledger_path,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug("pool cache put skipped: %s", exc)
-
-            base_bal, quote_bal = _poll_token_balances(
-                rpc,
-                pool.pool_base_token_account,
-                pool.pool_quote_token_account,
-                timeout_sec=min(3.0, thresholds.pool_poll_sec),
-                interval_sec=0.6,
-            )
-            if base_bal is None and quote_bal is None:
-                result.metrics["live_vaults_note"] = (
-                    "skipped (vault accounts not visible after poll)"
-                )
-            else:
-                live_base = float((base_bal or {}).get("uiAmount") or 0)
-                live_quote_ui = vault_quote_ui(quote_bal)
-                result.metrics["live_pool_base_ui"] = live_base
-                result.metrics["live_pool_quote_ui"] = live_quote_ui
-                try:
-                    result.metrics["live_pool_sol"] = quote_ui_to_sol(
-                        rpc, pool.quote_mint, live_quote_ui
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    result.metrics["live_pool_sol"] = 0.0
-                    result.metrics["live_pool_sol_error"] = str(exc)
-
-    # --- bonding curve (deployer only) ---
-    # NOTE: we do NOT gate on curve.complete anymore.
-    curve_addr = bonding_curve_pda(mint)
-    curve = None
-    curve_acct = _wait_account(rpc, curve_addr, encoding="base64", attempts=6, delay=0.4)
-    if curve_acct:
         try:
-            curve = parse_bonding_curve(curve_addr, curve_acct["data"][0])
-        except Exception as exc:  # noqa: BLE001
-            return _reject(
-                result, ledger_path, f"bonding curve parse failed: {exc}", finalize=finalize
+            from archetype.price.cache import cache_put
+            from archetype.price.resolve import ResolvedPool
+
+            cache_put(
+                ResolvedPool(
+                    mint=mint,
+                    pool=pool,
+                    decimals=mint_info.decimals,
+                    supply_ui=mint_info.supply_ui,
+                    name=event.name,
+                    symbol=event.symbol,
+                    venue=venue,
+                ),
+                ledger_path=ledger_path,
             )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("pool cache put skipped: %s", exc)
 
-    if curve is not None:
-        result.metrics["bonding_curve"] = curve_addr
-        result.metrics["curve_complete"] = curve.complete  # informational only
-        result.metrics["deployer"] = curve.creator
+        base_bal, quote_bal = _poll_token_balances(
+            rpc,
+            pool.pool_base_token_account,
+            pool.pool_quote_token_account,
+            timeout_sec=min(3.0, thresholds.pool_poll_sec),
+            interval_sec=0.6,
+        )
+        if base_bal is None and quote_bal is None:
+            result.metrics["live_vaults_note"] = (
+                "skipped (vault accounts not visible after poll)"
+            )
+        else:
+            live_base = float((base_bal or {}).get("uiAmount") or 0)
+            live_quote_ui = vault_quote_ui(quote_bal)
+            result.metrics["live_pool_base_ui"] = live_base
+            result.metrics["live_pool_quote_ui"] = live_quote_ui
+            live_sol = 0.0
+            try:
+                live_sol = quote_ui_to_sol(rpc, pool.quote_mint, live_quote_ui)
+                result.metrics["live_pool_sol"] = live_sol
+                # backfill migrate liquidity if snapshot was empty
+                if base_ui <= 0 and live_base > 0:
+                    base_ui = live_base
+                if quote_sol <= 0 and live_sol > 0:
+                    quote_sol = live_sol
+                    result.metrics["pool_sol_at_migrate"] = quote_sol
+                    result.metrics["pool_quote_ui_at_migrate"] = live_quote_ui
+            except Exception as exc:  # noqa: BLE001
+                result.metrics["live_pool_sol"] = 0.0
+                result.metrics["live_pool_sol_error"] = str(exc)
 
-        bad, why = is_deployer_blacklisted(ledger_path, curve.creator)
-        if bad:
-            result.fail(f"deployer blacklisted: {why or 'no reason'}")
+            # liquidity floor from live vaults when migrate snapshot lacked balances
+            if result.passed and float(result.metrics.get("pool_sol_at_migrate") or 0) <= 0:
+                try:
+                    if pool.quote_mint == WSOL_MINT:
+                        if live_sol < thresholds.min_pool_sol:
+                            result.fail(
+                                f"live pool SOL too low: {live_sol:.4f} "
+                                f"(min {thresholds.min_pool_sol})"
+                            )
+                    else:
+                        sol_usd = get_sol_usd(rpc)
+                        min_usd = thresholds.min_pool_sol * sol_usd
+                        q_usd = quote_ui_to_usd(rpc, pool.quote_mint, live_quote_ui)
+                        if q_usd < min_usd:
+                            result.fail(
+                                f"live pool quote liquidity too low: ${q_usd:,.2f} "
+                                f"(min ${min_usd:,.2f})"
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    result.fail(f"live liquidity floor check failed: {exc}")
+
+    # --- pump-only: bonding curve deployer + birdeye fees ---
+    if venue == "pump":
+        curve_ok = _pump_curve_and_fees(
+            event, rpc, ledger_path, result, thresholds, migrate_ok=migrate_ok
+        )
+        if not curve_ok:
             return _done(result, ledger_path, finalize=finalize)
-    elif migrate_ok:
-        result.fail("could not read bonding curve for deployer checks")
-        return _done(result, ledger_path, finalize=finalize)
     else:
-        return _reject(
-            result, ledger_path, "bonding curve account missing", finalize=finalize
-        )
+        result.metrics["fees_method"] = "skipped (non-pump venue)"
+        result.metrics["estimated_global_fees_sol"] = None
+        result.metrics["fees_check_needed"] = False
 
-    # --- global fees (birdeye indexed — replaces old vault estimate) ---
-    try:
-        fees_sol = fetch_global_fees_paid(mint)
-    except Exception as exc:  # noqa: BLE001
-        result.fail(f"global fees unavailable: {exc}")
-        return _done(result, ledger_path, finalize=finalize)
-
-    result.metrics["estimated_global_fees_sol"] = fees_sol
-    result.metrics["fees_method"] = "birdeye token_overview global_fees_paid"
-    # cleared 2 SOL but still under the warn bar → yellow CHECK in --trade
-    fees_check = fees_sol < thresholds.fees_warn_below_sol
-    result.metrics["fees_check_needed"] = fees_check
-    result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
-
-    if fees_sol < thresholds.min_global_fees_sol:
-        result.fail(
-            f"global fees too low: {fees_sol:.4f} SOL "
-            f"(min {thresholds.min_global_fees_sol})"
-        )
-        return _done(result, ledger_path, finalize=finalize)
-
-    # --- market cap (prefer migrate snapshot so we filter at graduation) ---
+    # --- market cap ---
     try:
         sol_usd = get_sol_usd(rpc)
         result.metrics["sol_usd"] = sol_usd
@@ -383,6 +424,73 @@ def run_onchain_filters(
         result.fail(f"market cap calc failed: {exc}")
 
     return _done(result, ledger_path, finalize=finalize)
+
+
+def _pump_curve_and_fees(
+    event: MigrationEvent,
+    rpc: HeliusRpc,
+    ledger_path: Path,
+    result: FilterResult,
+    thresholds: FilterThresholds,
+    *,
+    migrate_ok: bool,
+) -> bool:
+    """bonding curve deployer + birdeye global fees. false → caller should _done."""
+    mint = event.mint
+    curve_addr = bonding_curve_pda(mint)
+    curve = None
+    curve_acct = _wait_account(rpc, curve_addr, encoding="base64", attempts=6, delay=0.4)
+    if curve_acct:
+        try:
+            curve = parse_bonding_curve(curve_addr, curve_acct["data"][0])
+        except Exception as exc:  # noqa: BLE001
+            result.fail(f"bonding curve parse failed: {exc}")
+            return False
+
+    if curve is not None:
+        result.metrics["bonding_curve"] = curve_addr
+        result.metrics["curve_complete"] = curve.complete
+        result.metrics["deployer"] = curve.creator
+        bad, why = is_deployer_blacklisted(ledger_path, curve.creator)
+        if bad:
+            result.fail(f"deployer blacklisted: {why or 'no reason'}")
+            return False
+    elif migrate_ok:
+        result.fail("could not read bonding curve for deployer checks")
+        return False
+    else:
+        result.fail("bonding curve account missing")
+        return False
+
+    try:
+        fees_sol = fetch_global_fees_paid(mint)
+    except Exception as exc:  # noqa: BLE001
+        result.fail(f"global fees unavailable: {exc}")
+        return False
+
+    result.metrics["estimated_global_fees_sol"] = fees_sol
+    result.metrics["fees_method"] = "birdeye token_overview global_fees_paid"
+    fees_check = fees_sol < thresholds.fees_warn_below_sol
+    result.metrics["fees_check_needed"] = fees_check
+    result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
+
+    if fees_sol < thresholds.min_global_fees_sol:
+        result.fail(
+            f"global fees too low: {fees_sol:.4f} SOL "
+            f"(min {thresholds.min_global_fees_sol})"
+        )
+        return False
+    return True
+
+
+def _expected_owner(venue: str) -> str | None:
+    if venue == "pump":
+        return PUMP_AMM_PROGRAM
+    if venue == "launchlab":
+        return RAYDIUM_CPMM_PROGRAM
+    if venue == "meteora_dbc":
+        return METEORA_DAMM_V2_PROGRAM
+    return None
 
 
 def _wait_account(
@@ -437,15 +545,10 @@ def _poll_token_balances(
 
 
 def _check_lp_burned(pool: PoolInfo) -> tuple[bool, str]:
-    """
-    use already-fetched pool.lp_supply — no extra helius call.
-
-    pump migrate burns LP; lp_supply 0 (or tiny) is the usual signal.
-    """
+    """use already-fetched pool.lp_supply — no extra helius call."""
     lp_supply = int(pool.lp_supply or 0)
     if lp_supply == 0:
         return True, "lp_supply=0 (burned/ok)"
-    # soft pass — historical heuristic always passed after largest-accounts too
     return True, f"lp_supply={lp_supply} (ok; no extra rpc)"
 
 
@@ -463,13 +566,15 @@ def _done(
         log_filter_reject(ledger_path, result.mint, reason)
         log.info("FILTER REJECT %s — %s", result.mint, reason)
     else:
-        fees = float(result.metrics.get("estimated_global_fees_sol") or 0)
+        fees = result.metrics.get("estimated_global_fees_sol")
+        fees_s = f"{float(fees):.2f}" if fees is not None else "-"
         fees_note = " fees=CHECK" if result.metrics.get("fees_check_needed") else ""
         log.info(
-            "FILTER PASS %s — mcap=$%.0f fees~%.2fSOL%s pool=%.2fSOL",
+            "FILTER PASS %s — venue=%s mcap=$%.0f fees~%sSOL%s pool=%.2fSOL",
             result.mint,
+            result.metrics.get("venue"),
             float(result.metrics.get("market_cap_usd") or 0),
-            fees,
+            fees_s,
             fees_note,
             float(result.metrics.get("pool_sol_at_migrate") or 0),
         )

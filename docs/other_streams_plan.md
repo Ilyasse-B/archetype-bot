@@ -225,19 +225,23 @@ Before any LaunchLab / Meteora work:
 
 ## Wave B — LaunchLab + Meteora
 
+**Status (5 Nov 2026):** B1–B3 implemented in code. B4 (live gate vs your terminal) is on you — do not wait for a live graduation in CI; example coins (Float / higher.fun / Bags) verify decode + price offline.
+
 Same “coins of different types” rule. Discovery for both can land together; trading can follow venue by venue inside the wave, but both must clear an end-to-end gate before Wave C.
 
-### B1 — Helius log feeds (discovery)
+Agent card fields: `amm` (`pumpswap` | `raydium` | `meteora`) + `launchpad` (platform name, or `pump` / `raydium` / `meteora` for pure launches).
+
+### B1 — Helius parsed streams (discovery)
 
 **Outcome:** Graduations PumpPortal misses (especially Meteora; also LaunchLab) enter the same backlog.
 
 #### Steps
 
-1. Add `src/archetype/ingest/helius_logs.py`:
-   - `logsSubscribe` on LaunchLab `LanMV9s…` and Meteora DBC `dbcij3…`
-2. On log mentioning `MigrateToCpswap` / `migration_damm_v2` / `migrate_meteora_damm`:
-   - `getTransaction` (`maxSupportedTransactionVersion: 1`)
-   - decode → `coin_mint`, `quote_mint`, `pool`, `venue`
+1. Add `src/archetype/ingest/helius_migrations.py`:
+   - Prefer `parsedTransactionSubscribe` (Gatekeeper) on LaunchLab `LanMV9s…` + Meteora DBC `dbcij3…` with migrate instruction names
+   - Fallback: `logsSubscribe` + client-side migrate log filter
+2. On each migrate notification:
+   - decode accounts (or `getTransaction`) → `coin_mint`, `quote_mint`, `pool`, `venue`
 3. Dedup against PumpPortal by signature and by mint
 4. LaunchLab platform label: `GET https://launch-mint-v1.raydium.io/get/by/mints?ids={mint}` (no key) → `platformInfo.name`
 5. Wire feed start/stop into daemon lifespan; config flags `ingest_launchlab`, `ingest_meteora_dbc` (both on by default once Wave B ships)

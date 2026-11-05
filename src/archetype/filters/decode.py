@@ -1,5 +1,8 @@
 """
-decode mint / bonding curve / pumpswap pool bits from helius data.
+decode mint / bonding curve / amm pool bits from helius data.
+
+pumpswap + raydium cpmm + meteora damm v2 all normalize into PoolInfo
+so price/fills can stay venue-agnostic at the vault layer.
 """
 
 from __future__ import annotations
@@ -12,8 +15,12 @@ from typing import Any
 from solders.pubkey import Pubkey
 
 from archetype.filters.thresholds import (
+    LAUNCHLAB_PROGRAM,
+    METEORA_DAMM_V2_PROGRAM,
+    METEORA_DBC_PROGRAM,
     PUMP_AMM_PROGRAM,
     PUMP_PROGRAM,
+    RAYDIUM_CPMM_PROGRAM,
     TOKEN_2022_PROGRAM,
     TOKEN_PROGRAM,
     WSOL_MINT,
@@ -159,6 +166,186 @@ def parse_pool(address: str, data_b64: str) -> PoolInfo:
         coin_creator=coin_creator,
         index=index,
     )
+
+
+def parse_cpmm_pool(
+    address: str,
+    data_b64: str,
+    *,
+    coin_mint: str | None = None,
+) -> PoolInfo:
+    """
+    raydium cpmm pool → PoolInfo oriented around the graduated coin.
+
+    layout (live pools): vault0@72 vault1@104 mint0@168 mint1@200.
+    token0/token1 order is sorted by mint — coin may be either side.
+    """
+    data = base64.b64decode(data_b64)
+    if len(data) < 232:
+        raise ValueError(f"cpmm pool too short: {len(data)}")
+    vault0 = str(Pubkey.from_bytes(data[72:104]))
+    vault1 = str(Pubkey.from_bytes(data[104:136]))
+    mint0 = str(Pubkey.from_bytes(data[168:200]))
+    mint1 = str(Pubkey.from_bytes(data[200:232]))
+    base_mint, quote_mint, base_ata, quote_ata = _orient_pair(
+        mint0, mint1, vault0, vault1, coin_mint=coin_mint
+    )
+    return PoolInfo(
+        address=address,
+        creator="",
+        base_mint=base_mint,
+        quote_mint=quote_mint,
+        lp_mint="",
+        pool_base_token_account=base_ata,
+        pool_quote_token_account=quote_ata,
+        lp_supply=0,
+        coin_creator=None,
+        index=0,
+    )
+
+
+def parse_damm_v2_pool(
+    address: str,
+    data_b64: str,
+    *,
+    coin_mint: str | None = None,
+) -> PoolInfo:
+    """
+    meteora damm v2 pool → PoolInfo.
+
+    layout (live pools): mint0@168 mint1@200 vault0@232 vault1@264.
+    """
+    data = base64.b64decode(data_b64)
+    if len(data) < 296:
+        raise ValueError(f"damm v2 pool too short: {len(data)}")
+    mint0 = str(Pubkey.from_bytes(data[168:200]))
+    mint1 = str(Pubkey.from_bytes(data[200:232]))
+    vault0 = str(Pubkey.from_bytes(data[232:264]))
+    vault1 = str(Pubkey.from_bytes(data[264:296]))
+    base_mint, quote_mint, base_ata, quote_ata = _orient_pair(
+        mint0, mint1, vault0, vault1, coin_mint=coin_mint
+    )
+    return PoolInfo(
+        address=address,
+        creator="",
+        base_mint=base_mint,
+        quote_mint=quote_mint,
+        lp_mint="",
+        pool_base_token_account=base_ata,
+        pool_quote_token_account=quote_ata,
+        lp_supply=0,
+        coin_creator=None,
+        index=0,
+    )
+
+
+def parse_pool_by_owner(
+    address: str,
+    owner: str,
+    data_b64: str,
+    *,
+    coin_mint: str | None = None,
+) -> PoolInfo:
+    """dispatch pool parse from account owner program id."""
+    if owner == PUMP_AMM_PROGRAM:
+        return parse_pool(address, data_b64)
+    if owner == RAYDIUM_CPMM_PROGRAM:
+        return parse_cpmm_pool(address, data_b64, coin_mint=coin_mint)
+    if owner == METEORA_DAMM_V2_PROGRAM:
+        return parse_damm_v2_pool(address, data_b64, coin_mint=coin_mint)
+    raise ValueError(f"unknown pool owner program: {owner}")
+
+
+def venue_for_pool_owner(owner: str) -> str | None:
+    """map amm program → ingest venue key."""
+    if owner == PUMP_AMM_PROGRAM:
+        return "pump"
+    if owner == RAYDIUM_CPMM_PROGRAM:
+        return "launchlab"
+    if owner == METEORA_DAMM_V2_PROGRAM:
+        return "meteora_dbc"
+    return None
+
+
+def decode_migrate_to_cpswap_accounts(tx: dict[str, Any]) -> tuple[str, str, str] | None:
+    """
+    launchlab migrate_to_cpswap → (coin_mint, quote_mint, cpmm_pool).
+
+    idl: [1]=base_mint [2]=quote_mint [5]=cpswap_pool (live float migrate matches).
+    """
+    for accts in _iter_program_ix_accounts(tx, LAUNCHLAB_PROGRAM):
+        if len(accts) < 6:
+            continue
+        coin = str(accts[1])
+        quote = str(accts[2])
+        pool = str(accts[5])
+        # index 4 is the cpswap program id itself — skip those
+        if pool == RAYDIUM_CPMM_PROGRAM:
+            continue
+        if coin and quote and pool:
+            return coin, quote, pool
+    return None
+
+
+def decode_migration_damm_v2_accounts(tx: dict[str, Any]) -> tuple[str, str, str] | None:
+    """
+    meteora migration_damm_v2 → (coin_mint, quote_mint, damm_pool).
+
+    docs / plan: [4]=pool [13]=base_mint [14]=quote_mint.
+    """
+    for accts in _iter_program_ix_accounts(tx, METEORA_DBC_PROGRAM):
+        if len(accts) < 15:
+            continue
+        pool = str(accts[4])
+        coin = str(accts[13])
+        quote = str(accts[14])
+        if pool in {METEORA_DBC_PROGRAM, METEORA_DAMM_V2_PROGRAM}:
+            # wrong slot — try next matching ix
+            continue
+        if coin and quote and pool:
+            return coin, quote, pool
+    return None
+
+
+def _orient_pair(
+    mint0: str,
+    mint1: str,
+    vault0: str,
+    vault1: str,
+    *,
+    coin_mint: str | None,
+) -> tuple[str, str, str, str]:
+    """pick base=coin side; default token0 as base when unknown."""
+    if coin_mint and coin_mint == mint1:
+        return mint1, mint0, vault1, vault0
+    if coin_mint and coin_mint == mint0:
+        return mint0, mint1, vault0, vault1
+    # no hint — treat mint0 as base (price still works; just labels swap)
+    return mint0, mint1, vault0, vault1
+
+
+def _iter_program_ix_accounts(tx: dict[str, Any], program_id: str) -> list[list[str]]:
+    """top-level + inner instruction account lists for one program."""
+    out: list[list[str]] = []
+    msg = (tx.get("transaction") or {}).get("message") or {}
+    for ix in msg.get("instructions") or []:
+        if not isinstance(ix, dict):
+            continue
+        if ix.get("programId") != program_id:
+            continue
+        accts = ix.get("accounts") or []
+        if accts:
+            out.append([str(a) for a in accts])
+    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
+        for ix in group.get("instructions") or []:
+            if not isinstance(ix, dict):
+                continue
+            if ix.get("programId") != program_id:
+                continue
+            accts = ix.get("accounts") or []
+            if accts:
+                out.append([str(a) for a in accts])
+    return out
 
 
 def extract_pool_from_migrate_tx(

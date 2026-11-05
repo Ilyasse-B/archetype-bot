@@ -19,7 +19,7 @@ from archetype.filters.sol_price import get_sol_usd
 from archetype.filters.thresholds import WSOL_MINT
 from archetype.price.convert import quote_meta, quote_ui_to_sol
 from archetype.price.models import PriceTick, build_tick
-from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
+from archetype.price.resolve import ResolvedPool, resolve_pool
 from archetype.price.snapshot import fetch_price_tick
 
 log = logging.getLogger("archetype.price")
@@ -45,7 +45,7 @@ async def aiter_price_ticks_ws(
     if not rpc.enabled:
         raise RuntimeError("ARCHETYPE_HELIUS_API_KEY not set")
 
-    resolved = resolved or resolve_pumpswap_pool(
+    resolved = resolved or resolve_pool(
         rpc,
         mint,
         known_pool=known_pool,

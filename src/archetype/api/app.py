@@ -33,6 +33,7 @@ from archetype.db import db_exists_and_ok
 from archetype.filters import run_full_filters
 from archetype.filters.helius import HeliusRpc
 from archetype.ingest import MigrationBuffer, MigrationEvent, PumpPortalMigrationFeed
+from archetype.ingest.helius_migrations import HeliusMigrationFeed, MigrationDeduper
 from archetype.execution import ensure_wallet
 from archetype.execution.tpsl import TpslEngine
 from archetype.price.live import LivePrices
@@ -97,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     buffer = MigrationBuffer(maxlen=200, on_change=_publish_migration)
     rpc = HeliusRpc(settings.helius_api_key)
     ledger = settings.resolved_trading_ledger_db()
+    deduper = MigrationDeduper()
 
     async def _filter_hook(event: MigrationEvent) -> MigrationEvent:
         """repair mint → run deterministic filters off the event loop; enqueue PASS."""
@@ -123,6 +125,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 log.info("FILTER REJECT %s — %s", ev.mint, outcome.reject_reason)
                 return ev
 
+            # cross-feed mint dedupe after repair (sig already marked by helius feed)
+            if deduper.mark_mint(ev.mint):
+                ev.filter_passed = False
+                ev.filter_reasons = ["duplicate migration (mint already seen)"]
+                ev.filter_metrics = {
+                    "deduped": True,
+                    "venue": ev.venue,
+                    "signature": ev.signature,
+                }
+                log.info("FILTER SKIP dup %s sig=%s…", ev.mint, (ev.signature or "?")[:16])
+                return ev
+            # pumpportal path: also mark sig so a later helius echo is dropped
+            deduper.mark_signature(ev.signature)
+
             result = run_full_filters(ev, rpc, ledger)
             ev.filter_passed = result.passed
             ev.filter_reasons = list(result.reasons)
@@ -137,6 +153,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         api_key=settings.pumpportal_api_key,
         buffer=buffer,
         on_migration=_filter_hook if rpc.enabled else None,
+    )
+    helius_feed = HeliusMigrationFeed(
+        api_key=settings.helius_api_key,
+        buffer=buffer,
+        enable_launchlab=settings.ingest_launchlab,
+        enable_meteora_dbc=settings.ingest_meteora_dbc,
+        on_migration=_filter_hook if rpc.enabled else None,
+        deduper=deduper,
     )
 
     @asynccontextmanager
@@ -158,10 +182,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.agent_loop = agent_loop
         await tpsl.start()
         await feed.start()
+        await helius_feed.start()
         if settings.agent_loop_enabled:
             await agent_loop.start()
         yield
         await agent_loop.stop()
+        await helius_feed.stop()
         await feed.stop()
         await tpsl.stop()
         rpc.close()
@@ -171,6 +197,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.started_at = datetime.now(timezone.utc)
     app.state.migration_buffer = buffer
     app.state.pumpportal_feed = feed
+    app.state.helius_migration_feed = helius_feed
     app.state.helius_rpc = rpc
     app.state.live = hub
 

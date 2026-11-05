@@ -1294,6 +1294,28 @@ _PAIRING_NOTE = (
 )
 
 
+def _amm_from_venue(venue: Any) -> str | None:
+    """venue key → agent-facing amm label."""
+    from archetype.filters.thresholds import AMM_BY_VENUE
+
+    if not venue:
+        return None
+    return AMM_BY_VENUE.get(str(venue), str(venue))
+
+
+def _launchpad_fallback(venue: Any, mint: Any) -> str | None:
+    """when platform was never set — pure pump / raydium / meteora launch."""
+    from archetype.ingest.platform import launchpad_for_event
+
+    if not venue:
+        return None
+    return launchpad_for_event(
+        venue=str(venue),
+        platform=None,
+        mint=str(mint) if mint else None,
+    )
+
+
 def _is_paired_coin(coin: dict[str, Any] | None) -> bool:
     """true when quote is set and not WSOL."""
     if not isinstance(coin, dict):
@@ -1327,13 +1349,15 @@ def _static_card(state: LoopState, buy_sol: float | None, snapshot: str = "") ->
         f"symbol: {coin.get('symbol') or ''}",
         f"socials: {coin.get('socials_present') or []}",
     ]
-    # venue / pair extras — same card shape, just more fields when they matter
-    venue = coin.get("venue")
-    if venue and venue != "pump":
-        lines.append(f"venue: {venue}")
-    platform = coin.get("platform")
-    if platform:
-        lines.append(f"platform: {platform}")
+    # amm + launchpad — always shown so the agent knows where it came from
+    amm = coin.get("amm") or _amm_from_venue(coin.get("venue"))
+    launchpad = coin.get("launchpad") or coin.get("platform") or _launchpad_fallback(
+        coin.get("venue"), coin.get("mint") or state.get("mint")
+    )
+    if amm:
+        lines.append(f"amm: {amm}")
+    if launchpad:
+        lines.append(f"launchpad: {launchpad}")
     if _is_paired_coin(coin):
         lines.append(f"pairing: {_pairing_label(coin)}")
     desc = str(coin.get("description") or "")[:400]

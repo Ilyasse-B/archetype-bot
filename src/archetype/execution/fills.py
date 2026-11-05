@@ -21,7 +21,7 @@ from archetype.execution.track import round_mark
 from archetype.filters.helius import HeliusRpc
 from archetype.filters.sol_price import get_sol_usd
 from archetype.price.models import PriceTick
-from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
+from archetype.price.resolve import ResolvedPool, resolve_pool
 from archetype.price.snapshot import fetch_price_tick, fetch_price_tick_resolved
 
 # dust leftover → treat as full close
@@ -123,7 +123,7 @@ def buy(
         # still resolve pool for position storage if we dont have one
         if resolved is None and (hint_pool or not existing):
             try:
-                resolved = resolve_pumpswap_pool(
+                resolved = resolve_pool(
                     rpc,
                     mint,
                     known_pool=hint_pool or (tick.pool or None),

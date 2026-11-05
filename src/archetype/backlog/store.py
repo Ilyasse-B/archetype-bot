@@ -75,6 +75,10 @@ def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
         "quote_name": metrics.get("quote_name"),
         "venue": event.venue,
         "platform": event.platform or metrics.get("platform"),
+        "amm": metrics.get("amm"),
+        "launchpad": metrics.get("launchpad")
+        or event.platform
+        or metrics.get("platform"),
         "name": event.name,
         "symbol": event.symbol,
         "signature": event.signature,

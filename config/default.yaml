@@ -19,6 +19,10 @@ ollama_num_thread: 0
 # start ollama first, then POST /agent/loop/start (or set this true and restart).
 agent_loop_enabled: false
 
+# wave B — helius parsed streams for launchlab + meteora dbc graduations
+ingest_launchlab: true
+ingest_meteora_dbc: true
+
 # buy size is fixed from the migration mcap. prompt and the buy path both read these.
 buy_mcap_small_usd: 50000
 buy_mcap_mid_usd: 125000

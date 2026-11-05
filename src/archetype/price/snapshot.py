@@ -12,7 +12,7 @@ from archetype.filters.sol_price import get_sol_usd
 from archetype.filters.thresholds import WSOL_MINT
 from archetype.price.convert import quote_meta, quote_ui_to_sol, vault_quote_ui
 from archetype.price.models import PriceTick, build_tick
-from archetype.price.resolve import ResolvedPool, resolve_pumpswap_pool
+from archetype.price.resolve import ResolvedPool, resolve_pool
 
 log = logging.getLogger("archetype.price")
 
@@ -25,6 +25,7 @@ def fetch_price_tick(
     sol_usd: float | None = None,
     source: str = "rpc",
     known_pool: str | None = None,
+    venue: str | None = None,
     name: str | None = None,
     symbol: str | None = None,
     ledger_path: Path | None = None,
@@ -38,10 +39,11 @@ def fetch_price_tick(
     for non-WSOL quotes, quote vault is converted to SOL-equivalent so
     price_sol / wallet math stay SOL-denominated.
     """
-    pool_res = resolved or resolve_pumpswap_pool(
+    pool_res = resolved or resolve_pool(
         rpc,
         mint,
         known_pool=known_pool,
+        venue=venue,
         name=name,
         symbol=symbol,
         ledger_path=ledger_path,
@@ -98,10 +100,11 @@ def fetch_price_tick_resolved(
     name = kwargs.get("name")
     symbol = kwargs.get("symbol")
     if resolved is None:
-        resolved = resolve_pumpswap_pool(
+        resolved = resolve_pool(
             rpc,
             mint,
             known_pool=known_pool,
+            venue=kwargs.get("venue"),
             name=name,
             symbol=symbol,
             ledger_path=ledger_path,

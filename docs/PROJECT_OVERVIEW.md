@@ -67,13 +67,13 @@ The product goal is an agent that **simulates a real human memecoin trader**: ov
 | 5 | **IPC** | **FastAPI on localhost** (`127.0.0.1`). |
 | 6 | **X / social (v1)** | Only tweets/accounts linked in coin metadata. Broader X later. |
 | 7 | **Tools** | One tool phase (Phase 5). The short catalogue lives in `trader.md` (name, a rank from 0 to 1, one line, when to call). No separate tools file. Callable so far: `metrics` 0.5, `safety` 0.8, `dex` 0.25. Field notes sit beside the numbers on the first result only. Full list and call rules: `docs/all-tools.md`. Call-control (cooldown, don’t repeat a tool) is later. |
-| 8 | **Data sources (hybrid)** | **PumpPortal** = migrations (incl. non-SOL quote pump pairs after Wave A mint repair). **Helius** = live price, filter RPC, fee-split / tokenized-agent PDAs. **Birdeye** = deterministic filter **global fees** (`token_overview.global_fees_paid`). Metadata URI / DAS = socials and description. First-think **coin snapshot** = Jupiter (volume/liquidity/created) + Solana Tracker (ATH, cashback/holder-reward flags) + Donate.gg (charity) — **no pump.fun frontend HTTP**. Live **metrics** = Jupiter + Solana Tracker. Safety = Rugcheck + Streamflow + Solana Tracker. `dex` = Dexscreener. A failed line says `unavailable`. |
+| 8 | **Data sources (hybrid)** | **PumpPortal** = pump migrations (incl. custom quotes). **Helius parsed streams** = LaunchLab + Meteora DBC graduations. **Helius RPC** = live price, filter RPC. **Birdeye** = pump **global fees** only. Metadata URI / DAS = socials and description. First-think **coin snapshot** = Jupiter + Solana Tracker + Donate.gg — **no pump.fun frontend HTTP**. Live **metrics** = Jupiter + Solana Tracker. Safety = Rugcheck + Streamflow + Solana Tracker. `dex` = Dexscreener. A failed line says `unavailable`. |
 | 9 | **Pre-agent enrich + socials gate** | Always fetch metadata before the agent. **No socials at all → reject.** **Any one** of twitter / telegram / website is enough to pass. |
 | 10 | **Migration backlog** | While busy, queue passed migrations locally (timestamp + coin info). When free, **FIFO from the top**. Same backlog is a **tool** the locked agent can peek for other-coin context (still one trade only). Human trade stream already consumes FIFO via SQLite. |
 | 11 | **Risk (paper)** | Buy size is program-owned from migration mcap: **&lt; $50k → 3 SOL**, **&lt; $125k → 5 SOL**, **≥ $125k → 10 SOL** (missing mcap uses 3). Exact $50k is the 5 SOL band; exact $125k is 10. The model does not pick size. No paper kill-switch. |
 | 12 | **Fine-tuning** | Weekly Unsloth/Colab. Maximize **PnL**. Closed trade: final thesis + PnL + time held + timestamps (+ meta). |
 | 13 | **Live gate** | Net profitable paper week (even 0.1 SOL). |
-| 14 | **Launchpads v1** | **Pump.fun / PumpSwap** for discovery + paper trade, including **custom quote** pairs (PUMP, xStocks, DOGE, AMD bag, …). Paper wallet stays SOL/USD via quote→USD→SOL. LaunchLab / Meteora = Wave B (see `docs/other_streams_plan.md`). |
+| 14 | **Launchpads v1** | **Pump / LaunchLab / Meteora DBC** discovery + paper trade. PumpPortal for pump; Helius `parsedTransactionSubscribe` for LaunchLab→CPMM and Meteora DBC→DAMM v2. Agent card shows `amm` + `launchpad`. Paper wallet stays SOL/USD via quote→USD→SOL. |
 | 15 | **Buy requires predictions** | Buy only if the agent outputs **TP + SL**. Any profit **&gt; 0**. Any stop-loss **&gt; 0 and &lt; 100**. No fixed menus. Size is injected from mcap (row 11). A `wait` or `reject` that also sends percents has those percents dropped. Human CLI can still set TP/SL via `set-profit` / `set-loss`. |
 | 16 | **Exits** | Agent continuously revises TP/SL. Deterministic price/exec hits levels every tick. **Daemon TP/SL auto-exits implemented** (human CLI `set-profit` / `set-loss` + in-watch commands). |
 | 17 | **Price shown to agent** | Latest engine price + % since last check + current unrealized PnL. |
@@ -573,7 +573,7 @@ Unattended daemon; Pump migrations via Helius; rejects logged; single-coin lock;
 - **Helius free-tier WebSockets** for live price / pool updates on the active coin.  
 - **Metadata URI / Helius DAS** once per candidate for off-chain socials (before agent; socials guardrail).
 - **First-think coin snapshot:** Jupiter + Solana Tracker + Donate.gg + Helius fee/agent PDAs. No pump.fun frontend. See Phase 4.
-- **Wave A (other streams):** PumpPortal custom-quote migrations repair mint via migrate tx; filters/price/fills allow any PumpSwap quote; paper PnL in SOL via quote→USD→SOL; agent card shows `pairing: Name (TICKER)` for non-SOL quotes. Plan: `docs/other_streams_plan.md`.
+- **Wave A/B (other streams):** PumpPortal custom-quote migrations repair mint via migrate tx; Helius parsed streams catch LaunchLab + Meteora DBC grads; filters/price/fills cover PumpSwap + Raydium CPMM + Meteora DAMM v2; paper PnL in SOL via quote→USD→SOL; agent card shows `amm`, `launchpad`, and `pairing` when relevant. Plan: `docs/other_streams_plan.md`.
 - **Safety tool:** Rugcheck and Streamflow (no key) plus Solana Tracker (one key). See Phase 5.
 - **Dex tool:** Dexscreener orders and token pairs (no key). The agent sees paid status and active boosts. New links, the image, and the banner are stored on the coin and not shown.
 
@@ -684,7 +684,7 @@ archetype-bot/
 │   ├── cli.py                 # HTTP client + local watch / trade stream
 │   ├── daemon.py              # uvicorn entry
 │   ├── api/                   # FastAPI: status, migrations, backlog, /paper/*, /agent/*
-│   ├── ingest/                # PumpPortal migration feed + buffer
+│   ├── ingest/                # PumpPortal + Helius launchlab/meteora feeds + buffer
 │   ├── filters/               # on-chain deterministic gates + Helius RPC
 │   ├── metadata/              # DAS / URI + socials gate + first-think coin snapshot
 │   ├── backlog/               # migration_backlog FIFO
