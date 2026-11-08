@@ -165,6 +165,9 @@ transcripts/
 *.db-wal
 *.db-shm
 
+# local-only helpers (voiceover copy, scratch tooling — never commit)
+local_scripts/
+
 # Spyder project settings
 .spyderproject
 .spyproject
