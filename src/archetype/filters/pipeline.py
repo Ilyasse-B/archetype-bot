@@ -2,7 +2,7 @@
 deterministic single-pass filters for a migration event.
 
 runs once per mint right after a feed fires — not continuous metrics.
-venue-aware: pump keeps bonding-curve + birdeye fees; launchlab/meteora skip those.
+birdeye global fees apply to every venue. bonding-curve deployer checks stay pump-only.
 """
 
 from __future__ import annotations
@@ -391,17 +391,17 @@ def run_onchain_filters(
                 except Exception as exc:  # noqa: BLE001
                     result.fail(f"live liquidity floor check failed: {exc}")
 
-    # --- pump-only: bonding curve deployer + birdeye fees ---
+    # --- pump-only: bonding curve deployer ---
     if venue == "pump":
-        curve_ok = _pump_curve_and_fees(
-            event, rpc, ledger_path, result, thresholds, migrate_ok=migrate_ok
+        curve_ok = _pump_curve_deployer(
+            event, rpc, ledger_path, result, migrate_ok=migrate_ok
         )
         if not curve_ok:
             return _done(result, ledger_path, finalize=finalize)
-    else:
-        result.metrics["fees_method"] = "skipped (non-pump venue)"
-        result.metrics["estimated_global_fees_sol"] = None
-        result.metrics["fees_check_needed"] = False
+
+    # --- all venues: birdeye global fees (same 2 SOL floor) ---
+    if not _check_global_fees(event.mint, result, thresholds):
+        return _done(result, ledger_path, finalize=finalize)
 
     # --- market cap ---
     try:
@@ -426,16 +426,15 @@ def run_onchain_filters(
     return _done(result, ledger_path, finalize=finalize)
 
 
-def _pump_curve_and_fees(
+def _pump_curve_deployer(
     event: MigrationEvent,
     rpc: HeliusRpc,
     ledger_path: Path,
     result: FilterResult,
-    thresholds: FilterThresholds,
     *,
     migrate_ok: bool,
 ) -> bool:
-    """bonding curve deployer + birdeye global fees. false → caller should _done."""
+    """pump bonding-curve deployer blacklist. false → caller should _done."""
     mint = event.mint
     curve_addr = bonding_curve_pda(mint)
     curve = None
@@ -455,13 +454,20 @@ def _pump_curve_and_fees(
         if bad:
             result.fail(f"deployer blacklisted: {why or 'no reason'}")
             return False
-    elif migrate_ok:
+        return True
+    if migrate_ok:
         result.fail("could not read bonding curve for deployer checks")
         return False
-    else:
-        result.fail("bonding curve account missing")
-        return False
+    result.fail("bonding curve account missing")
+    return False
 
+
+def _check_global_fees(
+    mint: str,
+    result: FilterResult,
+    thresholds: FilterThresholds,
+) -> bool:
+    """birdeye global_fees_paid floor — every venue. false → caller should _done."""
     try:
         fees_sol = fetch_global_fees_paid(mint)
     except Exception as exc:  # noqa: BLE001
@@ -470,8 +476,7 @@ def _pump_curve_and_fees(
 
     result.metrics["estimated_global_fees_sol"] = fees_sol
     result.metrics["fees_method"] = "birdeye token_overview global_fees_paid"
-    fees_check = fees_sol < thresholds.fees_warn_below_sol
-    result.metrics["fees_check_needed"] = fees_check
+    result.metrics["fees_check_needed"] = fees_sol < thresholds.fees_warn_below_sol
     result.metrics["fees_warn_below_sol"] = thresholds.fees_warn_below_sol
 
     if fees_sol < thresholds.min_global_fees_sol:
