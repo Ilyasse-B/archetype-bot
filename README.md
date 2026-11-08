@@ -4,9 +4,13 @@ Local Solana memecoin agent. One coin at a time, paper fills only.
 
 ## Status
 
-Phase 4 is running: a LangGraph loop on local Ollama `llama3.2:3b`. It searches (buy, reject, or wait), then holds, revises levels, or sells, and writes a thesis when the trade closes.
+The project is in progress.
 
-Phase 5 is in progress. Built: market-cap move since the last peek, live metrics, safety, Dexscreener check, tracked wallets (KOL holder tool), Birdeye global-fees floor on every venue, and a separate localhost demo viewer. Still ahead: vamp, backlog peek, website, X, and Gemini amongst others.
+**Already built:** a LangGraph agent loop on local Ollama `llama3.2:3b` (buy, reject, wait, hold, revise TP/SL, sell, thesis), migration ingest, deterministic filters (including Birdeye global-fees on every venue), paper trading across the supported AMMs, live peek / market-cap move since last peek, safety and Dexscreener checks, tracked wallets (KOL holder tool), OTC desks lookups, and a separate localhost demo viewer around the daemon.
+
+**Still to do:** finish the remaining agent tools (vamp, backlog peek, website, X, Gemini, and others), then refine the daemon and agent so they can run reliably for longer stretches.
+
+**After that:** leave the agent running to collect trading data, then train the model on that record (e.g. LoRA) so the weights get better at the job.
 
 **Venues:** migrations from **PumpSwap**, **Raydium CPMM** (LaunchLab and any launchpad on it — Float, StonkFun, higher.fun, letsbonk, …), and **Meteora DAMM v2** (DBC / Bags, …). Paper fills work on all three AMMs. Fee-floor checks run on all three; bonding-curve deployer checks stay pump-specific. **OTC desks** is not an AMM: after a filter PASS we look up the mint on otcdesks; if it hits, the agent card gets the reward stock basket.
 
@@ -22,7 +26,7 @@ After a buy, the agent keeps thinking in a loop. It can call tools again, update
 
 When the trade is over, the agent writes a short thesis: why it bought, and why it did what it did along the way.
 
-Once the tool set is wider and the daemon and agent are in better shape, the agent will be left running for longer stretches so it can collect trading data. After about a week, that record will be used to train the model with LoRA, so the weights can get better at the job.
+The tool catalogue is still being built. After the remaining tools and refinements land, the agent will run for longer periods to collect trading data, then that data will be used to train the model.
 
 ## Setup
 
