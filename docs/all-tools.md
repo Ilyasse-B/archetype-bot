@@ -27,9 +27,9 @@ The catalogue lives in `src/archetype/llm/prompts/trader.md`, under the buy / wa
 
 While the agent is still deciding whether to buy, that prompt includes buy, reject, and wait. After a buy, those examples and the before-buy instructions are removed. The hold paragraph then says the agent can call tools, and the catalogue below is the detail.
 
-One line per tool: the action name, a rank from 0 to 1 (higher matters more), what it returns, and when to call it. No field definitions. `metrics` is 0.5, `safety` is 0.8, `dex` is 0.25. New tools get a line when they are built.
+One line per tool: the action name, a rank from 0 to 1 (higher matters more), what it returns, and when to call it. No field definitions. `metrics` is 0.5, `safety` is 0.8, `dex` is 0.25, `wallets` is 0.4. New tools get a line when they are built.
 
-Field notes are not on the opening card. They sit inline on the first result for that tool, beside each number. `metrics` and `safety` also have one short closing line on how to use the block. `dex` is the two values and their notes, with no extra closing line. A later call for the same tool is the numbers only.
+Field notes are not on the opening card. They sit inline on the first result for that tool, beside each number. `metrics` and `safety` also have one short closing line on how to use the block. `dex` and `wallets` are the values and their notes, with no extra closing line. A later call for the same tool is the numbers only.
 
 A missing key or a failed request is `unavailable` on that line. No second source.
 
@@ -125,12 +125,18 @@ The first result has a short note beside each field. A later result is the two v
 
 Links, the image, and the banner are stored on the backlog coin and are not shown. Websites and socials are added only when the URL is not already stored (`twitter`, `telegram`, `website`, or `extra_links`). `twitter.com` and `x.com` count as the same link. `imageUrl` and `header` are saved under those names. Pair price, market cap, volume, and liquidity are not used.
 
-### 5. Tracked wallets — **both**
+### 5. Tracked wallets — **agent** (built, rank 0.4)
 
-We keep a list of wallets we care about. When a coin is in focus, check whether any of them hold it.
+Action `wallets`. Rank 0.4. Not on the first prompt. The agent asks before or after a buy. Does not count as a search look.
 
-- A hit is pushed into the next think (wallet label + size, not a full holder dump).
-- The agent can ask again later in the trade.
+We keep a scored KOL list in `data/kol_wallets.db` (wallet + rating 0–1). On a call, one Helius `getProgramAccounts` for the mint intersects that list. No Solana Tracker credits on the hot path.
+
+The agent only sees:
+
+- `tracked` — how many wallets from our list hold this coin (balance > 0).
+- `avg_rating` — mean rating of those hits (0–1, higher better). `none` when the count is 0.
+
+No wallet addresses or names. The first result has a short note beside each field (including that this is a weak side signal, not a core buy/sell reason). A later result is the two values only. The recent-events line is the block itself, starting at `wallets:`. A missing Helius key or a failed read is `wallets: unavailable`.
 
 ### 6. Vamp / copycat scan — **agent**
 

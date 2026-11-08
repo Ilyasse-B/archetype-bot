@@ -21,7 +21,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell", "metrics", "safety", "dex"]
+ThinkAction = Literal[
+    "reject", "hold", "buy", "revise_tpsl", "sell", "metrics", "safety", "dex", "wallets"
+]
 
 # tool is named set_tpsl; plan action is revise_tpsl. same thing.
 _ACTION_ALIASES = {
@@ -33,6 +35,8 @@ _ACTION_ALIASES = {
     "rugcheck": "safety",
     "dexscreener": "dex",
     "dex_paid": "dex",
+    "tracked": "wallets",
+    "tracked_wallets": "wallets",
 }
 
 
@@ -220,6 +224,9 @@ def _coerce_payload(data: dict[str, Any]) -> dict[str, Any]:
         "dex",
         "dexscreener",
         "dex_paid",
+        "wallets",
+        "tracked",
+        "tracked_wallets",
     ):
         out.pop("profit_pct", None)
         out.pop("loss_pct", None)

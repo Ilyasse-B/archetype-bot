@@ -35,9 +35,11 @@ Tools. One at a time. A tool does not buy, sell, wait, reject, hold, or change y
 metrics - 0.5 - latest holder count, top holders, and the last 5 minutes of trades. Call it whenever you want updated metrics information on the coin.
 safety - 0.8 - rug score, insider networks, locked supply, bundlers, and fees. Call it before you buy, and again if you have held a long time.
 dex - 0.25 - whether the coin paid for a dexscreener profile, and how many boosts are applied. A sign the people running it care about the coin and improves visibility and trust.
+wallets - 0.4 - how many tracked wallets currently hold this coin, and their average rating (0-1, the higher better). This means other well performing traders currently hold this coin.
 {"action":"metrics","reasoning":"why you want a fresh metrics read"}
 {"action":"safety","reasoning":"why you want a safety read"}
 {"action":"dex","reasoning":"why you want a dex read"}
+{"action":"wallets","reasoning":"why you want a tracked-wallets read"}
 
 Rules:
 - Reasoning is one short sentence. Narrative is one short sentence.

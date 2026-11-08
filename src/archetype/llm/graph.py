@@ -33,6 +33,7 @@ from archetype.backlog.store import update_latest_coin_info
 from archetype.tools.dex import dex_text, fetch_dex, merge_dex_links
 from archetype.tools.onchain import fetch_onchain_metrics
 from archetype.tools.safety import fetch_safety
+from archetype.tools.wallets import fetch_wallets, wallets_text
 from archetype.tools.price_change import since_last_line, since_last_peek
 
 log = logging.getLogger("archetype.graph")
@@ -625,7 +626,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             peek_state,
         )
 
-    if decision.action in ("metrics", "safety", "dex"):
+    if decision.action in ("metrics", "safety", "dex", "wallets"):
         # tool call. fresh http read, and this look does not count.
         return await _refresh_metrics(
             deps,
@@ -1117,12 +1118,16 @@ async def _refresh_metrics(
     peek_state: dict[str, Any],
 ) -> LoopState:
     """
-    agent asked for metrics, safety, or dex.
+    agent asked for metrics, safety, dex, or wallets.
 
     fetch again. do not trade, and do not burn a search look.
     dex also stores new links, the image, and the banner on the coin.
     """
-    kind = decision.action if decision.action in ("metrics", "safety", "dex") else "metrics"
+    kind = (
+        decision.action
+        if decision.action in ("metrics", "safety", "dex", "wallets")
+        else "metrics"
+    )
     _save_think(deps, mint, messages, reply)
     prev = (getattr(window, "summary", None) or "").strip()
     narrative = decision.narrative.strip()
@@ -1131,7 +1136,9 @@ async def _refresh_metrics(
         deps.memory.set_summary(mint, narrative)
     # notes only the first time this tool shows up in the recent window
     prior = list(getattr(window, "events", None) or [])
-    explain = kind in ("safety", "dex") and not any(getattr(ev, "kind", "") == kind for ev in prior)
+    explain = kind in ("safety", "dex", "wallets") and not any(
+        getattr(ev, "kind", "") == kind for ev in prior
+    )
     coin = dict(state.get("coin") or {})
     if kind == "dex":
         read = await asyncio.to_thread(fetch_dex, mint)
@@ -1140,6 +1147,8 @@ async def _refresh_metrics(
         ledger = getattr(deps.tools, "ledger_path", None)
         if ledger is not None:
             update_latest_coin_info(ledger, mint, coin)
+    elif kind == "wallets":
+        text = await asyncio.to_thread(_wallets, mint, explain)
     else:
         text = await asyncio.to_thread(
             _safety if kind == "safety" else _onchain_metrics,
@@ -1179,8 +1188,8 @@ def _event_line(ev: Any) -> str:
     """tool blocks print in full. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
-    if kind in ("safety", "dex") and isinstance(payload, dict):
-        # the block already starts with safety: or dex:. no extra reason line.
+    if kind in ("safety", "dex", "wallets") and isinstance(payload, dict):
+        # the block already starts with safety: / dex: / wallets:. no extra reason line.
         return str(payload.get("text") or "").strip() or f"{kind}:"
     if kind == "metrics" and isinstance(payload, dict):
         why = str(payload.get("reasoning") or "").strip()
@@ -1212,6 +1221,25 @@ def _safety(mint: str, explain: bool = False) -> str:
     except Exception as exc:  # noqa: BLE001
         log.warning("safety failed %s: %s", mint, exc)
         return "safety: unavailable"
+
+
+def _wallets(mint: str, explain: bool = False) -> str:
+    """tracked kol holders ∩ this mint. helius + local db."""
+    if not mint:
+        return "wallets: unavailable"
+    try:
+        from archetype.config import get_settings
+
+        settings = get_settings()
+        read = fetch_wallets(
+            mint,
+            api_key=settings.helius_api_key,
+            db_path=settings.data_dir / "kol_wallets.db",
+        )
+        return wallets_text(read, explain=explain)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("wallets failed %s: %s", mint, exc)
+        return "wallets: unavailable"
 
 
 def _onchain_metrics(mint: str, explain: bool = False) -> str:
