@@ -284,6 +284,14 @@
       letter-spacing: 0.06em;
     }
     .coin-phase.on { color: var(--ok); border-color: rgba(63,185,80,.4); }
+    .group.demo-group { border-color: rgba(88,166,255,.45); }
+    button.demo-btn {
+      background: rgba(88,166,255,.18);
+      border-color: rgba(88,166,255,.55);
+      color: #fff;
+    }
+    button.demo-btn:hover { border-color: var(--accent); background: rgba(88,166,255,.28); }
+    .pill.demo { background: var(--accent); box-shadow: 0 0 8px rgba(88,166,255,.45); }
   </style>
 </head>
 <body>
@@ -293,6 +301,9 @@
       <h1>Archetype live</h1>
     </div>
     <div class="controls">
+      <div class="group demo-group">
+        <button id="btnLoadDemo" class="demo-btn" type="button">load demo</button>
+      </div>
       <div class="group">
         <span class="pill" id="ollamaPill"></span>
         <span class="label">ollama</span>
@@ -346,11 +357,25 @@
     let activeMint = null;
     let openRows = []; // DOM nodes for current mint (not yet archived)
     const rejectSeen = new Set(); // one fail card per mint
+    let demoMode = false;
+    let demoGen = 0; // bump to cancel an in-flight script
+    let demoTick = null;
+    let demoState = null; // { coin, loop, live }
 
     function setPill(id, on) {
       const el = $(id);
       el.classList.toggle("on", !!on);
       el.classList.toggle("off", !on);
+      el.classList.remove("demo");
+    }
+
+    function setDemoPills() {
+      // fake "everything up" look without touching real services
+      ["ollamaPill", "daemonPill", "loopPill"].forEach((id) => {
+        const el = $(id);
+        el.classList.remove("off");
+        el.classList.add("on", "demo");
+      });
     }
 
     function setText(id, value, title) {
@@ -412,12 +437,40 @@
           : coin.market_cap_usd != null
             ? "$" + fmtNum(Number(coin.market_cap_usd))
             : "—";
+      const tp =
+        live && live.profit_pct != null
+          ? live.profit_pct + "%"
+          : loop && loop.profit_pct != null
+            ? loop.profit_pct + "%"
+            : null;
+      const sl =
+        live && live.loss_pct != null
+          ? live.loss_pct + "%"
+          : loop && loop.loss_pct != null
+            ? loop.loss_pct + "%"
+            : null;
+      const holding = !!(live && live.holding);
+      let position = "—";
+      if (holding) {
+        const bits = [];
+        if (live.value_sol != null) bits.push(fmtNum(Number(live.value_sol)) + " SOL");
+        if (live.pnl_sol != null || live.pnl_pct != null) {
+          const pnlSol = live.pnl_sol != null ? fmtNum(Number(live.pnl_sol)) + " SOL" : "";
+          const pnlPct = live.pnl_pct != null ? (Number(live.pnl_pct) >= 0 ? "+" : "") + fmtNum(Number(live.pnl_pct)) + "%" : "";
+          bits.push("pnl " + [pnlSol, pnlPct].filter(Boolean).join(" / "));
+        }
+        if (live.held_sec != null) bits.push("held " + live.held_sec + "s");
+        position = bits.join(" · ") || "open";
+      }
       const rows = [
         ["mint", mint],
         ["venue", coin.venue || coin.amm || coin.launchpad || "—"],
         ["amm", coin.amm || "—"],
         ["launchpad", coin.launchpad || "—"],
         ["mcap", mcap],
+        ["tp", tp || "—"],
+        ["sl", sl || "—"],
+        ["position", position],
         ["fees", coin.estimated_global_fees_sol != null ? fmtNum(Number(coin.estimated_global_fees_sol)) + " SOL" : "—"],
         ["buy size", coin.buy_sol != null ? coin.buy_sol + " SOL" : (loop && loop.buy_sol) || "—"],
         ["pairing", coin.quote_symbol || coin.quote_name || (coin.quote_mint && coin.quote_mint !== "So11111111111111111111111111111111111111112" ? coin.quote_mint : "SOL")],
@@ -433,6 +486,18 @@
       const phase = (loop && loop.phase) || "—";
       $("cPhase").textContent = phase;
       $("cPhase").classList.toggle("on", phase === "searching" || phase === "locked");
+    }
+
+    function paintDemo() {
+      if (!demoState) return;
+      const { coin, loop, live } = demoState;
+      setText("fModel", "llama3.2:3b (demo)");
+      setText("fPhase", loop.phase || "—");
+      setText("fMint", loop.mint || "—");
+      setText("fAction", loop.last_action || "—");
+      setText("fNarr", loop.last_narrative || "—");
+      setText("fBacklog", String(loop.backlog != null ? loop.backlog : 0));
+      renderCoin(coin || {}, loop || {}, live || {});
     }
 
     function archiveOpenMint(label) {
@@ -546,6 +611,7 @@
     }
 
     async function refresh() {
+      if (demoMode) return; // scripted run owns the UI
       try {
         const s = await api("/api/status");
         setPill("ollamaPill", s.ollama && s.ollama.up);
@@ -573,6 +639,7 @@
     }
 
     function connectLive() {
+      if (demoMode) return;
       disconnectLive();
       es = new EventSource("/api/live?filtered=false");
       es.onmessage = (ev) => {
@@ -597,6 +664,10 @@
 
     function bind(id, path) {
       $(id).onclick = async () => {
+        if (demoMode) {
+          setText("hint", "stop demo first (reload page)");
+          return;
+        }
         $(id).disabled = true;
         setText("hint", "…");
         try {
@@ -611,12 +682,404 @@
       };
     }
 
+    function sleep(ms, gen) {
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(gen === demoGen), ms);
+      });
+    }
+
+    function stopDemoTicker() {
+      if (demoTick) {
+        clearInterval(demoTick);
+        demoTick = null;
+      }
+    }
+
+    function startPositionTicker(entryMcap, buySol, tpPct, slPct, opts) {
+      // climb mcap toward TP so the card always shows live numbers
+      stopDemoTicker();
+      const fromMcap = (opts && opts.fromMcap) || entryMcap;
+      const heldBase = (opts && opts.heldBase) || 0;
+      const spanSec = (opts && opts.spanSec) || 12;
+      const target = entryMcap * (1 + (tpPct / 100) * 1.02);
+      const started = Date.now();
+      demoTick = setInterval(() => {
+        if (!demoMode || !demoState || !demoState.live) return;
+        const elapsed = Math.floor((Date.now() - started) / 1000);
+        const held = heldBase + elapsed;
+        const progress = Math.min(1, elapsed / spanSec);
+        const mcap = fromMcap + (target - fromMcap) * progress;
+        const pnlPct = ((mcap / entryMcap) - 1) * 100;
+        const pnlSol = buySol * (pnlPct / 100);
+        const valueSol = buySol + pnlSol;
+        demoState.live.fdv_usd = Math.round(mcap);
+        demoState.live.mcap_usd = Math.round(mcap);
+        demoState.live.value_sol = Math.round(valueSol * 1000) / 1000;
+        demoState.live.pnl_sol = Math.round(pnlSol * 1000) / 1000;
+        demoState.live.pnl_pct = Math.round(pnlPct * 10) / 10;
+        demoState.live.held_sec = held;
+        demoState.live.holding = true;
+        demoState.live.profit_pct = tpPct;
+        demoState.live.loss_pct = slPct;
+        demoState.coin.market_cap_usd = Math.round(mcap);
+        paintDemo();
+      }, 400);
+    }
+
+    async function runLoadDemo() {
+      const btn = $("btnLoadDemo");
+      btn.disabled = true;
+      demoGen += 1;
+      const gen = demoGen;
+      demoMode = true;
+      disconnectLive();
+      stopDemoTicker();
+      lastDaemonUp = false;
+      activeMint = null;
+      openRows = [];
+      rejectSeen.clear();
+      agentLog.innerHTML = "";
+      setDemoPills();
+      setText("hint", "demo running (simulated — no daemon)");
+
+      const rejects = [
+        {
+          mint: "RugSpRd1111111111111111111111111111111111",
+          name: "RugSpread",
+          symbol: "RUGS",
+          filter_reasons: ["global fees 0.4 SOL < 2.0 floor"],
+        },
+        {
+          mint: "FakeMn2222222222222222222222222222222222",
+          name: "FakeMoon",
+          symbol: "FMOON",
+          filter_reasons: ["deployer still holds > 8% supply"],
+        },
+        {
+          mint: "CopyCt3333333333333333333333333333333333",
+          name: "CopyCat",
+          symbol: "COPY",
+          filter_reasons: ["narrative clone of recent pass; skipped"],
+        },
+      ];
+
+      const focus = {
+        mint: "NebFox4444444444444444444444444444444444",
+        name: "NebulaFox",
+        symbol: "NBX",
+        venue: "pumpswap",
+        amm: "pumpswap",
+        launchpad: "pump.fun",
+        market_cap_usd: 185000,
+        estimated_global_fees_sol: 6.2,
+        buy_sol: 0.35,
+        quote_symbol: "SOL",
+        twitter: "https://x.com/nebula_fox_demo",
+        telegram: "https://t.me/nebula_fox_demo",
+        website: "https://nebula.fox",
+        description: "fox-themed memecoin migrating off pump — demo fixture",
+      };
+
+      const buySol = 0.35;
+      let tpPct = 35;
+      let slPct = 18;
+      const entryMcap = focus.market_cap_usd;
+
+      demoState = {
+        coin: { ...focus },
+        loop: {
+          running: true,
+          phase: "idle",
+          mint: "",
+          last_action: "",
+          last_narrative: "",
+          backlog: 3,
+          buy_sol: buySol,
+          profit_pct: null,
+          loss_pct: null,
+        },
+        live: {},
+      };
+      paintDemo();
+
+      const still = async (ms) => {
+        const ok = await sleep(ms, gen);
+        return ok && demoMode && gen === demoGen;
+      };
+
+      // 3 muted rejects first
+      for (let i = 0; i < rejects.length; i++) {
+        if (!(await still(900))) return;
+        flashFail(rejects[i]);
+        demoState.loop.backlog = 3 - i - 1;
+        demoState.loop.phase = "filtering";
+        demoState.loop.last_action = "filter_reject";
+        demoState.loop.last_narrative = rejects[i].filter_reasons[0];
+        paintDemo();
+      }
+
+      if (!(await still(1100))) return;
+      flashPass({
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        venue: focus.venue,
+        market_cap_usd: focus.market_cap_usd,
+        filter_passed: true,
+      });
+      demoState.loop.backlog = 0;
+      demoState.loop.phase = "searching";
+      demoState.loop.mint = focus.mint;
+      demoState.loop.last_action = "filter_pass";
+      demoState.loop.last_narrative = "fees + deployer clean; handed to agent";
+      paintDemo();
+
+      if (!(await still(700))) return;
+      addAgentEvent({
+        kind: "focus",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        mcap_usd: entryMcap,
+        fees_sol: focus.estimated_global_fees_sol,
+      });
+
+      if (!(await still(900))) return;
+      addAgentEvent({
+        kind: "thinking",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        mcap_usd: entryMcap,
+        text: "scanning tools before first decision…",
+      });
+      demoState.loop.last_action = "thinking";
+      paintDemo();
+
+      const tools = [
+        {
+          kind: "metrics",
+          reasoning: "mcap ~$185k, 5m volume healthy, holders climbing",
+          text: "fdv=$185,000\nliq≈42 SOL\n5m vol≈11 SOL",
+        },
+        {
+          kind: "safety",
+          reasoning: "mint renounced, freeze auth none, no bundle spike",
+          text: "freeze=none\nmint_auth=renounced\nbundle_pct=low",
+        },
+        {
+          kind: "dex",
+          reasoning: "dexscreener paid + socials match card",
+          text: "boosted=true\npairs=1 (pumpswap)",
+        },
+        {
+          kind: "wallets",
+          reasoning: "2 tracked KOLs already in top holders",
+          text: "kol_hits=2\nrank≈0.4",
+        },
+      ];
+      for (const t of tools) {
+        if (!(await still(850))) return;
+        addAgentEvent({
+          ...t,
+          mint: focus.mint,
+          name: focus.name,
+          symbol: focus.symbol,
+        });
+        demoState.loop.last_action = t.kind;
+        paintDemo();
+      }
+
+      if (!(await still(1000))) return;
+      addAgentEvent({
+        kind: "thinking",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        mcap_usd: entryMcap,
+        text: "fees clear, KOLs present, narrative fresh — sizing a paper buy",
+      });
+
+      if (!(await still(1100))) return;
+      const buyNarrative =
+        "clean migration, real fees, two KOL wallets already in — buy small and set room to run";
+      addAgentEvent({
+        kind: "decision",
+        action: "buy",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        narrative: buyNarrative,
+        reasoning: "pass filters + tools agree; paper buy 0.35 SOL",
+        profit_pct: tpPct,
+        loss_pct: slPct,
+        buy_sol: buySol,
+        mcap_usd: entryMcap,
+      });
+      demoState.loop.last_action = "buy";
+      demoState.loop.last_narrative = buyNarrative;
+      demoState.loop.phase = "locked";
+      demoState.loop.profit_pct = tpPct;
+      demoState.loop.loss_pct = slPct;
+      paintDemo();
+
+      if (!(await still(800))) return;
+      addAgentEvent({
+        kind: "buy",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        sol: buySol,
+        mcap_usd: entryMcap,
+        profit_pct: tpPct,
+        loss_pct: slPct,
+      });
+      demoState.live = {
+        fdv_usd: entryMcap,
+        mcap_usd: entryMcap,
+        holding: true,
+        value_sol: buySol,
+        pnl_sol: 0,
+        pnl_pct: 0,
+        held_sec: 0,
+        profit_pct: tpPct,
+        loss_pct: slPct,
+        price_usd: 0.00018,
+      };
+      paintDemo();
+      startPositionTicker(entryMcap, buySol, tpPct, slPct);
+
+      if (!(await still(3500))) return;
+      addAgentEvent({
+        kind: "thinking",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        mcap_usd: demoState.live.mcap_usd,
+        since_last_pct: 12.4,
+        since_last_sec: 8,
+        text: "price grinding up — tighten SL, leave TP room",
+      });
+      demoState.loop.last_action = "thinking";
+      paintDemo();
+
+      if (!(await still(1200))) return;
+      tpPct = 42;
+      slPct = 12;
+      addAgentEvent({
+        kind: "revise_tpsl",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        profit_pct: tpPct,
+        loss_pct: slPct,
+        reasoning: "trail SL closer after +12%; stretch TP to 42%",
+        narrative: "revised levels once while holding",
+      });
+      demoState.loop.profit_pct = tpPct;
+      demoState.loop.loss_pct = slPct;
+      demoState.loop.last_action = "revise_tpsl";
+      demoState.loop.last_narrative = "revised TP 42% / SL 12%";
+      if (demoState.live) {
+        demoState.live.profit_pct = tpPct;
+        demoState.live.loss_pct = slPct;
+      }
+      const heldSoFar = (demoState.live && demoState.live.held_sec) || 4;
+      const fromMcap = (demoState.live && demoState.live.mcap_usd) || entryMcap * 1.12;
+      startPositionTicker(entryMcap, buySol, tpPct, slPct, {
+        fromMcap,
+        heldBase: heldSoFar,
+        spanSec: 8,
+      });
+      paintDemo();
+
+      if (!(await still(4500))) return;
+      stopDemoTicker();
+      const exitMcap = Math.round(entryMcap * (1 + tpPct / 100));
+      const exitPnlPct = tpPct;
+      const exitPnlSol = Math.round(buySol * (exitPnlPct / 100) * 1000) / 1000;
+      const exitValue = Math.round((buySol + exitPnlSol) * 1000) / 1000;
+      demoState.live = {
+        ...demoState.live,
+        fdv_usd: exitMcap,
+        mcap_usd: exitMcap,
+        holding: true,
+        value_sol: exitValue,
+        pnl_sol: exitPnlSol,
+        pnl_pct: exitPnlPct,
+        profit_pct: tpPct,
+        loss_pct: slPct,
+      };
+      demoState.coin.market_cap_usd = exitMcap;
+      demoState.loop.last_action = "tp_hit";
+      demoState.loop.last_narrative = "take-profit hit — closing paper fill";
+      paintDemo();
+
+      addAgentEvent({
+        kind: "tpsl",
+        reason: "TP",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        sol: exitValue,
+        pnl_sol: exitPnlSol,
+        pnl_pct: exitPnlPct,
+        mcap_usd: exitMcap,
+      });
+
+      if (!(await still(700))) return;
+      addAgentEvent({
+        kind: "sell",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        sol: exitValue,
+        pnl_sol: exitPnlSol,
+        pnl_pct: exitPnlPct,
+        flat: true,
+      });
+      demoState.live.holding = false;
+      demoState.loop.phase = "closed";
+      paintDemo();
+
+      if (!(await still(900))) return;
+      const thesis =
+        "Bought NebulaFox after fees cleared the floor and two tracked wallets showed in holders. " +
+        "Held through a steady grind, revised SL tighter once momentum stuck, then TP at +42% closed the paper round.";
+      addAgentEvent({
+        kind: "thesis",
+        mint: focus.mint,
+        name: focus.name,
+        symbol: focus.symbol,
+        thesis,
+        pnl_sol: exitPnlSol,
+        held_sec: demoState.live.held_sec || 18,
+      });
+      demoState.loop.last_action = "thesis";
+      demoState.loop.last_narrative = thesis;
+      demoState.loop.phase = "closed";
+      // keep mint on the card so the ending frame still shows the round
+      paintDemo();
+
+      if (!(await still(400))) return;
+      setText("hint", "demo complete — reload page for live mode");
+      btn.disabled = false;
+      // leave demoMode true so status polls don't clobber the ending frame
+    }
+
     bind("btnOllamaStart", "/api/ollama/start");
     bind("btnOllamaStop", "/api/ollama/stop");
     bind("btnDaemonStart", "/api/daemon/start");
     bind("btnDaemonStop", "/api/daemon/stop");
     bind("btnLoopStart", "/api/loop/start");
     bind("btnLoopStop", "/api/loop/stop");
+
+    $("btnLoadDemo").onclick = () => {
+      runLoadDemo().catch((e) => {
+        setText("hint", String(e.message || e));
+        $("btnLoadDemo").disabled = false;
+      });
+    };
 
     refresh();
     setInterval(refresh, 2000);

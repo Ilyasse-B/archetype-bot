@@ -28,13 +28,14 @@ uv run python -m archetype.demo
    - Agent loop via daemon `POST /agent/loop/start|stop`
 2. **Status** — polls Ollama, daemon `/health` + `/status`, `/agent/loop`, focused `coin_info` from the ledger, and a live peek (`POST /agent/peek`) for the focused mint so mcap/FDV updates on the coin card
 3. **Live** — proxies daemon `GET /live` SSE; agent events drive the left log; filter PASSes flash there; filter rejects stay muted (one card per mint); migrations column is hidden (coin card is the focus)
+4. **Load demo** — fully client-side scripted run (no daemon / agent / Ollama). Plays 3 filter rejects → 1 pass → focus → tool calls → buy → live mcap/TP/SL/position on the coin card → one TP/SL revise → TP hit → thesis. For recording when real migrations are slow. Reload the page to leave demo mode.
 
 ## Layout
 
-- Header: logo (`web/demo/logo.png`) + “Archetype live” + control groups (ollama / daemon / agent)
+- Header: logo (`web/demo/logo.png`) + **load demo** + control groups (ollama / daemon / agent)
 - Thin status strip (phase / action / narrative / backlog / model / mint) — ellipsis overflow with a CSS hover tip for the full text (native `title` was unreliable)
 - Left (~48%): agent log — decision rows titled by the real action (`wait` / `buy` / `reject` / …); finished mint collapsed into one archive block; hover expands full tool/decision text
-- Center: current coin card (name, ticker, mint, venue, **live** mcap from peek, fees, socials, …)
+- Center: current coin card (name, ticker, mint, venue, **live** mcap, **tp**, **sl**, **position**, fees, socials, …)
 
 UI is intentionally plain — ops console for screen recording.
 
