@@ -862,6 +862,31 @@ def balance_reset_cmd(
     )
 
 
+@app.command("demo")
+def demo_cmd(
+    open_browser: bool = typer.Option(
+        True,
+        "--open/--no-open",
+        help="open the viewer in a browser",
+    ),
+    port: int = typer.Option(8787, help="viewer port (daemon stays on its own port)"),
+) -> None:
+    """
+    hackathon live viewer (separate from the trading daemon).
+
+    starts a small localhost UI that can start/stop ollama, the daemon,
+    and the agent loop, and shows live migrations + agent events.
+    """
+    from archetype.demo import DEMO_HOST
+    from archetype.demo.app import run as run_demo
+
+    console.print(
+        f"[cyan]hackathon viewer[/cyan] http://{DEMO_HOST}:{port}/ "
+        "(daemon is separate — not served by this process)"
+    )
+    run_demo(host=DEMO_HOST, port=port, open_browser=open_browser)
+
+
 @app.command("stop")
 def stop_cmd(
     force: bool = typer.Option(

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Archetype — live viewer</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #161b22;
+      --line: #2a3340;
+      --text: #e6edf3;
+      --muted: #8b9bb0;
+      --ok: #3fb950;
+      --bad: #f85149;
+      --warn: #d29922;
+      --accent: #58a6ff;
+      --mono: "IBM Plex Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .group {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #0e1116;
+    }
+    .pill {
+      display: inline-block;
+      min-width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    .pill.on { background: var(--ok); box-shadow: 0 0 8px rgba(63,185,80,.45); }
+    .pill.off { background: var(--bad); }
+    .label { color: var(--muted); margin-right: 4px; }
+    button {
+      font: inherit;
+      color: var(--text);
+      background: #21262d;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    main {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 0;
+      height: calc(100vh - 57px);
+    }
+    .focus {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px 16px;
+      background: #12161c;
+    }
+    .focus .k { color: var(--muted); }
+    .focus .v { color: var(--text); word-break: break-all; }
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      min-height: 0;
+      height: 100%;
+    }
+    @media (max-width: 900px) {
+      .cols { grid-template-columns: 1fr; }
+    }
+    section.tail {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      border-right: 1px solid var(--line);
+    }
+    section.tail:last-child { border-right: none; }
+    section.tail h2 {
+      margin: 0;
+      padding: 8px 12px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .log {
+      flex: 1;
+      overflow: auto;
+      padding: 8px 12px;
+      font-size: 12px;
+    }
+    .row {
+      padding: 6px 0;
+      border-bottom: 1px solid #1c2330;
+    }
+    .row .meta { color: var(--muted); }
+    .row.pass .tag { color: var(--ok); }
+    .row.fail .tag { color: var(--bad); }
+    .row.agent .tag { color: var(--accent); }
+    .tag { font-weight: 600; margin-right: 6px; text-transform: uppercase; }
+    .err { color: var(--bad); padding: 8px 16px; }
+    .note { color: var(--warn); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Archetype live</h1>
+    <div class="controls">
+      <div class="group">
+        <span class="pill" id="ollamaPill"></span>
+        <span class="label">ollama</span>
+        <button id="btnOllamaStart" type="button">start</button>
+      </div>
+      <div class="group">
+        <span class="pill" id="daemonPill"></span>
+        <span class="label">daemon</span>
+        <button id="btnDaemonStart" type="button">start</button>
+        <button id="btnDaemonStop" type="button">stop</button>
+      </div>
+      <div class="group">
+        <span class="pill" id="loopPill"></span>
+        <span class="label">agent</span>
+        <button id="btnLoopStart" type="button">start</button>
+        <button id="btnLoopStop" type="button">stop</button>
+      </div>
+      <span class="note" id="hint"></span>
+    </div>
+  </header>
+  <main>
+    <div class="focus" id="focus">
+      <div><span class="k">phase</span><br /><span class="v" id="fPhase">—</span></div>
+      <div><span class="k">mint</span><br /><span class="v" id="fMint">—</span></div>
+      <div><span class="k">action</span><br /><span class="v" id="fAction">—</span></div>
+      <div><span class="k">narrative</span><br /><span class="v" id="fNarr">—</span></div>
+      <div><span class="k">backlog</span><br /><span class="v" id="fBacklog">—</span></div>
+      <div><span class="k">model</span><br /><span class="v" id="fModel">—</span></div>
+    </div>
+    <div class="cols">
+      <section class="tail">
+        <h2>migrations</h2>
+        <div class="log" id="migLog"></div>
+      </section>
+      <section class="tail">
+        <h2>agent</h2>
+        <div class="log" id="agentLog"></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const migLog = $("migLog");
+    const agentLog = $("agentLog");
+    let es = null;
+    let lastDaemonUp = false;
+
+    function setPill(id, on) {
+      const el = $(id);
+      el.classList.toggle("on", !!on);
+      el.classList.toggle("off", !on);
+    }
+
+    function addRow(parent, cls, html) {
+      const div = document.createElement("div");
+      div.className = "row " + cls;
+      div.innerHTML = html;
+      parent.prepend(div);
+      while (parent.children.length > 200) parent.removeChild(parent.lastChild);
+    }
+
+    async function api(path, method = "GET") {
+      const resp = await fetch(path, { method });
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (_) {}
+      if (!resp.ok) {
+        const detail = (data && data.detail) || text || resp.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return data;
+    }
+
+    async function refresh() {
+      try {
+        const s = await api("/api/status");
+        setPill("ollamaPill", s.ollama && s.ollama.up);
+        setPill("daemonPill", s.daemon && s.daemon.up);
+        const loopOn = !!(s.loop && s.loop.running);
+        setPill("loopPill", loopOn);
+        $("fModel").textContent = (s.ollama && s.ollama.model) || "—";
+        $("fPhase").textContent = (s.loop && s.loop.phase) || (s.daemon && s.daemon.up ? "—" : "daemon down");
+        $("fMint").textContent = (s.loop && s.loop.mint) || "—";
+        $("fAction").textContent = (s.loop && s.loop.last_action) || "—";
+        $("fNarr").textContent = (s.loop && s.loop.last_narrative) || "—";
+        const st = s.daemon && s.daemon.status;
+        $("fBacklog").textContent =
+          st && st.backlog_pending != null ? String(st.backlog_pending) : "—";
+        $("hint").textContent = "";
+        if (s.daemon && s.daemon.up && !lastDaemonUp) connectLive();
+        if (!(s.daemon && s.daemon.up) && lastDaemonUp) disconnectLive();
+        lastDaemonUp = !!(s.daemon && s.daemon.up);
+      } catch (e) {
+        $("hint").textContent = String(e.message || e);
+      }
+    }
+
+    function disconnectLive() {
+      if (es) { es.close(); es = null; }
+    }
+
+    function connectLive() {
+      disconnectLive();
+      es = new EventSource("/api/live?filtered=false");
+      es.onmessage = (ev) => {
+        let data;
+        try { data = JSON.parse(ev.data); } catch (_) { return; }
+        if (!data || !data.stream) return;
+        if (data.stream === "hello") return;
+        if (data.stream === "migration") {
+          const m = data.migration || {};
+          const passed = m.filter_passed === true;
+          const failed = m.filter_passed === false;
+          const tag = passed ? "pass" : failed ? "fail" : "mig";
+          const cls = passed ? "pass" : failed ? "fail" : "";
+          const mint = (m.mint || m.coin_mint || "").slice(0, 12);
+          const name = m.name || m.symbol || "";
+          const venue = m.venue || m.platform || m.pool || "";
+          const why = (m.filter_reasons || []).slice(0, 2).join("; ");
+          addRow(
+            migLog,
+            cls,
+            `<span class="tag">${tag}</span><span class="meta">${venue}</span> ${name} <span class="meta">${mint}…</span>` +
+              (why ? `<div class="meta">${why}</div>` : "")
+          );
+          return;
+        }
+        if (data.stream === "agent") {
+          const e = data.event || {};
+          const kind = e.kind || "event";
+          const mint = (e.mint || "").slice(0, 10);
+          const bits = [];
+          if (e.reasoning) bits.push(e.reasoning);
+          if (e.text) bits.push(String(e.text).split("\n")[0]);
+          if (e.error) bits.push(e.error);
+          if (e.narrative) bits.push(e.narrative);
+          addRow(
+            agentLog,
+            "agent",
+            `<span class="tag">${kind}</span><span class="meta">${mint}</span> ${bits.join(" — ").slice(0, 220)}`
+          );
+        }
+      };
+      es.onerror = () => {
+        $("hint").textContent = "live stream disconnected (is daemon up?)";
+      };
+    }
+
+    function bind(id, path) {
+      $(id).onclick = async () => {
+        $(id).disabled = true;
+        $("hint").textContent = "…";
+        try {
+          await api(path, "POST");
+          $("hint").textContent = "ok";
+          await refresh();
+        } catch (e) {
+          $("hint").textContent = String(e.message || e);
+        } finally {
+          $(id).disabled = false;
+        }
+      };
+    }
+
+    bind("btnOllamaStart", "/api/ollama/start");
+    bind("btnDaemonStart", "/api/daemon/start");
+    bind("btnDaemonStop", "/api/daemon/stop");
+    bind("btnLoopStart", "/api/loop/start");
+    bind("btnLoopStop", "/api/loop/stop");
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
