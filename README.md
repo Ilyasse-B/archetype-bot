@@ -6,9 +6,9 @@ Local Solana memecoin agent. One coin at a time, paper fills only.
 
 Phase 4 is running: a LangGraph loop on local Ollama `llama3.2:3b`. It searches (buy, reject, or wait), then holds, revises levels, or sells, and writes a thesis when the trade closes.
 
-Phase 5 is in progress. Built: market-cap move since the last peek, live metrics, safety, and a Dexscreener check. Still ahead: tracked wallets, vamp, backlog peek, website, X, and Gemini amongst others.
+Phase 5 is in progress. Built: market-cap move since the last peek, live metrics, safety, Dexscreener check, tracked wallets (KOL holder tool), Birdeye global-fees floor on every venue, and a separate localhost demo viewer. Still ahead: vamp, backlog peek, website, X, and Gemini amongst others.
 
-**Venues:** migrations from **PumpSwap**, **Raydium CPMM** (LaunchLab and any launchpad on it — Float, StonkFun, higher.fun, letsbonk, …), and **Meteora DAMM v2** (DBC / Bags, …). Paper fills work on all three AMMs. **OTC desks** is not an AMM: after a filter PASS we look up the mint on otcdesks; if it hits, the agent card gets the reward stock basket.
+**Venues:** migrations from **PumpSwap**, **Raydium CPMM** (LaunchLab and any launchpad on it — Float, StonkFun, higher.fun, letsbonk, …), and **Meteora DAMM v2** (DBC / Bags, …). Paper fills work on all three AMMs. Fee-floor checks run on all three; bonding-curve deployer checks stay pump-specific. **OTC desks** is not an AMM: after a filter PASS we look up the mint on otcdesks; if it hits, the agent card gets the reward stock basket.
 
 ## How it works
 
@@ -69,4 +69,15 @@ uv run archetype buy <MINT> <SOL>
 uv run archetype sell <MINT>
 uv run archetype set-profit <MINT> <PCT>
 uv run archetype set-loss <MINT> <PCT>
+uv run archetype demo
 ```
+
+## Demo viewer
+
+Separate localhost UI for demos / recording (not part of the daemon). Starts Ollama, the daemon, and the agent loop from the browser, and shows the focused coin plus a live agent log.
+
+```bash
+uv run archetype demo          # http://127.0.0.1:8787/
+```
+
+See [`docs/web-app.md`](docs/web-app.md).

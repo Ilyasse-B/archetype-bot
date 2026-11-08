@@ -9,8 +9,10 @@ does NOT live inside the trading daemon. it only:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -61,9 +63,20 @@ def create_demo_app() -> FastAPI:
         loop: dict[str, Any] = {}
         daemon_status: dict[str, Any] = {}
         daemon_up = bool(daemon.get("ok"))
+        coin: dict[str, Any] = {}
+        live: dict[str, Any] = {}
         if daemon_up:
             loop = await _get_json(f"{settings.base_url}/agent/loop") or {}
             daemon_status = await _get_json(f"{settings.base_url}/status") or {}
+            mint = str(loop.get("mint") or "").strip()
+            if mint:
+                coin = await asyncio.to_thread(
+                    _coin_info_for_mint,
+                    settings.resolved_trading_ledger_db(),
+                    mint,
+                )
+                # live mcap off the daemon vault socket / peek
+                live = await _peek_live(settings.base_url, mint, coin) or {}
         return {
             "viewer": {"host": DEMO_HOST, "port": DEMO_PORT},
             "ollama": {
@@ -78,28 +91,17 @@ def create_demo_app() -> FastAPI:
                 "status": daemon_status,
             },
             "loop": loop,
+            "coin": coin,
+            "live": live,
         }
 
     @app.post("/api/ollama/start")
     async def ollama_start() -> dict[str, Any]:
-        # user unit — same as the docs
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                ["systemctl", "--user", "start", "ollama"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(500, f"ollama start failed: {exc}") from exc
-        if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
-            raise HTTPException(500, f"ollama start failed: {err}")
-        # give it a beat to bind
-        await asyncio.sleep(0.8)
-        up = await _ollama_up(settings.ollama_base_url)
-        return {"ok": up, "model": settings.ollama_model}
+        return await _ollama_unit("start", settings.ollama_base_url, settings.ollama_model)
+
+    @app.post("/api/ollama/stop")
+    async def ollama_stop() -> dict[str, Any]:
+        return await _ollama_unit("stop", settings.ollama_base_url, settings.ollama_model)
 
     @app.post("/api/daemon/start")
     async def daemon_start() -> dict[str, Any]:
@@ -216,6 +218,34 @@ def run(host: str = DEMO_HOST, port: int = DEMO_PORT, open_browser: bool = False
     uvicorn.run(create_demo_app(), host=host, port=port, log_level="info")
 
 
+async def _ollama_unit(action: str, base: str, model: str) -> dict[str, Any]:
+    """systemctl --user start|stop ollama."""
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["systemctl", "--user", action, "ollama"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"ollama {action} failed: {exc}") from exc
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise HTTPException(500, f"ollama {action} failed: {err}")
+    # ollama can take a second to bind after systemctl
+    for _ in range(8):
+        await asyncio.sleep(0.4)
+        up = await _ollama_up(base)
+        if action == "stop" and not up:
+            break
+        if action == "start" and up:
+            break
+    else:
+        up = await _ollama_up(base)
+    return {"ok": (not up) if action == "stop" else up, "up": up, "model": model}
+
+
 async def _ollama_up(base: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
@@ -223,6 +253,47 @@ async def _ollama_up(base: str) -> bool:
             return resp.status_code == 200
     except Exception:  # noqa: BLE001
         return False
+
+
+def _coin_info_for_mint(ledger_path: Path, mint: str) -> dict[str, Any]:
+    """latest backlog coin_info for this mint (even if already consumed)."""
+    if not mint or not ledger_path.is_file():
+        return {}
+    try:
+        with sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True) as con:
+            row = con.execute(
+                "SELECT coin_info FROM migration_backlog "
+                "WHERE mint = ? ORDER BY id DESC LIMIT 1",
+                (mint,),
+            ).fetchone()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not row or not row[0]:
+        return {}
+    try:
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _peek_live(base: str, mint: str, coin: dict[str, Any]) -> dict[str, Any] | None:
+    """POST /agent/peek — fdv/mcap from the live vault socket when focused."""
+    body = {
+        "mint": mint,
+        "known_pool": coin.get("pool_address") or coin.get("pool") or None,
+        "name": coin.get("name") or None,
+        "symbol": coin.get("symbol") or None,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(f"{base.rstrip('/')}/agent/peek", json=body)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def _daemon_health(base: str) -> dict[str, Any] | None:

@@ -15,6 +15,7 @@
       --bad: #f85149;
       --warn: #d29922;
       --accent: #58a6ff;
+      --pass-bg: rgba(63, 185, 80, 0.14);
       --mono: "IBM Plex Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
@@ -33,9 +34,22 @@
       gap: 12px;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 16px;
+      padding: 10px 16px;
       border-bottom: 1px solid var(--line);
       background: var(--panel);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .brand img {
+      width: 28px;
+      height: 28px;
+      object-fit: contain;
+      display: block;
+      flex-shrink: 0;
     }
     header h1 {
       margin: 0;
@@ -44,8 +58,9 @@
       letter-spacing: 0.04em;
       text-transform: uppercase;
       color: var(--muted);
+      white-space: nowrap;
     }
-    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; min-width: 0; }
     .group {
       display: flex;
       gap: 6px;
@@ -76,39 +91,79 @@
     }
     button:hover { border-color: var(--accent); color: #fff; }
     button:disabled { opacity: 0.45; cursor: default; }
+    .note {
+      color: var(--warn);
+      font-size: 11px;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ellipsis {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .tip {
+      position: relative;
+      min-width: 0;
+    }
+    .tip .tip-body {
+      display: none;
+      position: absolute;
+      left: 0;
+      top: calc(100% + 4px);
+      z-index: 40;
+      min-width: 220px;
+      max-width: min(480px, 70vw);
+      max-height: 220px;
+      overflow: auto;
+      padding: 8px 10px;
+      background: #0d1117;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.45);
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+      font-size: 12px;
+    }
+    .tip:hover .tip-body { display: block; }
     main {
       display: grid;
       grid-template-rows: auto 1fr;
-      gap: 0;
-      height: calc(100vh - 57px);
+      height: calc(100vh - 53px);
+      min-height: 0;
     }
-    .focus {
-      padding: 10px 16px;
-      border-bottom: 1px solid var(--line);
+    .status {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 8px 16px;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 8px 14px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--line);
       background: #12161c;
     }
-    .focus .k { color: var(--muted); }
-    .focus .v { color: var(--text); word-break: break-all; }
-    .cols {
+    .status .k { color: var(--muted); font-size: 11px; }
+    .status .v { color: var(--text); }
+    .stage {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: minmax(380px, 48%) 1fr;
       min-height: 0;
       height: 100%;
     }
     @media (max-width: 900px) {
-      .cols { grid-template-columns: 1fr; }
+      .stage { grid-template-columns: 1fr; grid-template-rows: 42% 1fr; }
+      .status { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     }
-    section.tail {
+    .agent-panel, .coin-panel {
       display: flex;
       flex-direction: column;
       min-height: 0;
-      border-right: 1px solid var(--line);
+      min-width: 0;
     }
-    section.tail:last-child { border-right: none; }
-    section.tail h2 {
+    .agent-panel { border-right: 1px solid var(--line); }
+    .panel-h {
       margin: 0;
       padding: 8px 12px;
       font-size: 12px;
@@ -121,30 +176,128 @@
     .log {
       flex: 1;
       overflow: auto;
-      padding: 8px 12px;
+      padding: 8px 10px;
       font-size: 12px;
     }
     .row {
-      padding: 6px 0;
+      padding: 7px 8px;
       border-bottom: 1px solid #1c2330;
+      border-radius: 4px;
     }
+    .row.agent { border-left: 2px solid var(--accent); margin-bottom: 4px; background: #12161c; }
+    .row.archive {
+      border-left: 2px solid var(--muted);
+      background: #10141a;
+      margin-bottom: 8px;
+      cursor: default;
+    }
+    .row.pass-flash {
+      background: var(--pass-bg);
+      border: 1px solid rgba(63,185,80,.35);
+      margin-bottom: 6px;
+    }
+    .row.fail-flash {
+      opacity: 0.55;
+      border-left: 2px solid var(--bad);
+      background: #14181f;
+      margin-bottom: 4px;
+    }
+    .row.fail-flash .tag { color: var(--bad); }
     .row .meta { color: var(--muted); }
-    .row.pass .tag { color: var(--ok); }
-    .row.fail .tag { color: var(--bad); }
-    .row.agent .tag { color: var(--accent); }
-    .tag { font-weight: 600; margin-right: 6px; text-transform: uppercase; }
-    .err { color: var(--bad); padding: 8px 16px; }
-    .note { color: var(--warn); font-size: 11px; }
+    .tag { font-weight: 600; margin-right: 6px; text-transform: uppercase; color: var(--accent); }
+    .archive .tag { color: var(--muted); }
+    .row-preview {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .row-full {
+      display: none;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-top: 6px;
+      color: var(--text);
+      max-height: 240px;
+      overflow: auto;
+      border-top: 1px solid var(--line);
+      padding-top: 6px;
+    }
+    .row:hover .row-full { display: block; }
+    .row:hover .row-preview { white-space: normal; overflow: visible; }
+    .coin-panel {
+      align-items: center;
+      justify-content: flex-start;
+      padding: 28px 24px 24px;
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(88,166,255,0.08), transparent 55%),
+        var(--bg);
+      overflow: auto;
+    }
+    .coin-card {
+      width: min(560px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 22px 22px 18px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    }
+    .coin-card.empty { opacity: 0.55; }
+    .coin-name {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin: 0 0 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .coin-sym {
+      color: var(--accent);
+      font-size: 14px;
+      margin-bottom: 14px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .coin-grid {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 6px 12px;
+      font-size: 12px;
+    }
+    .coin-grid .k { color: var(--muted); }
+    .coin-grid .v {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .coin-phase {
+      display: inline-block;
+      margin-top: 14px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .coin-phase.on { color: var(--ok); border-color: rgba(63,185,80,.4); }
   </style>
 </head>
 <body>
   <header>
-    <h1>Archetype live</h1>
+    <div class="brand">
+      <img src="/static/logo.png" alt="Archetype" />
+      <h1>Archetype live</h1>
+    </div>
     <div class="controls">
       <div class="group">
         <span class="pill" id="ollamaPill"></span>
         <span class="label">ollama</span>
         <button id="btnOllamaStart" type="button">start</button>
+        <button id="btnOllamaStop" type="button">stop</button>
       </div>
       <div class="group">
         <span class="pill" id="daemonPill"></span>
@@ -158,35 +311,41 @@
         <button id="btnLoopStart" type="button">start</button>
         <button id="btnLoopStop" type="button">stop</button>
       </div>
-      <span class="note" id="hint"></span>
+      <span class="note" id="hint" title=""></span>
     </div>
   </header>
   <main>
-    <div class="focus" id="focus">
-      <div><span class="k">phase</span><br /><span class="v" id="fPhase">—</span></div>
-      <div><span class="k">mint</span><br /><span class="v" id="fMint">—</span></div>
-      <div><span class="k">action</span><br /><span class="v" id="fAction">—</span></div>
-      <div><span class="k">narrative</span><br /><span class="v" id="fNarr">—</span></div>
-      <div><span class="k">backlog</span><br /><span class="v" id="fBacklog">—</span></div>
-      <div><span class="k">model</span><br /><span class="v" id="fModel">—</span></div>
+    <div class="status" id="statusBar">
+      <div><div class="k">phase</div><div class="v tip"><div class="ellipsis" id="fPhase">—</div><div class="tip-body" id="fPhaseTip"></div></div></div>
+      <div><div class="k">action</div><div class="v tip"><div class="ellipsis" id="fAction">—</div><div class="tip-body" id="fActionTip"></div></div></div>
+      <div><div class="k">narrative</div><div class="v tip"><div class="ellipsis" id="fNarr">—</div><div class="tip-body" id="fNarrTip"></div></div></div>
+      <div><div class="k">backlog</div><div class="v tip"><div class="ellipsis" id="fBacklog">—</div><div class="tip-body" id="fBacklogTip"></div></div></div>
+      <div><div class="k">model</div><div class="v tip"><div class="ellipsis" id="fModel">—</div><div class="tip-body" id="fModelTip"></div></div></div>
+      <div><div class="k">mint</div><div class="v tip"><div class="ellipsis" id="fMint">—</div><div class="tip-body" id="fMintTip"></div></div></div>
     </div>
-    <div class="cols">
-      <section class="tail">
-        <h2>migrations</h2>
-        <div class="log" id="migLog"></div>
-      </section>
-      <section class="tail">
-        <h2>agent</h2>
+    <div class="stage">
+      <section class="agent-panel">
+        <h2 class="panel-h">agent</h2>
         <div class="log" id="agentLog"></div>
+      </section>
+      <section class="coin-panel">
+        <div class="coin-card empty" id="coinCard">
+          <p class="coin-name ellipsis" id="cName" title="">waiting for focus…</p>
+          <div class="coin-sym ellipsis" id="cSym" title="">—</div>
+          <div class="coin-grid" id="cGrid"></div>
+          <div class="coin-phase" id="cPhase">idle</div>
+        </div>
       </section>
     </div>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const migLog = $("migLog");
     const agentLog = $("agentLog");
     let es = null;
     let lastDaemonUp = false;
+    let activeMint = null;
+    let openRows = []; // DOM nodes for current mint (not yet archived)
+    const rejectSeen = new Set(); // one fail card per mint
 
     function setPill(id, on) {
       const el = $(id);
@@ -194,12 +353,27 @@
       el.classList.toggle("off", !on);
     }
 
-    function addRow(parent, cls, html) {
-      const div = document.createElement("div");
-      div.className = "row " + cls;
-      div.innerHTML = html;
-      parent.prepend(div);
-      while (parent.children.length > 200) parent.removeChild(parent.lastChild);
+    function setText(id, value, title) {
+      const el = $(id);
+      const v = value == null || value === "" ? "—" : String(value);
+      el.textContent = v;
+      el.title = title != null ? String(title) : v;
+      const tip = $(id + "Tip");
+      if (tip) tip.textContent = title != null ? String(title) : v;
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function fmtNum(n) {
+      if (typeof n !== "number" || !isFinite(n)) return null;
+      if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+      return String(Math.round(n * 1000) / 1000);
     }
 
     async function api(path, method = "GET") {
@@ -214,27 +388,183 @@
       return data;
     }
 
+    function renderCoin(coin, loop, live) {
+      const card = $("coinCard");
+      const mint = (loop && loop.mint) || (coin && coin.mint) || "";
+      if (!mint) {
+        card.classList.add("empty");
+        setText("cName", "waiting for focus…");
+        setText("cSym", "—");
+        $("cGrid").innerHTML = "";
+        $("cPhase").textContent = "idle";
+        $("cPhase").classList.remove("on");
+        return;
+      }
+      card.classList.remove("empty");
+      const name = (coin && coin.name) || "unknown";
+      const sym = (coin && coin.symbol) || "—";
+      setText("cName", name, name);
+      setText("cSym", sym, sym);
+      const liveMcap = live && (live.fdv_usd != null ? live.fdv_usd : live.mcap_usd);
+      const mcap =
+        liveMcap != null
+          ? "$" + fmtNum(Number(liveMcap)) + " (live)"
+          : coin.market_cap_usd != null
+            ? "$" + fmtNum(Number(coin.market_cap_usd))
+            : "—";
+      const rows = [
+        ["mint", mint],
+        ["venue", coin.venue || coin.amm || coin.launchpad || "—"],
+        ["amm", coin.amm || "—"],
+        ["launchpad", coin.launchpad || "—"],
+        ["mcap", mcap],
+        ["fees", coin.estimated_global_fees_sol != null ? fmtNum(Number(coin.estimated_global_fees_sol)) + " SOL" : "—"],
+        ["buy size", coin.buy_sol != null ? coin.buy_sol + " SOL" : (loop && loop.buy_sol) || "—"],
+        ["pairing", coin.quote_symbol || coin.quote_name || (coin.quote_mint && coin.quote_mint !== "So11111111111111111111111111111111111111112" ? coin.quote_mint : "SOL")],
+        ["twitter", coin.twitter || "—"],
+        ["telegram", coin.telegram || "—"],
+        ["website", coin.website || "—"],
+        ["desc", coin.description || "—"],
+      ];
+      $("cGrid").innerHTML = rows.map(([k, v]) => {
+        const val = v == null || v === "" ? "—" : String(v);
+        return `<div class="k">${escapeHtml(k)}</div><div class="v" title="${escapeHtml(val)}">${escapeHtml(val)}</div>`;
+      }).join("");
+      const phase = (loop && loop.phase) || "—";
+      $("cPhase").textContent = phase;
+      $("cPhase").classList.toggle("on", phase === "searching" || phase === "locked");
+    }
+
+    function archiveOpenMint(label) {
+      if (!openRows.length) return;
+      const lines = openRows.map((el) => el.dataset.full || el.dataset.preview || "").filter(Boolean);
+      openRows.forEach((el) => el.remove());
+      openRows = [];
+      const full = lines.join("\n\n———\n\n");
+      const preview = (label || "finished") + " · " + lines.length + " events · " + (lines[0] || "").slice(0, 80);
+      const div = document.createElement("div");
+      div.className = "row archive";
+      div.title = full;
+      div.innerHTML =
+        `<span class="tag">done</span><span class="row-preview">${escapeHtml(preview)}</span>` +
+        `<div class="row-full">${escapeHtml(full)}</div>`;
+      agentLog.prepend(div);
+      while (agentLog.children.length > 80) agentLog.removeChild(agentLog.lastChild);
+    }
+
+    function addAgentEvent(e) {
+      const kind = e.kind || "event";
+      const mint = e.mint || "";
+      // decision cards titled by the real action (wait/buy/reject/hold/…)
+      const label =
+        kind === "decision" && e.action
+          ? String(e.action)
+          : kind;
+      const parts = [];
+      if (e.name || e.symbol) parts.push([e.name, e.symbol].filter(Boolean).join(" / "));
+      if (e.reasoning) parts.push("why: " + e.reasoning);
+      if (e.narrative) parts.push("narrative: " + e.narrative);
+      if (e.text) parts.push(String(e.text));
+      if (e.error) parts.push("error: " + e.error);
+      if (e.thesis) parts.push("thesis: " + e.thesis);
+      if (e.pnl_sol != null) parts.push("pnl: " + e.pnl_sol + " SOL");
+      if (e.held_sec != null) parts.push("held: " + e.held_sec + "s");
+      if (e.mcap_usd != null) parts.push("mcap: $" + fmtNum(Number(e.mcap_usd)));
+      if (e.fees_sol != null) parts.push("fees: " + e.fees_sol + " SOL");
+      if (e.buy_sol != null) parts.push("buy: " + e.buy_sol + " SOL");
+      ["profit_pct", "loss_pct"].forEach((k) => {
+        if (e[k] != null && e[k] !== "") parts.push(k + ": " + e[k]);
+      });
+      if (kind === "decision" && e.action) parts.unshift("action: " + e.action);
+      const full = `[${label}] ${mint}\n` + (parts.join("\n") || JSON.stringify(e));
+      const preview = `${label}  ${mint.slice(0, 8)}…  ` + (parts.find((p) => p.startsWith("why:")) || parts[0] || "").replace(/\s+/g, " ");
+
+      // new mint while we still have open rows → archive previous
+      if (activeMint && mint && mint !== activeMint && openRows.length) {
+        archiveOpenMint(activeMint.slice(0, 8) + "…");
+      }
+      if (mint) activeMint = mint;
+
+      const div = document.createElement("div");
+      div.className = "row agent";
+      div.dataset.full = full;
+      div.dataset.preview = preview;
+      div.title = full;
+      div.innerHTML =
+        `<span class="tag">${escapeHtml(label)}</span>` +
+        `<span class="row-preview">${escapeHtml(preview)}</span>` +
+        `<div class="row-full">${escapeHtml(full)}</div>`;
+      agentLog.prepend(div);
+      openRows.push(div);
+      while (agentLog.children.length > 120) {
+        const last = agentLog.lastChild;
+        if (openRows.includes(last)) openRows = openRows.filter((x) => x !== last);
+        agentLog.removeChild(last);
+      }
+
+      // trade / search finished → collapse into one block
+      if (kind === "thesis" || kind === "reject" || kind === "sell") {
+        archiveOpenMint((e.name || e.symbol || mint || "coin").toString().slice(0, 24));
+        activeMint = null;
+      }
+    }
+
+    function flashPass(m) {
+      const name = m.name || m.symbol || "";
+      const mint = m.mint || m.coin_mint || "";
+      const full = `FILTER PASS\n${name}\n${mint}\nvenue=${m.venue || m.platform || ""}\nmcap=${m.market_cap_usd ?? ""}`;
+      const div = document.createElement("div");
+      div.className = "row pass-flash";
+      div.title = full;
+      div.innerHTML =
+        `<span class="tag" style="color:var(--ok)">pass</span>` +
+        `<span class="row-preview">${escapeHtml(name + "  " + mint.slice(0, 10) + "…")}</span>` +
+        `<div class="row-full">${escapeHtml(full)}</div>`;
+      agentLog.prepend(div);
+    }
+
+    function flashFail(m) {
+      const mint = m.mint || m.coin_mint || "";
+      if (!mint || rejectSeen.has(mint)) return;
+      rejectSeen.add(mint);
+      if (rejectSeen.size > 200) {
+        const first = rejectSeen.values().next().value;
+        rejectSeen.delete(first);
+      }
+      const name = m.name || m.symbol || "";
+      const why = (m.filter_reasons || []).slice(0, 3).join("; ") || "rejected";
+      const full = `FILTER REJECT\n${name}\n${mint}\n${why}`;
+      const preview = `reject  ${(name || mint.slice(0, 10))}  ${why}`.replace(/\s+/g, " ");
+      const div = document.createElement("div");
+      div.className = "row fail-flash";
+      div.title = full;
+      div.innerHTML =
+        `<span class="tag">reject</span>` +
+        `<span class="row-preview">${escapeHtml(preview.slice(0, 140))}</span>` +
+        `<div class="row-full">${escapeHtml(full)}</div>`;
+      agentLog.prepend(div);
+    }
+
     async function refresh() {
       try {
         const s = await api("/api/status");
         setPill("ollamaPill", s.ollama && s.ollama.up);
         setPill("daemonPill", s.daemon && s.daemon.up);
-        const loopOn = !!(s.loop && s.loop.running);
-        setPill("loopPill", loopOn);
-        $("fModel").textContent = (s.ollama && s.ollama.model) || "—";
-        $("fPhase").textContent = (s.loop && s.loop.phase) || (s.daemon && s.daemon.up ? "—" : "daemon down");
-        $("fMint").textContent = (s.loop && s.loop.mint) || "—";
-        $("fAction").textContent = (s.loop && s.loop.last_action) || "—";
-        $("fNarr").textContent = (s.loop && s.loop.last_narrative) || "—";
+        setPill("loopPill", !!(s.loop && s.loop.running));
+        setText("fModel", s.ollama && s.ollama.model);
+        setText("fPhase", (s.loop && s.loop.phase) || (s.daemon && s.daemon.up ? "—" : "daemon down"));
+        setText("fMint", s.loop && s.loop.mint);
+        setText("fAction", s.loop && s.loop.last_action);
+        setText("fNarr", s.loop && s.loop.last_narrative);
         const st = s.daemon && s.daemon.status;
-        $("fBacklog").textContent =
-          st && st.backlog_pending != null ? String(st.backlog_pending) : "—";
-        $("hint").textContent = "";
+        setText("fBacklog", st && st.backlog_pending != null ? String(st.backlog_pending) : "—");
+        setText("hint", "", "");
+        renderCoin(s.coin || {}, s.loop || {}, s.live || {});
         if (s.daemon && s.daemon.up && !lastDaemonUp) connectLive();
         if (!(s.daemon && s.daemon.up) && lastDaemonUp) disconnectLive();
         lastDaemonUp = !!(s.daemon && s.daemon.up);
       } catch (e) {
-        $("hint").textContent = String(e.message || e);
+        setText("hint", String(e.message || e));
       }
     }
 
@@ -252,53 +582,29 @@
         if (data.stream === "hello") return;
         if (data.stream === "migration") {
           const m = data.migration || {};
-          const passed = m.filter_passed === true;
-          const failed = m.filter_passed === false;
-          const tag = passed ? "pass" : failed ? "fail" : "mig";
-          const cls = passed ? "pass" : failed ? "fail" : "";
-          const mint = (m.mint || m.coin_mint || "").slice(0, 12);
-          const name = m.name || m.symbol || "";
-          const venue = m.venue || m.platform || m.pool || "";
-          const why = (m.filter_reasons || []).slice(0, 2).join("; ");
-          addRow(
-            migLog,
-            cls,
-            `<span class="tag">${tag}</span><span class="meta">${venue}</span> ${name} <span class="meta">${mint}…</span>` +
-              (why ? `<div class="meta">${why}</div>` : "")
-          );
+          if (m.filter_passed === true) flashPass(m);
+          else if (m.filter_passed === false) flashFail(m);
           return;
         }
         if (data.stream === "agent") {
-          const e = data.event || {};
-          const kind = e.kind || "event";
-          const mint = (e.mint || "").slice(0, 10);
-          const bits = [];
-          if (e.reasoning) bits.push(e.reasoning);
-          if (e.text) bits.push(String(e.text).split("\n")[0]);
-          if (e.error) bits.push(e.error);
-          if (e.narrative) bits.push(e.narrative);
-          addRow(
-            agentLog,
-            "agent",
-            `<span class="tag">${kind}</span><span class="meta">${mint}</span> ${bits.join(" — ").slice(0, 220)}`
-          );
+          addAgentEvent(data.event || {});
+          // refresh coin card soon after focus
+          if ((data.event || {}).kind === "focus") refresh();
         }
       };
-      es.onerror = () => {
-        $("hint").textContent = "live stream disconnected (is daemon up?)";
-      };
+      es.onerror = () => setText("hint", "live stream disconnected");
     }
 
     function bind(id, path) {
       $(id).onclick = async () => {
         $(id).disabled = true;
-        $("hint").textContent = "…";
+        setText("hint", "…");
         try {
           await api(path, "POST");
-          $("hint").textContent = "ok";
+          setText("hint", "ok");
           await refresh();
         } catch (e) {
-          $("hint").textContent = String(e.message || e);
+          setText("hint", String(e.message || e));
         } finally {
           $(id).disabled = false;
         }
@@ -306,6 +612,7 @@
     }
 
     bind("btnOllamaStart", "/api/ollama/start");
+    bind("btnOllamaStop", "/api/ollama/stop");
     bind("btnDaemonStart", "/api/daemon/start");
     bind("btnDaemonStop", "/api/daemon/stop");
     bind("btnLoopStart", "/api/loop/start");
