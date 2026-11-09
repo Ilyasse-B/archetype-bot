@@ -28,6 +28,12 @@ from archetype.llm.graph import (
     load_thesis_prompt,
 )
 from archetype.llm.memory import FocusMemory
+from archetype.tools.vamp import (
+    VampBuffer,
+    VampHit,
+    format_vamp_alert,
+    match_vamp,
+)
 
 log = logging.getLogger("archetype.agent.loop")
 
@@ -63,6 +69,14 @@ class AgentLoop:
         # migrations --follow polls this. survives across start/stop.
         self.feed = AgentFeed()
         self._seen_hit_seqs: set[int] = set()
+        # in-memory vamp backlog for the current focus (not sqlite)
+        self.vamp = VampBuffer()
+        # live focus for the filter thread (updated mid-tick via focus_hook)
+        self._focus_snap: dict[str, Any] = {
+            "phase": "idle",
+            "mint": None,
+            "coin": None,
+        }
 
     @property
     def running(self) -> bool:
@@ -137,7 +151,114 @@ class AgentLoop:
                 emit=_emit,
                 buy_sol=self.settings.buy_sol_for_mcap,
                 abort=asyncio.Event(),
+                abort_reason=None,
+                vamp=self.vamp,
+                focus_hook=self._on_focus_change,
             )
+        )
+
+    def _on_focus_change(
+        self,
+        phase: str,
+        mint: str | None,
+        coin: dict[str, Any] | None,
+    ) -> None:
+        """graph calls this when focus starts/locks/ends — mid-tick safe."""
+        self._focus_snap = {
+            "phase": str(phase or "idle"),
+            "mint": (mint or "").strip() or None,
+            "coin": dict(coin) if isinstance(coin, dict) else None,
+        }
+
+    def focus_snapshot(self) -> dict[str, Any] | None:
+        """
+        phase + focus coin for the vamp matcher.
+
+        prefers the mid-tick focus_hook snapshot; falls back to last tick state.
+        safe to call from the filter worker thread.
+        """
+        snap = self._focus_snap
+        phase = str(snap.get("phase") or "idle")
+        mint = str(snap.get("mint") or "").strip()
+        coin = snap.get("coin")
+        if phase == "idle" or not mint or not isinstance(coin, dict):
+            # fallback: last completed tick (e.g. before first focus_hook)
+            state = self.state
+            phase = str(state.get("phase") or "idle")
+            mint = str(state.get("mint") or "").strip()
+            coin = state.get("coin")
+            if phase == "idle" or not mint or not isinstance(coin, dict):
+                return None
+        return {
+            "phase": phase,
+            "mint": mint,
+            "coin": dict(coin),
+        }
+
+    def on_passed_migration(self, candidate: dict[str, Any]) -> None:
+        """
+        filter PASS hook. only while focused; searching buffers, locked alerts.
+
+        called from the filter thread after enqueue_passed — keep it sync.
+        """
+        if not isinstance(candidate, dict):
+            return
+        snap = self.focus_snapshot()
+        if snap is None:
+            return
+        hit = match_vamp(snap["coin"], candidate)
+        if hit is None:
+            return
+        phase = snap["phase"]
+        if phase == "searching":
+            self.vamp.buffer_add(hit)
+            return
+        if phase == "locked":
+            self._alert_locked_vamp(hit)
+            return
+        # idle / unknown — ignore
+        log.debug("VAMP ignore phase=%s mint=%s", phase, hit.mint[:8])
+
+    def _alert_locked_vamp(self, hit: VampHit) -> None:
+        """write event, live emit, cancel in-flight think with vamp reason."""
+        deps = getattr(self._lock, "deps", None) if self._lock is not None else None
+        focus = str(self.state.get("mint") or "").strip()
+        if not focus or deps is None:
+            # loop not armed yet — keep it so a later flush can still fire
+            self.vamp.buffer_add(hit)
+            return
+        # locked path — already holding
+        text = format_vamp_alert(hit, holding=True, explain=True)
+        payload = hit.to_payload(text=text)
+        try:
+            deps.memory.append_event(focus, "vamp", payload)
+            self.vamp.note_presented(hit.mint)
+        except Exception:  # noqa: BLE001
+            log.warning("VAMP event not stored", exc_info=True)
+        emit = getattr(deps, "emit", None)
+        if emit is not None:
+            try:
+                emit(
+                    "vamp",
+                    mint=hit.mint,
+                    name=hit.name or "",
+                    symbol=hit.symbol or "",
+                    text=text,
+                    matched_on=list(hit.matched_on),
+                    why=hit.why,
+                    focus_mint=focus,
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("VAMP live emit failed", exc_info=True)
+        # cancel in-flight think; bag stays open (not tpsl close)
+        deps.abort_reason = "vamp"
+        if deps.abort is not None:
+            deps.abort.set()
+        log.info(
+            "VAMP interrupt focus=%s cand=%s on=%s",
+            focus[:8],
+            hit.mint[:8],
+            ",".join(hit.matched_on),
         )
 
     async def _warm_ollama(self) -> None:
@@ -217,9 +338,11 @@ class AgentLoop:
                 except Exception:  # noqa: BLE001
                     log.debug("could not store tpsl event", exc_info=True)
                 # the coin is flat. drop the think that is still running.
-                abort = getattr(getattr(self._lock, "deps", None), "abort", None)
-                if abort is not None:
-                    abort.set()
+                deps = getattr(self._lock, "deps", None) if self._lock else None
+                if deps is not None:
+                    deps.abort_reason = "tpsl"
+                    if deps.abort is not None:
+                        deps.abort.set()
 
     async def _watch_hits(self) -> None:
         """check tp/sl about once a second so the cli is not stuck waiting on a think."""

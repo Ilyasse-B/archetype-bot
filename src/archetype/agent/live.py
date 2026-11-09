@@ -104,10 +104,12 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         if text:
             console.print(f"         {text}")
         return
-    if kind in ("metrics", "safety", "dex", "wallets"):
-        reason = str(ev.get("reasoning") or "").strip()
+    if kind in ("metrics", "safety", "dex", "wallets", "vamp"):
+        reason = str(ev.get("reasoning") or ev.get("why") or "").strip()
+        colour = "yellow" if kind == "vamp" else "cyan"
         console.print(
-            f"{head} [cyan]{kind}[/cyan] {label}" + (f" — {reason}" if reason else "")
+            f"{head} [{colour}]{kind}[/{colour}] {label}"
+            + (f" — {reason}" if reason else "")
         )
         text = str(ev.get("text") or "").strip()
         for line in text.splitlines():

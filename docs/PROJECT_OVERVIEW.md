@@ -1,6 +1,6 @@
 # Archetype Bot — Project Overview & Suggested Architecture
 
-> Status: **Phase 4 loop is running** — LangGraph lock loop on local Ollama `llama3.2:3b` (one coin, buy/reject/wait, then hold/revise/sell, thesis on close). Live-checked on migrations: it waits and rejects. A full buy → sell round has not been watched through yet. **Phase 5 in progress** — every think includes the market-cap move since the last peek. There is no fast-move alert. Live holder metrics are on the first think and callable again as `metrics` (rank 0.5). The agent can call `safety` (rank 0.8: Rugcheck, Streamflow locks, Solana Tracker), `dex` (rank 0.25: Dexscreener paid profile and active boosts), and `wallets` (rank 0.4: tracked KOL holders ∩ mint, count + avg rating only). The rest of the list is still ahead (`docs/all-tools.md`: vamp, backlog peek, website, X, Gemini). Call-control is noted and not built. Ollama `0.34.4` under `~/.local`; user unit is **disabled** — start it only when the agent runs. Global fees gate is a **hard 2 SOL** floor.
+> Status: **Phase 4 loop is running** — LangGraph lock loop on local Ollama `llama3.2:3b` (one coin, buy/reject/wait, then hold/revise/sell, thesis on close). Live-checked on migrations: it waits and rejects. A full buy → sell round has not been watched through yet. **Phase 5 in progress** — every think includes the market-cap move since the last peek. There is no fast-move alert. Live holder metrics are on the first think and callable again as `metrics` (rank 0.5). The agent can call `safety` (rank 0.8: Rugcheck, Streamflow locks, Solana Tracker), `dex` (rank 0.25: Dexscreener paid profile and active boosts), and `wallets` (rank 0.4: tracked KOL holders ∩ mint, count + avg rating only). **Vamp / copycat** is built as a fed/interrupt scanner on filter-PASS migrations while focused (`docs/vamp-tool.md`). Still ahead: backlog peek, website, X, Gemini. Call-control is noted and not built. Ollama `0.34.4` under `~/.local`; user unit is **disabled** — start it only when the agent runs. Global fees gate is a **hard 2 SOL** floor.
 > Host: Linux Mint 23 (server-style background service + CLI).  
 > Hardware: i7-12th gen, 16GB RAM, ~2GB NVIDIA MX550 (mostly unused).
 
@@ -23,9 +23,9 @@ Scan **migrated / graduated** tokens only as the default universe. New pairs are
 
 **What “migrated” means:** token finishes the Pump.fun bonding curve and graduates into **PumpSwap** (Pump AMM). Since ~March 2025 this is the normal path (not legacy Raydium for new graduates).
 
-### Secondary tool: vamp / revamp scan
+### Secondary path: vamp / copycat scan (fed / interrupt)
 
-While **holding or deeply researching one focused coin**, a tool may scan new launches for copycats (“vamps”) that could dump the focused coin. Not a second trading universe.
+While **focused on one coin**, filter-PASS migrations are compared for same-narrative copies (“vamps”). Searching buffers hits; buy flushes them; locked hits interrupt the think (not TP/SL close). The agent does not buy the vamp from the alert. Spec: `docs/vamp-tool.md`.
 
 ### Single-coin trading lock (critical)
 
@@ -139,8 +139,8 @@ This is the first basic part of the project — the spine everything else hangs 
 8. WHILE LOCKED (agent thinks continuously about this coin):
       - Price/exec engines: every tick; hit TP/SL → paper sell
       - Agent loop: last summary + last 5 events + price/%/PnL helpers
-        → revise TP/SL + narrative; may call metrics, safety, or dex again
-        (dev wallet, tracked wallets, vamp, linked X, backlog peek, website, Gemini still ahead)
+        → revise TP/SL + narrative; may call metrics, safety, dex, or wallets again
+        (vamp is a fed/interrupt alert, not callable; linked X, backlog peek, website, Gemini still ahead)
 9. ON CLOSE: full history → final thesis → DB (thesis + PnL + hold time…)
 10. UNLOCK → pop next from backlog → step 7
 ```
@@ -160,7 +160,7 @@ This is the first basic part of the project — the spine everything else hangs 
 - **CLI separate:** localhost FastAPI client; owns Helius live watch / interactive trade stream.
 - **Price path:** Helius WS in CLI for display. Daemon keeps **one** vault websocket per focused coin. Peek and TP/SL both read that socket. Peek does not poll RPC while the coin is in focus.
 - **Execution:** paper fills via `/paper/*` (human) or `/agent/*` (LLM); caps 2% / 5 SOL still policy (not hard-enforced in CLI yet).
-- **Agent (Phase 4, running):** one coin at a time. Searching: `buy` / `reject` / `wait`, plus `metrics`, `safety`, and `dex`. Locked: `hold` / `revise_tpsl` / `sell`, plus the same three tools. A tool call does not count as a search look. Buy must include TP+SL. Each think peeks price once and includes the move since the last peek. After a buy, the pinned prompt drops the buy / wait / reject wording. See §10 Phase 4 and Phase 5.
+- **Agent (Phase 4, running):** one coin at a time. Searching: `buy` / `reject` / `wait`, plus `metrics`, `safety`, `dex`, and `wallets`. Locked: `hold` / `revise_tpsl` / `sell`, plus the same tools. Vamp is a fed/interrupt alert (not callable). A tool call does not count as a search look. Buy must include TP+SL. Each think peeks price once and includes the move since the last peek. After a buy, the pinned prompt drops the buy / wait / reject wording. See §10 Phase 4 and Phase 5.
 - Human CLI can force exit anytime (`sell` / trade-stream leave).
 
 ---
@@ -173,7 +173,7 @@ SEARCH / FREE:
 
 LOCKED (continuous agent loop on one mint):
   loop: summary + last 5 events + price helpers → update TP/SL + narrative
-        optional tools (metrics 0.5, safety 0.8, dex 0.25 are built; vamp, linked X, backlog peek still ahead)
+        optional tools (metrics 0.5, safety 0.8, dex 0.25, wallets 0.4); vamp fed/interrupt built; linked X, backlog peek still ahead
   || parallel forever: price_engine ticks → execution hits TP/SL
 
 ON CLOSE:
@@ -531,7 +531,11 @@ Spec and build order: `docs/all-tools.md`. The catalogue the model actually sees
 
 4. **Dexscreener (agent).** `src/archetype/tools/dex.py`. Action `dex`, rank 0.25. Not on the first prompt. The agent only sees `dex paid` (true when an approved token profile is in the orders) and `active boosts` (the live count on the pair). Extra websites and socials are merged onto the stored coin when the URL is new. `imageUrl` and `header` are stored too. None of those links are shown. No API key.
 
-**Still ahead:** dev wallet, tracked wallets, vamp, backlog peek, website legitimacy, X, Gemini. Call-control (don’t call the same tool again while its last result is still the latest read, a short cooldown, and a nudge toward metrics and safety before narrative tools) is written in `docs/all-tools.md` and not implemented.
+5. **Tracked wallets (agent).** `src/archetype/tools/wallets.py`. Action `wallets`, rank 0.4. Count + avg rating only.
+
+6. **Vamp / copycat (alert — fed / interrupt, not callable).** `src/archetype/tools/vamp.py`. On filter-PASS migrations while focused: name/ticker/shared social URL match → buffer (searching), flush on buy, or interrupt + rethink when locked. Agent sees a short alert (name/symbol, matched fields, optional pairing) and judges whether to sell/reject; detector does not score “stronger”. Hold/revise after a vamp drops those mints from the migration backlog. Later, with X tools, revisit reply/quote-chain matching. Design: `docs/vamp-tool.md`.
+
+**Still ahead:** backlog peek, website legitimacy, X, Gemini. Call-control (don’t call the same tool again while its last result is still the latest read, a short cooldown, and a nudge toward metrics and safety before narrative tools) is written in `docs/all-tools.md` and not implemented.
 
 **Keys:** Solana Tracker (`ARCHETYPE_SOLANA_TRACKER_API_KEY`) is required for ATH, cashback/holder-reward flags, and the richer metrics lines. Rugcheck / Streamflow / Jupiter / Donate.gg need no key. Pump.fun frontend APIs are **not used** (Cloudflare bot wall).
 
@@ -659,11 +663,11 @@ StonkFun pairs memecoins with tokenized stocks / other quotes via **Raydium Laun
 Implementation knobs and later tools — **do not block** the basic flow:
 
 - Exact paper-fill / slippage model (spot fills exist; fees/slippage not yet)
-- Exact bankroll starting size, vamp-matching heuristics
+- Exact bankroll starting size
 - Fine-tuning export formatting details
-- Tool catalog for Phase 5 → **in progress**. Built: price-change, live metrics (0.5), safety (0.8), Dexscreener (0.25). Still ahead: dev wallet, tracked wallets, vamp, backlog peek, website, X, Gemini. Spec: **`docs/all-tools.md`**.
+- Tool catalog for Phase 5 → **in progress**. Built: price-change, live metrics (0.5), safety (0.8), Dexscreener (0.25), wallets (0.4), vamp alert (fed/interrupt). Still ahead: backlog peek, website, X, Gemini. Spec: **`docs/all-tools.md`**.
 - Agent peek → **done** (one price each think, plus % since the last peek). Fast-move alerts were removed.
-- LangGraph lock loop → **running** (Phase 4). `metrics`, `safety`, and `dex` are in the action list. Call-control is not.
+- LangGraph lock loop → **running** (Phase 4). `metrics`, `safety`, `dex`, and `wallets` are in the action list; vamp is fed. Call-control is not.
 - **StonkFun / Raydium LaunchLab:** decode PumpPortal `raydium-cpmm` migrate txs for real CA; separate Raydium paper price/exec; optional second discovery via LaunchLab `logsSubscribe` / Raydium HTTP APIs (§14.5)  
 
 ---

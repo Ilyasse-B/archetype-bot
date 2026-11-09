@@ -62,8 +62,8 @@ def ensure_backlog_table(ledger_path: Path) -> None:
         conn.commit()
 
 
-def _coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
-    """snapshot worth keeping for the agent later."""
+def coin_info_from_event(event: MigrationEvent) -> dict[str, Any]:
+    """snapshot worth keeping for the agent later (and vamp matcher)."""
     metrics = dict(event.filter_metrics or {})
     # drop huge nested blobs if any
     meta = event.metadata or metrics.get("metadata") or {}
@@ -127,7 +127,7 @@ def enqueue_passed(
     """
     ensure_backlog_table(ledger_path)
     mint = event.mint
-    info = _coin_info_from_event(event)
+    info = coin_info_from_event(event)
 
     with sqlite3.connect(ledger_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -277,6 +277,39 @@ def clear_pending(ledger_path: Path) -> int:
         cur = conn.execute("DELETE FROM migration_backlog WHERE consumed = 0")
         conn.commit()
         return int(cur.rowcount)
+
+
+def drop_pending_mints(
+    ledger_path: Path, mints: list[str] | set[str] | tuple[str, ...]
+) -> int:
+    """
+    remove pending migration-backlog rows for these mints.
+
+    used when the agent keeps focus after a vamp alert (vamp not better).
+    marks consumed=1 so FIFO will not feed them later.
+    """
+    wanted = sorted({(m or "").strip() for m in mints if (m or "").strip()})
+    if not wanted:
+        return 0
+    ensure_backlog_table(ledger_path)
+    dropped = 0
+    with sqlite3.connect(ledger_path) as conn:
+        for mint in wanted:
+            cur = conn.execute(
+                "UPDATE migration_backlog SET consumed = 1 "
+                "WHERE mint = ? AND consumed = 0",
+                (mint,),
+            )
+            n = int(cur.rowcount)
+            if n:
+                dropped += n
+                log.info(
+                    "BACKLOG drop vamp-dismissed mint=%s rows=%s",
+                    mint,
+                    n,
+                )
+        conn.commit()
+    return dropped
 
 
 def pending_count(ledger_path: Path) -> int:

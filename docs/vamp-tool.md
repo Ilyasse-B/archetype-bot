@@ -1,8 +1,8 @@
 # Vamp / copycat scanner — implementation plan
 
-Design for Phase 5 tool 6. **Not built yet.** This doc is the build brief.
+Design for Phase 5 tool 6. **Built** as a fed/interrupt scanner (`src/archetype/tools/vamp.py`). This doc remains the behaviour brief.
 
-When we implement, update `docs/all-tools.md` §6: today it says **agent**; it should become event-driven (**fed** / interrupt), not a callable action. Same pass should touch `docs/PROJECT_OVERVIEW.md` and the catalogue line in `trader.md`.
+`docs/all-tools.md` §6, `docs/PROJECT_OVERVIEW.md`, and the catalogue line in `trader.md` track the fed/interrupt labelling.
 
 ---
 
@@ -103,10 +103,10 @@ flowchart TD
 
 Migrations already go: ingest → repair → `run_full_filters` → backlog enqueue on PASS.
 
-**Compare after `fetch_token_metadata`** in `src/archetype/filters/full.py` (name, symbol, socials available).
+**Compare on filter PASS** in `src/archetype/api/app.py` after `enqueue_passed` (candidate already has name, symbol, socials from the full filter path).
 
-- Run even if the socials gate later **fails**. A rejected copy can still steal attention.
-- Skip if on-chain failed before metadata (nothing useful to compare).
+- **v1 product rule:** only **passed** migrations (not socials-fail rejects). Matches the live “daemon migrations that enter the backlog” feed.
+- Skip when idle / no focus.
 - Need a **focus snapshot** from the running loop: phase, focus mint, focus `coin_info` (name, symbol, twitter, telegram, website, quote_mint / quote_symbol, description optional).
 
 Focus today: `AgentLoop.state` + `AgentToolkit.focus_mint` + graph `state["coin"]` from backlog `coin_info`.
@@ -136,23 +136,22 @@ Skip if candidate mint equals focus mint.
 |--------|------|
 | **Ticker** | Exact match after normalize, **or** one contains the other when both length ≥ 3. |
 | **Name** | Exact after normalize, **or** high token overlap / containment after dropping stopwords (`the`, `a`, `coin`, `token`, `inu` only as a lone token is weak — prefer multi-token / shared distinctive tokens). |
-| **Social URL** | Any shared normalized twitter, telegram, or website. |
-| **Pairing boost** | Same non-SOL `quote_mint` as focus **and** at least one name/ticker/social hit → set `stronger_pairing: true` (not a hit by itself). |
+| **Social URL** | Any shared normalized twitter, telegram, or website (exact URL / same status id). Counts as a match signal only — we do **not** score reply/quote graphs yet. |
+| **Pairing (display)** | If the candidate has a non-SOL quote, show `pairing:` for the agent. **Never** set a programmatic “stronger” flag — the agent judges pairing vs focus. |
 
 Shared twitter **status** URL (same `/status/id`) is a strong social hit. Shared profile-only URL is weaker but still counts in v1 (agent judges). Same host with unrelated paths does not match after path-aware norm.
 
-### Output struct (buffer + alert)
+### Output struct (buffer + internal payload)
 
 ```text
-mint, name, symbol
+mint          — kept in memory/payload for dismiss / logging; NOT shown to the agent
+name, symbol
 matched_on: ["ticker" | "name" | "twitter" | "telegram" | "website", ...]
-socials_overlap: short labels / urls
-quote_label: e.g. TESLAx or null
-stronger_pairing: bool
-why: one short line
+quote_label: e.g. TESLAx or null (agent-facing only when set)
+why: short backend log line
 ```
 
-No full second opening card. No wallet lists. No buy size.
+No full second opening card. No wallet lists. No buy size. No `stronger_pairing`. No overlap URL dump in the agent block.
 
 ---
 
@@ -218,24 +217,26 @@ Exact wording can be tightened when wiring `trader.md`. Searching catalogue does
 
 ### Alert block
 
+Header verb follows focus status: **selling** when holding / locked (including flush-after-buy); **rejecting** if shown before a buy.
+
 ```text
-vamp:
-mint: <base58>
-name: <name>  symbol: <ticker>
-matched: ticker, twitter
-overlap: twitter=<url>
-pairing: TESLAx
-note: same-narrative copy candidate. if stronger than focus, sell now. do not buy this mint from this alert.
+Vamp alert - another coin has migrated which may be similar to the coin you are currently focused on, assess the below details and decide whether it is worth selling your current coin
+name: Artificial Inu  symbol: AI (compare the name and symbol of this coin to your current coin's name and symbol, are they better?)
+matched: name, twitter (these are the fields that matched to your current coin)
+pairing: TESLAx (evaluate if this pairing is better than the pairing of your current coin (if it has one) in relation to the narrative)
+in your json reply, fill reasoning with why you sell, hold, reject, or otherwise keep this focus after this vamp alert
 ```
 
-- First delivery for a focus may keep short field notes; later hits stay compact.
-- Multiple buffered hits flush as separate blocks or one block with multiple mint sections — prefer **one block per mint**, newest first, stay inside the last-5 events cap (if many, keep highest-signal / most recent).
+- Field notes use the same bracket style as other tools (`explain=True` on first delivery; compact values later).
+- No mint, overlap, stronger_pairing, or trailing `note:` line on the agent block.
+- When a vamp event is in the prompt window, the decision grammar requires non-empty `reasoning`, and the loop rejects blank/echo-stripped reasons.
+- Multiple buffered hits flush as **one block per mint**, newest first, stay inside the last-5 events cap (if many, keep highest-signal / most recent).
 
 ### What the agent decides
 
 1. Is this really the same narrative? (deterministic matcher can false-positive.)
-2. Is it **better** than focus? (shared tweet + better ticker/pairing/fees/mcap context the agent already has.)
-3. If yes → `sell` soon. If no → `hold` / keep levels; ignore weak copies.
+2. Is it **better** than focus? (name/ticker, pairing, fees/mcap context the agent already has — agent-only judgement.)
+3. If yes → `sell` soon (or `reject` if not bought). If no → `hold` / keep levels; system drops those vamp mints from the migration backlog.
 
 ---
 
@@ -261,7 +262,7 @@ Optional later: small unit tests for matcher examples below (no live chain requi
 | Focus | Candidate | Expect |
 |-------|-----------|--------|
 | name Artificial Inu, symbol INU, twitter status T1 | name Fartster, twitter status T2 (Roadster) | **no hit** (no shared name/ticker/url) |
-| Artificial Inu / INU / twitter T1 | Artificial Inu / AI / twitter T1 / quote TESLAx | **hit** on name + twitter; `stronger_pairing` if focus was SOL and candidate is TESLAx (or both TESLAx) |
+| Artificial Inu / INU / twitter T1 | Artificial Inu / AI / twitter T1 / quote TESLAx | **hit** on name + twitter; alert may show `pairing: TESLAx` for the agent to judge |
 | symbol DOGE | symbol DOGE | **hit** ticker |
 | symbol AI | symbol AIR | no ticker hit unless other signals (containment only if both ≥ 3 and intentional — tune so `AI` ⊄ `AIR` false friends; prefer exact for very short tickers) |
 | website https://x.com/foo/status/1 | website https://twitter.com/foo/status/1 | **hit** twitter/social |
@@ -284,10 +285,10 @@ Tune short-ticker rules during implement so 2-letter symbols require exact match
 
 ## 13. Deferred (after core)
 
-- X: candidate tweet is reply/quote of focus tweet (or same conversation). Highest-quality narrative link; belongs with X tools.
+- **X graph revisit (required later):** when X tools land, extend vamp matching beyond exact URL / status-id equality — e.g. candidate tweet is a **reply**, **quote**, or multi-hop reply/quote chain of the focus coin’s linked tweet. Highest-quality narrative link; stays out of v1.
 - Soft narrative assist (Gemini) only if deterministic recall is too noisy.
 - Persist vamp backlog across daemon restart (usually unnecessary; focus is short-lived).
-- Promote vamp mint in migration backlog (out of scope: agent sells focus; vamp arrives by normal FIFO if it PASSed filters).
+- Soft-promote vamp mint in migration backlog is unnecessary: PASS vamps are already queued. **v1 does the reverse on “not better”:** hold/revise after a vamp alert drops those mints from the migration backlog (`drop_pending_mints`). A sell leaves them queued so FIFO can feed the stronger copy next.
 
 ---
 

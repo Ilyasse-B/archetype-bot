@@ -36,6 +36,7 @@ metrics - 0.5 - latest holder count, top holders, and the last 5 minutes of trad
 safety - 0.8 - rug score, insider networks, locked supply, bundlers, and fees. Call it before you buy, and again if you have held a long time.
 dex - 0.25 - whether the coin paid for a dexscreener profile, and how many boosts are applied. A sign the people running it care about the coin and improves visibility and trust.
 wallets - 0.4 - how many tracked wallets currently hold this coin, and their average rating (0-1, the higher better). This means other well performing traders currently hold this coin.
+vamp - 0.9 - fed alert (not callable) when a new migrated coin looks like the same narrative as your coin (name/ticker/socials). evaluate it; if it is the same narrative and looks stronger, sell the current coin in focus if you are holding (or reject if you have not bought yet) and move on. if it is not stronger, keep your coin.
 {"action":"metrics","reasoning":"why you want a fresh metrics read"}
 {"action":"safety","reasoning":"why you want a safety read"}
 {"action":"dex","reasoning":"why you want a dex read"}

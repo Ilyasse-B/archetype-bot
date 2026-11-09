@@ -14,13 +14,16 @@ from typing import Any
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, parse_decision
 
 
-def decision_format(phase: str) -> dict[str, Any]:
+def decision_format(phase: str, *, after_vamp: bool = False) -> dict[str, Any]:
     """
     ollama grammar for one decision.
 
     narrative can be left out. before a buy, the grammar requires both
     percents so a buy cannot come back without them. wait and reject
     still get those numbers stripped afterwards.
+
+    after a vamp alert, reasoning is required with minLength so the model
+    cannot omit why it sold / held / rejected.
     """
     searching = phase != "locked"
     actions = (
@@ -32,12 +35,16 @@ def decision_format(phase: str) -> dict[str, Any]:
     # a 3b skips optional keys. force the two levels while it can still buy.
     if searching:
         required.extend(["profit_pct", "loss_pct"])
+    reasoning_schema: dict[str, Any] = {"type": "string"}
+    if after_vamp:
+        # force a real why-string in the grammar when a vamp is in this think
+        reasoning_schema["minLength"] = 1
     return {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": actions},
             "narrative": {"type": "string"},
-            "reasoning": {"type": "string"},
+            "reasoning": reasoning_schema,
             "profit_pct": {"type": "number", "exclusiveMinimum": 0},
             "loss_pct": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 100},
         },

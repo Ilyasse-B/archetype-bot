@@ -250,9 +250,31 @@ def coach_text(raw: str) -> str:
         )
     if "unterminated" in low or "invalid json" in low or "not prose" in low:
         return "reply was cut off. reasoning is one short sentence."
+    if "vamp" in low and "reasoning" in low:
+        return (
+            "after a vamp alert every reply needs reasoning: "
+            "why you sell, hold, reject, or keep this focus."
+        )
     if "reasoning" in low:
         return "every reply needs reasoning: why you took this action."
     return "reply was not valid json. one short sentence."
+
+
+def require_post_vamp_reasoning(decision: ThinkDecision, *, after_vamp: bool) -> None:
+    """
+    after a vamp alert, refuse an empty / missing why.
+
+    the ollama grammar already requires reasoning; this catches echo-stripped
+    blanks and anything that slipped the schema.
+    """
+    if not after_vamp:
+        return
+    why = (decision.reasoning or "").strip()
+    if not why:
+        raise DecisionInvalid(
+            "after a vamp alert every reply needs reasoning: "
+            "why you sell, hold, reject, or keep this focus"
+        )
 
 
 def _short_validation(exc: ValidationError) -> str:

@@ -138,9 +138,21 @@ The agent only sees:
 
 No wallet addresses or names. The first result has a short note beside each field (including that this is a weak side signal, not a core buy/sell reason). A later result is the two values only. The recent-events line is the block itself, starting at `wallets:`. A missing Helius key or a failed read is `wallets: unavailable`.
 
-### 6. Vamp / copycat scan — **agent**
+### 6. Vamp / copycat scan — **alert (fed / interrupt), not agent-callable**
 
-While focused on one coin, look at new launches that copy its name or narrative. Those can dump the coin we are in. This is not a second trading universe: the agent does not buy the copy.
+Built. There is **no** `{"action":"vamp"}`. While focused on one coin, new **filter-PASS** migrations are compared (name / ticker / shared social URLs) against the focus. Pairing is shown for the agent to judge — the detector never marks a copy as “stronger”. Not a second trading universe: the agent does not buy the copy from this alert.
+
+- **Searching:** buffer hits only (no interrupt, not injected into searching thinks).
+- **Buy:** flush buffered hits into the first locked think as `vamp` events (header says **selling**).
+- **Locked + new hit:** append event, live `vamp` line, cancel in-flight think with a **vamp** reason (not TP/SL close), then rethink. Bag stays open.
+- **Reject / drop / idle:** clear the in-memory vamp backlog.
+- **Hold / revise after a vamp:** treat as “not better” and drop those vamp mints from the **migration** backlog so FIFO will not feed them next. A sell leaves them queued.
+
+Agent block: header + `name`/`symbol` + `matched` + optional `pairing`, each with bracket field notes like other tools, plus a line that the JSON reply must include `reasoning` for the post-vamp decision. No mint or overlap line on the prompt. When a vamp event is in the think window, the decision grammar requires non-empty `reasoning`.
+
+**Later revisit (with X tools):** extend matching so linked socials can mean reply / quote / reply-chain of the focus tweet, not only exact URL or status-id equality. Track that under the X work and `docs/vamp-tool.md` §13.
+
+Rank ~0.9 informational catalogue line (not callable). Full design: `docs/vamp-tool.md`.
 
 ### 7. Backlog peek — **agent**
 

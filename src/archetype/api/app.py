@@ -89,6 +89,8 @@ class BacklogResponse(BaseModel):
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     hub = LiveHub()
+    # filled in lifespan so the filter hook can see the running AgentLoop
+    runtime: dict[str, Any] = {"agent_loop": None}
 
     def _publish_migration(event: MigrationEvent) -> None:
         hub.publish(
@@ -109,6 +111,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def _run() -> MigrationEvent:
             from archetype.ingest.repair import repair_migration_event
+            from archetype.backlog.store import coin_info_from_event
 
             # fix quote-as-mint frames BEFORE blacklist / on-chain gates
             ev = event
@@ -145,6 +148,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ev.filter_metrics = dict(result.metrics)
             if result.passed:
                 enqueue_passed(ledger, ev)
+                # vamp scanner: only PASS migrations, only while focused
+                agent_loop = runtime.get("agent_loop")
+                if agent_loop is not None:
+                    try:
+                        agent_loop.on_passed_migration(coin_info_from_event(ev))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("vamp observe failed %s: %s", ev.mint, exc)
             return ev
 
         return await asyncio.to_thread(_run)
@@ -177,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         agent_loop.feed.on_push = lambda item: hub.publish(
             {"stream": "agent", "event": item}
         )
+        runtime["agent_loop"] = agent_loop
         app.state.tpsl_engine = tpsl
         app.state.live_prices = live_prices
         app.state.agent_loop = agent_loop

@@ -25,7 +25,12 @@ from archetype.execution.wallet import get_position
 from archetype.llm.choices import decision_format, decision_from_message
 from archetype.llm.client import exc_text
 from archetype.llm.coin_prompt import assemble_trader_prompt, render_coin_block
-from archetype.llm.decision import DecisionInvalid, ThinkDecision, coach_text
+from archetype.llm.decision import (
+    DecisionInvalid,
+    ThinkDecision,
+    coach_text,
+    require_post_vamp_reasoning,
+)
 from archetype.llm.memory import FocusMemory
 from archetype.llm.transcript import flush_transcript, render_thesis, render_think
 from archetype.metadata.snapshot import fetch_coin_snapshot
@@ -87,8 +92,15 @@ class LoopDeps:
     # fixed buy size from mcap. None keeps whatever the model sent.
     buy_sol: Callable[[float | None], float] | None = None
     thesis_prompt: str = ""
-    # set when take-profit or stop-loss sells the coin mid-think
+    # set when take-profit or stop-loss sells the coin mid-think,
+    # or when a locked vamp alert cancels the in-flight call
     abort: asyncio.Event | None = None
+    # "tpsl" → close/thesis; "vamp" → rethink with bag still open
+    abort_reason: str | None = None
+    # in-memory vamp backlog owned by AgentLoop (optional in tests)
+    vamp: Any | None = None
+    # mid-tick focus mirror so the filter thread sees searching/locked immediately
+    focus_hook: Callable[[str, str | None, dict[str, Any] | None], None] | None = None
 
 
 def _fmt_num(val: float) -> str:
@@ -225,18 +237,155 @@ def _with_peek(update: dict[str, Any], peek_state: dict[str, Any]) -> dict[str, 
 
 
 def _clear_abort(deps: LoopDeps) -> None:
-    """the flat signal is for this coin only."""
+    """clear the cancel flag + reason for the next think."""
+    deps.abort_reason = None
     if deps.abort is not None and deps.abort.is_set():
         deps.abort.clear()
+
+
+def _abort_is(deps: LoopDeps, reason: str) -> bool:
+    """true when the cancel flag is set for this reason."""
+    return (
+        deps.abort is not None
+        and deps.abort.is_set()
+        and (deps.abort_reason or "tpsl") == reason
+    )
 
 
 def _bag_flat(deps: LoopDeps, phase: str, mint: str) -> bool:
     """true when take-profit or stop-loss already sold this coin."""
     if phase != "locked" or not mint:
         return False
+    # vamp interrupt cancels the think but the bag is still open
+    if _abort_is(deps, "vamp"):
+        return False
     if deps.abort is not None and deps.abort.is_set():
         return True
     return not _is_open(deps, mint)
+
+
+def _clear_vamp(deps: LoopDeps) -> None:
+    """drop the in-memory vamp backlog when focus ends or rejects."""
+    buf = deps.vamp
+    if buf is None:
+        return
+    try:
+        buf.clear()
+    except Exception:  # noqa: BLE001
+        log.debug("vamp clear failed", exc_info=True)
+
+
+def _vamp_set_focus(deps: LoopDeps, mint: str | None) -> None:
+    """tie / retarget the vamp buffer to this focus mint."""
+    buf = deps.vamp
+    if buf is None:
+        return
+    try:
+        buf.set_focus(mint)
+    except Exception:  # noqa: BLE001
+        log.debug("vamp set_focus failed", exc_info=True)
+
+
+def _publish_focus(
+    deps: LoopDeps,
+    phase: str,
+    mint: str | None,
+    coin: dict[str, Any] | None = None,
+) -> None:
+    """tell AgentLoop the live focus (filter hook reads this mid-tick)."""
+    hook = deps.focus_hook
+    if hook is None:
+        return
+    try:
+        hook(phase, mint, coin)
+    except Exception:  # noqa: BLE001
+        log.debug("focus_hook failed", exc_info=True)
+
+
+def _flush_vamp_events(deps: LoopDeps, focus_mint: str) -> None:
+    """on buy: push buffered vamp hits into focus memory + live feed."""
+    buf = deps.vamp
+    if buf is None or not focus_mint:
+        return
+    try:
+        from archetype.tools.vamp import format_vamp_alert
+
+        hits = buf.flush()
+    except Exception:  # noqa: BLE001
+        log.warning("vamp flush failed", exc_info=True)
+        return
+    # stay inside the last-5 events window — keep newest / highest-signal first
+    # flush() already returns newest-first; trim to 3 so buy/safety still fit
+    for hit in hits[:3]:
+        try:
+            # flush runs on buy → already holding
+            text = format_vamp_alert(hit, holding=True, explain=True)
+            payload = hit.to_payload(text=text)
+            deps.memory.append_event(focus_mint, "vamp", payload)
+            buf.note_presented(hit.mint)
+            _emit(
+                deps,
+                "vamp",
+                mint=hit.mint,
+                name=hit.name or "",
+                symbol=hit.symbol or "",
+                text=text,
+                matched_on=list(hit.matched_on),
+                why=hit.why,
+                focus_mint=focus_mint,
+            )
+            log.info(
+                "VAMP flushed → focus %s cand=%s on=%s",
+                focus_mint[:8],
+                hit.mint[:8],
+                ",".join(hit.matched_on),
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("vamp flush event failed", exc_info=True)
+
+
+def _dismiss_seen_vamps(deps: LoopDeps, focus_mint: str) -> None:
+    """
+    agent kept the focus after a vamp alert → drop those mints from
+    the migration backlog so we dont feed a weaker copy next.
+    """
+    if not focus_mint:
+        return
+    buf = deps.vamp
+    mints: list[str] = []
+    if buf is not None:
+        try:
+            mints = list(buf.take_presented())
+        except Exception:  # noqa: BLE001
+            log.debug("vamp take_presented failed", exc_info=True)
+    if not mints:
+        # fallback: anything still in the recent events window
+        try:
+            window = deps.memory.prompt_window(focus_mint)
+            for ev in window.events:
+                if getattr(ev, "kind", "") != "vamp":
+                    continue
+                payload = getattr(ev, "payload", None) or {}
+                if isinstance(payload, dict):
+                    vm = str(payload.get("mint") or "").strip()
+                    if vm:
+                        mints.append(vm)
+        except Exception:  # noqa: BLE001
+            log.debug("vamp dismiss window scan failed", exc_info=True)
+    if not mints:
+        return
+    try:
+        from archetype.backlog.store import drop_pending_mints
+
+        n = drop_pending_mints(deps.memory.ledger_path, mints)
+        log.info(
+            "VAMP dismissed from migration backlog focus=%s dropped=%s mints=%s",
+            focus_mint[:8],
+            n,
+            ",".join(m[:8] for m in mints),
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("vamp dismiss failed", exc_info=True)
 
 
 async def _call_model(chat: Any, messages: list[dict[str, str]], abort: asyncio.Event | None):
@@ -401,6 +550,9 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     # clear focus so next_candidate is allowed
     deps.tools.set_focus("free", None)
     _clear_abort(deps)
+    _clear_vamp(deps)
+    _vamp_set_focus(deps, None)
+    _publish_focus(deps, "idle", None, None)
     result = await deps.tools.call("next_candidate")
     item = (result or {}).get("item") if isinstance(result, dict) else None
     if not item:
@@ -438,6 +590,9 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             reasoning=skip,
         )
         deps.tools.set_focus("free", None)
+        _clear_vamp(deps)
+        _vamp_set_focus(deps, None)
+        _publish_focus(deps, "idle", None, None)
         return {
             "phase": "idle",
             "mint": None,
@@ -452,6 +607,8 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     _flush_transcript(deps, mint, "", "unfinished")
     deps.memory.begin_focus(mint)
     deps.tools.set_focus("free", mint)
+    _vamp_set_focus(deps, mint)
+    _publish_focus(deps, "searching", mint, coin if isinstance(coin, dict) else None)
     name = coin.get("name") or coin.get("symbol") or ""
     log.info("FOCUS %s %s", mint, name)
     _emit(
@@ -559,6 +716,13 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         onchain=onchain,
     )
     steps = int(state.get("steps") or 0) + 1
+    # vamp in the recent-events window → tighten reasoning in the grammar
+    after_vamp = any(getattr(ev, "kind", "") == "vamp" for ev in (window.events or []))
+    # vamp interrupt mid-prepare: clear and stop so the next tick rethinks
+    if _abort_is(deps, "vamp"):
+        log.info("VAMP interrupt %s — rethink with alert in events", mint)
+        _clear_abort(deps)
+        return _with_peek({"steps": steps, "route": "stop"}, peek_state)
     if _bag_flat(deps, phase, mint):
         log.info("FLAT %s — sold while preparing the think, writing thesis", mint)
         return {"route": "close"}
@@ -567,13 +731,18 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         chat = deps.chat
         # grammar picks the action. before a buy it also requires both levels.
         if hasattr(chat, "bind"):
-            chat = chat.bind(format=decision_format(phase))
+            chat = chat.bind(format=decision_format(phase, after_vamp=after_vamp))
         msg, aborted = await _call_model(chat, messages, deps.abort)
+        if aborted and _abort_is(deps, "vamp"):
+            log.info("VAMP interrupt %s — rethink with alert in events", mint)
+            _clear_abort(deps)
+            return _with_peek({"steps": steps, "route": "stop"}, peek_state)
         if aborted or _bag_flat(deps, phase, mint):
             log.info("FLAT %s — sold during the think, writing thesis", mint)
             return {"route": "close"}
         reply = _message_text(msg)
         decision = decision_from_message(msg, required_sol=required)
+        require_post_vamp_reasoning(decision, after_vamp=after_vamp)
     except (DecisionInvalid, Exception) as exc:  # noqa: BLE001
         raw = exc_text(exc)
         _save_think(deps, mint, messages, reply or None, error=raw)
@@ -762,6 +931,9 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             profit_pct=decision.profit_pct,
             loss_pct=decision.loss_pct,
         )
+        # kept focus after a vamp alert → vamp was not better
+        if phase == "locked":
+            _dismiss_seen_vamps(deps, mint)
         return {"last_action": "hold", "route": "stop"}
 
     if decision.action == "reject":
@@ -783,6 +955,8 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             reasoning=decision.reasoning,
             narrative=decision.narrative,
         )
+        # drop buffered vamps for this focus; close/release also clears
+        _clear_vamp(deps)
         # same close as a sell: thesis, then the next coin.
         return {"last_action": "reject", "route": "close"}
 
@@ -848,6 +1022,10 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             profit_pct=fields["profit_pct"],
             loss_pct=fields["loss_pct"],
         )
+        # searching hits land on the first locked think
+        _flush_vamp_events(deps, mint)
+        coin_now = state.get("coin") if isinstance(state.get("coin"), dict) else None
+        _publish_focus(deps, "locked", mint, coin_now)
         return {
             "phase": "locked",
             "last_action": "buy",
@@ -883,6 +1061,8 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             profit_pct=decision.profit_pct,
             loss_pct=decision.loss_pct,
         )
+        # kept focus after a vamp alert → vamp was not better
+        _dismiss_seen_vamps(deps, mint)
         return {"last_action": "revise_tpsl", "route": "stop"}
 
     # sell
@@ -940,6 +1120,9 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         deps.memory.save_reject_log(mint)
         deps.memory.drop_focus(mint)
     _clear_abort(deps)
+    _clear_vamp(deps)
+    _vamp_set_focus(deps, None)
+    _publish_focus(deps, "idle", None, None)
     deps.tools.set_focus("free", None)
     return {
         "phase": "idle",
@@ -1051,6 +1234,10 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         )
         deps.memory.drop_focus(mint)
     _clear_abort(deps)
+    # trade/focus over — clear the in-memory vamp backlog (not migration fifo)
+    _clear_vamp(deps)
+    _vamp_set_focus(deps, None)
+    _publish_focus(deps, "idle", None, None)
     deps.tools.set_focus("free", None)
     return {
         "phase": "idle",
@@ -1065,8 +1252,8 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         "told_flat": None,
         "told_summary_empty": None,
         "last_action": "thesis",
-        "last_narrative": thesis,
         "last_error": err,
+        "last_narrative": thesis,
         "steps": int(state.get("steps") or 0) + 1,
         "route": "stop",
     }
@@ -1188,8 +1375,8 @@ def _event_line(ev: Any) -> str:
     """tool blocks print in full. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
-    if kind in ("safety", "dex", "wallets") and isinstance(payload, dict):
-        # the block already starts with safety: / dex: / wallets:. no extra reason line.
+    if kind in ("safety", "dex", "wallets", "vamp") and isinstance(payload, dict):
+        # the block already starts with safety: / dex: / wallets: / vamp:.
         return str(payload.get("text") or "").strip() or f"{kind}:"
     if kind == "metrics" and isinstance(payload, dict):
         why = str(payload.get("reasoning") or "").strip()
