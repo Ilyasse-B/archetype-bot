@@ -32,6 +32,8 @@ Also skim LLM prompts under `src/archetype/llm/prompts/` (especially `trader.md`
 
 **Do not update `README.md` unless the user explicitly asks.** The README is a formality updated only after significant progress. It is not a core knowledge-base file or progress tracker. Prefer `docs/`, `AGENTS.md`, and Project Context for living knowledge.
 
+**Git workflow (user-gated):** Stay on `main`. **Commit and push only when the user explicitly asks.** Do **not** create feature branches or pull requests unless the user explicitly asks. When committing, do not add Cursor / AI co-author trailers.
+
 ## Then read code if you need precision
 
 Docs can lag. When implementing or debugging, follow the relevant code rather than guessing:
