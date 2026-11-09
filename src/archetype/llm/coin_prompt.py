@@ -103,24 +103,37 @@ def render_coin_block(
     return "\n".join(lines)
 
 
-def assemble_trader_prompt(template: str, *, phase: str, coin_block: str) -> str:
+def assemble_trader_prompt(
+    template: str,
+    *,
+    phase: str,
+    coin_block: str,
+    allowed_tools: list[str] | tuple[str, ...] | None = None,
+) -> str:
     """
-    inject the coin block and keep only the phase section that matches.
+    inject the coin block, tools catalogue, and keep only the matching phase.
 
     searching → buy/reject/wait block. locked → hold/revise/sell block.
+    allowed_tools filters the callable catalogue (one-think suppress).
     """
-    text = template.replace("{{COIN}}", (coin_block or "").strip() or "mint: unknown — the coin's address")
+    from archetype.llm.tools_catalog import build_tools_section
+
+    text = template.replace(
+        "{{COIN}}",
+        (coin_block or "").strip() or "mint: unknown — the coin's address",
+    )
     if phase == "locked":
         text = _keep_phase(text, "PHASE_LOCKED")
         text = _drop_phase(text, "PHASE_SEARCHING")
-        # safety tool line: already bought
-        text = text.replace(
-            "Call it before you buy, and again if you have held a long time.",
-            "Call it again if you have held a long time.",
-        )
     else:
         text = _keep_phase(text, "PHASE_SEARCHING")
         text = _drop_phase(text, "PHASE_LOCKED")
+    tools_block = build_tools_section(allowed_tools, phase=phase)
+    if "{{TOOLS}}" in text:
+        text = text.replace("{{TOOLS}}", tools_block)
+    else:
+        # older templates without the marker — append before trailing rules if any
+        text = text.rstrip() + "\n\n" + tools_block
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text.strip()

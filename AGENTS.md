@@ -28,11 +28,19 @@ Start here, in roughly this order:
 | `docs/web-app.md` | Demo viewer (side path) |
 | `docs/metadata.md`, `docs/ai_agent_architecture_blueprint.md`, others | Supporting detail |
 
-Also skim LLM prompts under `src/archetype/llm/prompts/` (especially `trader.md`) — the standing catalogue the model sees each think.
+Also skim LLM prompts under `src/archetype/llm/prompts/` (especially `trader.md`) and `src/archetype/llm/tools_catalog.py` — trade verbs on `action`, research on `tool` (see `docs/tool-calling-fixes.md`).
 
 **Do not update `README.md` unless the user explicitly asks.** The README is a formality updated only after significant progress. It is not a core knowledge-base file or progress tracker. Prefer `docs/`, `AGENTS.md`, and Project Context for living knowledge.
 
 **Git workflow (user-gated):** Stay on `main`. **Commit and push only when the user explicitly asks.** Do **not** create feature branches or pull requests unless the user explicitly asks. When committing, do not add Cursor / AI co-author trailers.
+
+## Agent-facing language (keep it open)
+
+Anything the trading model reads (`trader.md`, tool catalogue blurbs/examples in `tools_catalog.py`, fed event text, coach lines, thesis prompts, etc.) must **not** push it toward one fixed behaviour.
+
+- Do **not** hardcode example numbers that look like the “right” choice (e.g. `profit_pct: 30`, `loss_pct: 10` in buy/revise examples). Use placeholders like `X` / `Y`, or spell out “a suitable …”, so the model picks levels from the coin and its own reasoning.
+- Avoid forceful “always / must / whenever” nudges that collapse judgment (e.g. “call metrics whenever”, “always sell if …”) unless the product rule is truly mandatory and deterministic.
+- Prefer describing **what a field means** and **when it can help**, not a script the agent should copy every time.
 
 ## Then read code if you need precision
 

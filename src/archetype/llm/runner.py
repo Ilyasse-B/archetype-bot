@@ -385,6 +385,12 @@ class AgentLoop:
                         self.last_tick_sec,
                     )
                 delay = self.idle_sec if phase == "idle" else self.think_sec
+                # bare wait/hold asks for a shorter/explicit gap (default 10s)
+                deps = getattr(self._lock, "deps", None) if self._lock else None
+                override = getattr(deps, "next_delay_sec", None) if deps else None
+                if isinstance(override, (int, float)) and override > 0:
+                    delay = float(override)
+                    deps.next_delay_sec = None
                 await self._sleep(delay)
         except asyncio.CancelledError:
             return

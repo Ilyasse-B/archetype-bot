@@ -1,17 +1,8 @@
 """
 one think-step decision from the local model.
 
-field names match the /agent trade routes:
-  buy        → sol, profit_pct, loss_pct
-  sell       → percent | sol_amount | initials (none of them = full sell)
-  revise_tpsl→ profit_pct, loss_pct, clear_profit, clear_loss
-  reject     → reasoning
-
-mint, price, and pool stay on the loop. the model does not get to
-pick a different coin or invent a fill price.
-
-bad json, or a buy missing tp+sl, raises DecisionInvalid.
-that is a failed step — do not trade.
+trade verbs live on `action`. research tools live on `tool`.
+you can set either, or both. tools are never valid action values.
 """
 
 from __future__ import annotations
@@ -21,22 +12,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-ThinkAction = Literal[
-    "reject", "hold", "buy", "revise_tpsl", "sell", "metrics", "safety", "dex", "wallets"
-]
+from archetype.llm.tools_catalog import CALLABLE_TOOLS, is_callable_tool, norm_tool_name
+
+# trade / phase verbs only — never metrics/safety/dex/wallets
+ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell"]
+
+AgentTool = Literal["metrics", "safety", "dex", "wallets"]
 
 # tool is named set_tpsl; plan action is revise_tpsl. same thing.
+# wait (searching) is stored as hold; the loop labels it wait before buy.
 _ACTION_ALIASES = {
     "set_tpsl": "revise_tpsl",
     "tpsl": "revise_tpsl",
-    # before a buy, "wait" is the word. the loop still stores it as hold.
     "wait": "hold",
-    "onchain": "metrics",
-    "rugcheck": "safety",
-    "dexscreener": "dex",
-    "dex_paid": "dex",
-    "tracked": "wallets",
-    "tracked_wallets": "wallets",
 }
 
 
@@ -47,29 +35,55 @@ class DecisionInvalid(ValueError):
 class ThinkDecision(BaseModel):
     """structured output for one search or locked think step."""
 
-    action: ThinkAction
+    # optional when the reply is tool-only
+    action: ThinkAction | None = None
+    # optional research fetch; result lands on the next think
+    tool: AgentTool | None = None
     # blank means "keep the narrative we already have"
     narrative: str = ""
-    reasoning: str = Field(..., min_length=1, description="why this action")
+    reasoning: str = Field(..., min_length=1, description="why this reply")
     # buy — same names as AgentBuyRequest
     sol: float | None = Field(None, gt=0, description="SOL to spend")
     profit_pct: float | None = Field(None, gt=0, description="take-profit %%")
-    loss_pct: float | None = Field(None, gt=0, lt=100, description="stop-loss %% magnitude")
-    # sell — same names as AgentSellRequest. all empty = sell 100%
+    loss_pct: float | None = Field(
+        None, gt=0, lt=100, description="stop-loss %% magnitude"
+    )
+    # sell — same names as AgentSellRequest. all empty = full sell
     percent: float | None = Field(None, gt=0, le=100, description="%% of tokens")
     sol_amount: float | None = Field(None, gt=0, description="SOL to sell out")
     initials: bool = Field(False, description="recover the first-buy SOL")
-    # revise_tpsl — same names as AgentTpslRequest. clear wins over a new pct
+    # revise_tpsl — clear wins over a new pct
     clear_profit: bool = False
     clear_loss: bool = False
 
     @field_validator("action", mode="before")
     @classmethod
     def _norm_action(cls, value: Any) -> Any:
+        if value in (None, ""):
+            return None
         if not isinstance(value, str):
             return value
         key = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if not key:
+            return None
+        # tool names must use the tool field — do not alias them
+        if key in CALLABLE_TOOLS or norm_tool_name(key) in CALLABLE_TOOLS:
+            raise ValueError(
+                f'use tool:"{norm_tool_name(key) or key}" not action:"{key}"'
+            )
         return _ACTION_ALIASES.get(key, key)
+
+    @field_validator("tool", mode="before")
+    @classmethod
+    def _norm_tool(cls, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        name = norm_tool_name(value)
+        if name is None:
+            return None
+        if not is_callable_tool(name):
+            raise ValueError(f"unknown tool:{name}")
+        return name
 
     @field_validator("narrative", "reasoning", mode="before")
     @classmethod
@@ -80,6 +94,8 @@ class ThinkDecision(BaseModel):
 
     @model_validator(mode="after")
     def _fields_for_action(self) -> ThinkDecision:
+        if self.action is None and self.tool is None:
+            raise ValueError("set action, tool, or both")
         if self.action == "buy":
             missing = [
                 name
@@ -107,7 +123,6 @@ class ThinkDecision(BaseModel):
             if modes > 1:
                 raise ValueError("use only one of percent / sol_amount / initials")
         elif self.action == "revise_tpsl":
-            # clear flags count even when a pct is also set (clear wins later)
             if not (
                 self.profit_pct is not None
                 or self.loss_pct is not None
@@ -139,11 +154,7 @@ class ThinkDecision(BaseModel):
         }
 
     def tpsl_fields(self) -> dict[str, Any]:
-        """
-        kwargs for set_levels.
-
-        clear_* wins over a new percent, same as POST /agent/tpsl.
-        """
+        """kwargs for set_levels. clear_* wins over a new percent."""
         if self.action != "revise_tpsl":
             raise DecisionInvalid("not a tpsl revise")
         out: dict[str, Any] = {}
@@ -186,6 +197,7 @@ def _is_echo(text: str) -> bool:
             "name or fees",
             "take-profit",
             "stop-loss",
+            'use tool:',
         )
     )
 
@@ -196,37 +208,39 @@ def _coerce_payload(data: dict[str, Any]) -> dict[str, Any]:
     action = out.get("action")
     if isinstance(action, str):
         action = action.strip().lower().replace("-", "_").replace(" ", "_")
-        out["action"] = action
+        out["action"] = action or None
+    elif action in ("",):
+        out["action"] = None
+        action = None
+
+    tool_raw = out.get("tool")
+    tool = norm_tool_name(tool_raw)
+    if tool_raw not in (None, "") and tool is None:
+        out["tool"] = tool_raw  # let validator complain
+    elif tool is not None:
+        out["tool"] = tool
+    else:
+        out.pop("tool", None)
+
     # buy size is `sol`. if it only filled the sell field, use that number
-    if action == "buy" and out.get("sol") in (None, "") and out.get("sol_amount") not in (None, ""):
+    if action == "buy" and out.get("sol") in (None, "") and out.get(
+        "sol_amount"
+    ) not in (None, ""):
         out["sol"] = out.pop("sol_amount")
+
     narrative = out.get("narrative")
     reasoning = out.get("reasoning")
     if isinstance(narrative, str) and _is_echo(narrative):
         out["narrative"] = ""
     if isinstance(reasoning, str) and _is_echo(reasoning):
         out["reasoning"] = ""
-    # narrative and reasoning stay separate. a blank narrative means keep the old one.
     if not isinstance(out.get("narrative"), str):
         out["narrative"] = ""
-    # reject and sell do not set levels. a wait can still echo 0s from the
-    # schema — drop them so the reply stays a wait.
-    # metrics still has to send percents (the search grammar requires them).
-    # they are not levels. drop them so a refresh is not a buy.
-    if action in (
-        "reject",
-        "sell",
-        "wait",
-        "metrics",
-        "onchain",
-        "safety",
-        "rugcheck",
-        "dex",
-        "dexscreener",
-        "dex_paid",
-        "wallets",
-        "tracked",
-        "tracked_wallets",
+
+    # searching grammar always asks for percents; strip when not a buy
+    # wait still says wait here (alias to hold happens in the model)
+    if action in (None, "reject", "sell", "wait") or (
+        action is None and out.get("tool")
     ):
         out.pop("profit_pct", None)
         out.pop("loss_pct", None)
@@ -243,6 +257,14 @@ def coach_text(raw: str) -> str:
     low = raw.lower()
     if "timeout" in low:
         return "timed out. send the json again."
+    if "use tool:" in low or (
+        "tool:" in low and "action:" in low and "not action" in low
+    ):
+        return 'use tool:"metrics" (or safety/dex/wallets), not action for tools.'
+    if "unknown tool" in low:
+        return "tool must be one of: metrics, safety, dex, wallets."
+    if "set action, tool" in low or "action, tool, or both" in low:
+        return "set action, tool, or both. reasoning is required."
     if "profit" in low or "loss" in low:
         return (
             "that buy had no take-profit or stop-loss. "
@@ -256,17 +278,12 @@ def coach_text(raw: str) -> str:
             "why you sell, hold, reject, or keep this focus."
         )
     if "reasoning" in low:
-        return "every reply needs reasoning: why you took this action."
+        return "every reply needs reasoning: why you took this action or tool call."
     return "reply was not valid json. one short sentence."
 
 
 def require_post_vamp_reasoning(decision: ThinkDecision, *, after_vamp: bool) -> None:
-    """
-    after a vamp alert, refuse an empty / missing why.
-
-    the ollama grammar already requires reasoning; this catches echo-stripped
-    blanks and anything that slipped the schema.
-    """
+    """after a vamp alert, refuse an empty / missing why."""
     if not after_vamp:
         return
     why = (decision.reasoning or "").strip()

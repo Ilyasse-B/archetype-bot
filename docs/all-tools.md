@@ -6,44 +6,57 @@ More tools will show up later. Add them here when we decide to, then build them.
 
 ## How a call works
 
-- The agent chooses which tool to call. It calls **one tool at a time**, never a batch.
-- It can call a tool on **wait** (still looking, not bought) or on **hold** (already in the trade). Same rule for both.
-- The standing prompt stays a short catalogue: tool name, one line on what it is, and when to call it. Field meanings are not in that list.
-- When it picks one, the next think gets that tool’s result. The first time that tool returns, each field has a short note beside the number. Later calls for the same tool are the numbers only. Then it thinks again.
-- **Cheap** facts can run on their own every think and sit in the packet, as long as they stay small. Extra on-chain numbers for the coin in focus are the example. If a call is slow, paid, or fat, the agent asks for it.
-- Do not push a mid-think price alert. The since-last-peek line already covers a move, and an alert would interrupt the think.
+Research tools use a **`tool` field**, not `action`. Trade verbs stay on `action`
+(`buy` / `reject` / `wait` while searching; `hold` / `revise_tpsl` / `sell` when locked).
+
+- The agent may set **`tool` alone**, **`action` alone**, or **both** in one JSON reply.
+- **One tool at a time.** Never a batch. Never put a tool name in `action`.
+- When `tool` is set (alone or with wait/hold/buy/revise), we fetch now; the **next**
+  think’s card shows the result. That saves a round trip vs wait-then-tool.
+- `reject` / `sell` + `tool` → tool is **ignored** (no next think on that focus).
+- Bare `wait` / bare `hold` (no tool) are allowed to watch price; next think waits
+  **10 seconds**. Live `mcap_usd` and `since last peek: +X% in Ys (...)` are already
+  on every card — do not call `metrics` just for price.
+- Field notes sit beside numbers on the **first** result for that tool; later calls
+  are values only.
+- **Cheap** facts can still be **fed** every think (first-think onchain block, price
+  peek). Slow / paid / fat reads stay agent-asked via `tool`.
+- Do not push a mid-think price alert; since-last-peek covers moves.
+
+Full contract and loop wiring: `docs/tool-calling-fixes.md`.
 
 Labels on each tool:
 
 | Label | Meaning |
 |-------|---------|
 | **fed** | Deterministic. We run it and put the result in the think packet. The agent does not ask. |
-| **agent** | Only runs when the agent calls it. |
+| **agent** | Only runs when the agent sets `"tool":"<name>"`. |
 | **both** | Runs in the background (or once when we focus the coin) and also when the agent asks. |
+| **alert** | Fed / interrupt (e.g. vamp). Not callable via `tool`. |
 
 ## Tool catalogue
 
-The catalogue lives in `src/archetype/llm/prompts/trader.md`, under the buy / wait / reject examples. It is part of the system prompt, so it stays on every think. There is no separate tools file.
+Blurbs and examples are assembled into the system prompt from
+`src/archetype/llm/tools_catalog.py` (injected via `{{TOOLS}}` in `trader.md`).
+The standing catalogue is: name, rank 0–1, one line, when to call. Field meanings
+are not in that list.
 
-While the agent is still deciding whether to buy, that prompt includes buy, reject, and wait. After a buy, those examples and the before-buy instructions are removed. The hold paragraph then says the agent can call tools, and the catalogue below is the detail.
-
-One line per tool: the action name, a rank from 0 to 1 (higher matters more), what it returns, and when to call it. No field definitions. `metrics` is 0.5, `safety` is 0.8, `dex` is 0.25, `wallets` is 0.4. New tools get a line when they are built.
-
-Field notes are not on the opening card. They sit inline on the first result for that tool, beside each number. `metrics` and `safety` also have one short closing line on how to use the block. `dex` and `wallets` are the values and their notes, with no extra closing line. A later call for the same tool is the numbers only.
+While searching, the prompt includes buy / reject / wait. After a buy, those are
+removed and the hold / revise / sell block remains. Callable tools today:
+`metrics` 0.5, `safety` 0.8, `dex` 0.25, `wallets` 0.4. Vamp is listed as fed-only.
 
 A missing key or a failed request is `unavailable` on that line. No second source.
 
-## Call control (later)
+## Call control (built)
 
-Not part of building tool 3. Note it so we do not forget.
+See `docs/tool-calling-fixes.md`.
 
-Once a few tools exist, stop the model from wasting looks:
-
-- Do not call the same tool again while its last result is still the latest read.
-- Do not call the same tool again inside a short cooldown.
-- Early in a search, steer it at `metrics` and `safety` first. Narrative tools (website, X, Gemini) come after it has a safety read and still wants the coin. Those tools build the thesis. They do not decide if the coin is safe.
-
-This is a nudge on top of the catalogue. It is not a second trader, and it does not pick the trade.
+- **One-think suppress:** after a tool runs, that tool is omitted from the next
+  think’s catalogue **and** grammar; restored on the think after that.
+- **Search looks:** tool-only replies do **not** count toward the 3-look searching
+  cap. Bare wait / buy / reject do. `wait`+`tool` counts as one look (the wait).
+- Soft “prefer metrics/safety before narrative tools” remains prompt guidance when
+  website / X / Gemini land — not a second trader.
 
 ## Already in the loop (do not rebuild)
 
@@ -71,9 +84,9 @@ This comes before X. A coin dying or running shows up on the next peek, not as a
 
 ### 2. Live on-chain metrics — **both** (built, rank 0.5)
 
-Fed once, on the first think, in that think’s changing message. That first block has a short note beside each field, then a line saying the block is a gauge and does not decide the trade. The numbers are not written into the opening card, so a later think does not replay a stale read. A later `metrics` reply is the numbers only.
+Fed once, on the first think, in that think’s changing message. That first block has a short note beside each field, then a line saying the block is a gauge and does not decide the trade. The numbers are not written into the opening card, so a later think does not replay a stale read. A later `"tool":"metrics"` result is the numbers only.
 
-The agent can reply `metrics` while searching or locked. That call does not count as a look. The next think gets a new HTTP read.
+The agent sets `"tool":"metrics"` while searching or locked (alone or with an action). That call does not count as a search look. The next think gets a new HTTP read.
 
 Uses Jupiter (no key) and Solana Tracker (`ARCHETYPE_SOLANA_TRACKER_API_KEY`). No pump.fun HTTP. No Helius. If one call fails, that line says `unavailable`.
 
@@ -87,7 +100,7 @@ Global fees already paid are not in this tool. Total fees are tool 3 (safety), f
 
 ### 3. Safety — **agent** (built, rank 0.8)
 
-One action, `safety`. The agent asks. Not on the first prompt. One result, a few lines. The old one-call legitimacy tool is this tool. Rugcheck’s score and risks are the score.
+One tool, `"tool":"safety"`. The agent asks. Not on the first prompt. One result, a few lines. The old one-call legitimacy tool is this tool. Rugcheck’s score and risks are the score.
 
 Three HTTP calls, no Helius. Anything not listed here is discarded, including wallet lists, charts, ATH, pool rows, LP lock, and the insider graph.
 
@@ -114,7 +127,7 @@ The first `safety` result has a short note beside each field, then a line saying
 
 ### 4. Dexscreener paid check — **agent** (built, rank 0.25)
 
-Action `dex`. Rank 0.25. Not on the first prompt. Two calls, no key: `GET https://api.dexscreener.com/orders/v1/solana/{mint}` and `GET https://api.dexscreener.com/token-pairs/v1/solana/{mint}`.
+Tool `"tool":"dex"`. Rank 0.25. Not on the first prompt. Two calls, no key: `GET https://api.dexscreener.com/orders/v1/solana/{mint}` and `GET https://api.dexscreener.com/token-pairs/v1/solana/{mint}`.
 
 The agent only sees:
 
@@ -127,7 +140,7 @@ Links, the image, and the banner are stored on the backlog coin and are not show
 
 ### 5. Tracked wallets — **agent** (built, rank 0.4)
 
-Action `wallets`. Rank 0.4. Not on the first prompt. The agent asks before or after a buy. Does not count as a search look.
+Tool `"tool":"wallets"`. Rank 0.4. Not on the first prompt. The agent asks before or after a buy. Does not count as a search look.
 
 We keep a scored KOL list in `data/kol_wallets.db` (wallet + rating 0–1). On a call, one Helius `getProgramAccounts` for the mint intersects that list. No Solana Tracker credits on the hot path.
 

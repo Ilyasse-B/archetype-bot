@@ -34,6 +34,7 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         return
     if kind == "decision":
         action = str(ev.get("action") or "")
+        tool = str(ev.get("tool") or "").strip()
         narrative = str(ev.get("narrative") or "").strip()
         reasoning = str(ev.get("reasoning") or "").strip()
         colour = {
@@ -43,7 +44,10 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
             "hold": "dim",
             "wait": "dim",
         }.get(action, "white")
-        console.print(f"{head} [{colour}]{action}[/{colour}] {label}")
+        act_bit = f"[{colour}]{action}[/{colour}]" if action else "[dim]tool[/dim]"
+        if tool:
+            act_bit += f"+[cyan]{tool}[/cyan]"
+        console.print(f"{head} {act_bit} {label}")
         if narrative:
             console.print(f"         {narrative}")
         if reasoning and reasoning != narrative:
@@ -120,8 +124,11 @@ def print_agent_event(console: Console, ev: dict[str, Any]) -> None:
         return
     if kind == "hold":
         reason = str(ev.get("reasoning") or "").strip()
+        tool = str(ev.get("tool") or "").strip()
         waiting = str(ev.get("phase") or "") != "locked"
         word = "waiting on" if waiting else "holding"
+        if tool:
+            word = f"{word}+{tool}"
         tp, sl = ev.get("profit_pct"), ev.get("loss_pct")
         levels = ""
         if not waiting and (tp is not None or sl is not None):

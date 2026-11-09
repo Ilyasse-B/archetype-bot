@@ -1,9 +1,7 @@
 """
 turn one model reply into a decision.
 
-searching: reject, hold, buy, metrics.
-locked: hold, sell, revise_tpsl, metrics.
-the loop runs the real command after. buy size is filled in here, not by the model.
+action = trade verbs only. tool = research fetch (optional, alone or with action).
 """
 
 from __future__ import annotations
@@ -12,41 +10,59 @@ import json
 from typing import Any
 
 from archetype.llm.decision import DecisionInvalid, ThinkDecision, parse_decision
+from archetype.llm.tools_catalog import CALLABLE_TOOLS, is_callable_tool, norm_tool_name
 
 
-def decision_format(phase: str, *, after_vamp: bool = False) -> dict[str, Any]:
+def decision_format(
+    phase: str,
+    *,
+    after_vamp: bool = False,
+    allowed_tools: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """
     ollama grammar for one decision.
 
-    narrative can be left out. before a buy, the grammar requires both
-    percents so a buy cannot come back without them. wait and reject
-    still get those numbers stripped afterwards.
+    action is optional (tool-only replies). tool is optional (action-only).
+    at least one must be present — enforced in ThinkDecision after parse.
 
-    after a vamp alert, reasoning is required with minLength so the model
-    cannot omit why it sold / held / rejected.
+    before a buy, the grammar still requires both percents so a 3b cannot
+    omit them; wait/reject/tool-only get those numbers stripped afterwards.
     """
     searching = phase != "locked"
     actions = (
-        ["hold", "sell", "revise_tpsl", "metrics", "safety", "dex", "wallets"]
-        if not searching
-        else ["buy", "reject", "wait", "metrics", "safety", "dex", "wallets"]
+        ["buy", "reject", "wait"]
+        if searching
+        else ["hold", "sell", "revise_tpsl"]
     )
-    required = ["action", "reasoning"]
+    if allowed_tools is None:
+        tools = list(CALLABLE_TOOLS)
+    else:
+        tools = [t for t in allowed_tools if t in CALLABLE_TOOLS]
+    # empty enum breaks some grammars — keep at least a placeholder the
+    # validator will reject if somehow used while everything is suppressed
+    if not tools:
+        tools = ["metrics"]
+
+    required = ["reasoning"]
     # a 3b skips optional keys. force the two levels while it can still buy.
     if searching:
         required.extend(["profit_pct", "loss_pct"])
     reasoning_schema: dict[str, Any] = {"type": "string"}
     if after_vamp:
-        # force a real why-string in the grammar when a vamp is in this think
         reasoning_schema["minLength"] = 1
     return {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": actions},
+            "tool": {"type": "string", "enum": tools},
             "narrative": {"type": "string"},
             "reasoning": reasoning_schema,
             "profit_pct": {"type": "number", "exclusiveMinimum": 0},
-            "loss_pct": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 100},
+            "loss_pct": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "exclusiveMaximum": 100,
+            },
         },
         "required": required,
     }
@@ -56,7 +72,8 @@ def decision_from_message(msg: Any, *, required_sol: float | None) -> ThinkDecis
     """
     turn one model reply into a decision.
 
-    a tool call wins. a json blob is only a fallback.
+    native tool_calls: if the name is a research tool, map to `tool`;
+    otherwise treat the name as `action`.
     """
     calls = list(getattr(msg, "tool_calls", None) or [])
     if calls:
@@ -69,31 +86,38 @@ def decision_from_message(msg: Any, *, required_sol: float | None) -> ThinkDecis
             args = getattr(call, "args", None) or {}
         if not isinstance(args, dict):
             raise DecisionInvalid(f"tool {name} args were not an object")
-        return _from_choice(name, args, required_sol)
+        return _from_payload(name, dict(args), required_sol)
 
     text = _message_text(msg).strip()
     if not text:
-        raise DecisionInvalid("call one tool")
+        raise DecisionInvalid("reply with action and/or tool json")
     try:
         data = json.loads(_json_blob(text))
     except json.JSONDecodeError as exc:
-        raise DecisionInvalid(f"call one tool (not prose): {exc}") from exc
+        raise DecisionInvalid(f"not json: {exc}") from exc
     if not isinstance(data, dict):
-        raise DecisionInvalid("call one tool")
-    # old habit: {"action":"buy", ...}
-    name = str(data.pop("action", "") or "")
-    if not name and len(data) == 1:
-        # {"buy": {...}} sometimes
-        name = next(iter(data))
-        inner = data[name]
-        data = inner if isinstance(inner, dict) else {}
-    return _from_choice(name, data, required_sol)
+        raise DecisionInvalid("reply with a json object")
+    return _from_dict(data, required_sol)
 
 
-def _from_choice(name: str, args: dict[str, Any], required_sol: float | None) -> ThinkDecision:
+def _from_payload(
+    name: str, args: dict[str, Any], required_sol: float | None
+) -> ThinkDecision:
+    """langchain-style single tool call / action name."""
     payload = dict(args)
-    payload["action"] = name
-    if payload.get("action") in ("buy", "Buy"):
+    key = (name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    tool = norm_tool_name(key)
+    if is_callable_tool(tool):
+        payload.setdefault("tool", tool)
+    elif key:
+        payload.setdefault("action", name)
+    return _from_dict(payload, required_sol)
+
+
+def _from_dict(data: dict[str, Any], required_sol: float | None) -> ThinkDecision:
+    payload = dict(data)
+    action = payload.get("action")
+    if isinstance(action, str) and action.strip().lower() == "buy":
         if payload.get("sol") in (None, ""):
             if required_sol is None:
                 raise DecisionInvalid("buy size is not configured")

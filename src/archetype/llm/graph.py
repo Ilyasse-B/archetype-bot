@@ -3,8 +3,8 @@ lock-loop state machine.
 
 one tick = one transition, then stop. the daemon (later) calls tick again.
 no model call when the backlog is empty.
-searching: pop one coin, one decision (reject / hold / buy / metrics).
-locked: one decision (hold / revise_tpsl / sell / metrics) from the locked prompt plus the last 5 events.
+searching: pop one coin, one decision (reject / hold / buy) and/or tool.
+locked: one decision (hold / revise_tpsl / sell) and/or tool from the locked prompt plus the last 5 events.
 flat bag: one thesis call over the full history, then unlock.
 """
 
@@ -40,6 +40,7 @@ from archetype.tools.onchain import fetch_onchain_metrics
 from archetype.tools.safety import fetch_safety
 from archetype.tools.wallets import fetch_wallets, wallets_text
 from archetype.tools.price_change import since_last_line, since_last_peek
+from archetype.llm.tools_catalog import CALLABLE_TOOLS
 
 log = logging.getLogger("archetype.graph")
 
@@ -52,6 +53,10 @@ _FREE_ACTIONS = frozenset({"reject", "hold", "buy"})
 _LOCKED_ACTIONS = frozenset({"hold", "sell", "revise_tpsl"})
 # first look counts. a 4th think while still searching is a reject.
 _MAX_SEARCH_LOOKS = 3
+# bare wait / bare hold — watch price without a tool
+_PURE_WAIT_SEC = 10.0
+# actions that end the focus — tool would have no next think
+_TERMINAL_ACTIONS = frozenset({"reject", "sell"})
 
 
 class LoopState(TypedDict, total=False):
@@ -101,6 +106,10 @@ class LoopDeps:
     vamp: Any | None = None
     # mid-tick focus mirror so the filter thread sees searching/locked immediately
     focus_hook: Callable[[str, str | None, dict[str, Any] | None], None] | None = None
+    # one-think tool cooldown — omitted from next catalogue + grammar
+    suppress_tool: str | None = None
+    # bare wait/hold pacing override (seconds); AgentLoop reads then clears
+    next_delay_sec: float | None = None
 
 
 def _fmt_num(val: float) -> str:
@@ -133,9 +142,35 @@ def load_system_prompt(settings: Any | None = None) -> str:
     return raw
 
 
-def prompt_for_phase(prompt: str, phase: str, *, coin_block: str = "") -> str:
-    """inject this coin's fields and keep only searching or locked actions."""
-    return assemble_trader_prompt(prompt, phase=phase, coin_block=coin_block)
+def prompt_for_phase(
+    prompt: str,
+    phase: str,
+    *,
+    coin_block: str = "",
+    allowed_tools: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """inject this coin's fields, tools catalogue, and phase actions."""
+    return assemble_trader_prompt(
+        prompt,
+        phase=phase,
+        coin_block=coin_block,
+        allowed_tools=allowed_tools,
+    )
+
+
+def _allowed_tools(deps: LoopDeps) -> list[str]:
+    """callable tools minus the one-think suppress."""
+    skip = (deps.suppress_tool or "").strip()
+    return [t for t in CALLABLE_TOOLS if t != skip]
+
+
+def _label_action(action: str | None, phase: str) -> str:
+    """before a buy, say wait. hold is only once the coin is owned."""
+    if not action:
+        return "tool"
+    if action == "hold" and phase != "locked":
+        return "wait"
+    return action
 
 
 def load_thesis_prompt() -> str:
@@ -168,13 +203,6 @@ def _queue_reject(deps: LoopDeps, mint: str, steps: int, reason: str) -> LoopSta
         "last_error": reason,
         "route": "apply",
     }
-
-
-def _label_action(action: str, phase: str) -> str:
-    """before a buy, say wait. hold is only once the coin is owned."""
-    if action == "hold" and phase != "locked":
-        return "wait"
-    return action
 
 
 def _timed_out(exc: BaseException) -> bool:
@@ -273,6 +301,12 @@ def _clear_vamp(deps: LoopDeps) -> None:
         buf.clear()
     except Exception:  # noqa: BLE001
         log.debug("vamp clear failed", exc_info=True)
+
+
+def _clear_tool_focus(deps: LoopDeps) -> None:
+    """drop tool cooldown + wait pacing when focus ends."""
+    deps.suppress_tool = None
+    deps.next_delay_sec = None
 
 
 def _vamp_set_focus(deps: LoopDeps, mint: str | None) -> None:
@@ -551,6 +585,7 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     deps.tools.set_focus("free", None)
     _clear_abort(deps)
     _clear_vamp(deps)
+    _clear_tool_focus(deps)
     _vamp_set_focus(deps, None)
     _publish_focus(deps, "idle", None, None)
     result = await deps.tools.call("next_candidate")
@@ -591,6 +626,7 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         )
         deps.tools.set_focus("free", None)
         _clear_vamp(deps)
+        _clear_tool_focus(deps)
         _vamp_set_focus(deps, None)
         _publish_focus(deps, "idle", None, None)
         return {
@@ -607,6 +643,7 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     _flush_transcript(deps, mint, "", "unfinished")
     deps.memory.begin_focus(mint)
     deps.tools.set_focus("free", mint)
+    _clear_tool_focus(deps)
     _vamp_set_focus(deps, mint)
     _publish_focus(deps, "searching", mint, coin if isinstance(coin, dict) else None)
     name = coin.get("name") or coin.get("symbol") or ""
@@ -704,7 +741,10 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         if mint:
             deps.memory.set_opening(mint, opening)
         onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
-    system_prompt = prompt_for_phase(deps.prompt, phase, coin_block=opening)
+    allowed = _allowed_tools(deps)
+    system_prompt = prompt_for_phase(
+        deps.prompt, phase, coin_block=opening, allowed_tools=allowed
+    )
     messages, seen = _messages(
         system_prompt,
         state,
@@ -716,6 +756,8 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         onchain=onchain,
     )
     steps = int(state.get("steps") or 0) + 1
+    # clear bare-wait override unless this think sets it again
+    deps.next_delay_sec = None
     # vamp in the recent-events window → tighten reasoning in the grammar
     after_vamp = any(getattr(ev, "kind", "") == "vamp" for ev in (window.events or []))
     # vamp interrupt mid-prepare: clear and stop so the next tick rethinks
@@ -729,9 +771,12 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     reply = ""
     try:
         chat = deps.chat
-        # grammar picks the action. before a buy it also requires both levels.
         if hasattr(chat, "bind"):
-            chat = chat.bind(format=decision_format(phase, after_vamp=after_vamp))
+            chat = chat.bind(
+                format=decision_format(
+                    phase, after_vamp=after_vamp, allowed_tools=allowed
+                )
+            )
         msg, aborted = await _call_model(chat, messages, deps.abort)
         if aborted and _abort_is(deps, "vamp"):
             log.info("VAMP interrupt %s — rethink with alert in events", mint)
@@ -742,6 +787,12 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             return {"route": "close"}
         reply = _message_text(msg)
         decision = decision_from_message(msg, required_sol=required)
+        # tool on cooldown this think — refuse so the model picks another path
+        if decision.tool and decision.tool not in allowed:
+            raise DecisionInvalid(
+                f"tool:{decision.tool} is on cooldown this think; "
+                "pick another tool or decide"
+            )
         require_post_vamp_reasoning(decision, after_vamp=after_vamp)
     except (DecisionInvalid, Exception) as exc:  # noqa: BLE001
         raw = exc_text(exc)
@@ -790,37 +841,53 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         log.info("THINK FAIL %s %s", mint, raw)
         deps.memory.append_event(mint, "error", {"error": note})
         _emit(deps, "error", mint=mint, error=note)
+        # failed think still consumes the one-think suppress window
+        deps.suppress_tool = None
         return _with_peek(
             {"steps": steps, "last_error": note, "route": "stop", **seen},
             peek_state,
         )
 
-    if decision.action in ("metrics", "safety", "dex", "wallets"):
-        # tool call. fresh http read, and this look does not count.
-        return await _refresh_metrics(
+    tool_name = decision.tool
+    action = decision.action
+    # reject/sell + tool → ignore tool (no next think on this focus)
+    if tool_name and action in _TERMINAL_ACTIONS:
+        log.info("TOOL ignored on %s %s", action, mint)
+        tool_name = None
+        decision = decision.model_copy(update={"tool": None})
+
+    # tool-only, or wait/hold + tool — fetch now; result on next think
+    if tool_name and action in (None, "hold"):
+        burn_look = action == "hold"
+        return await _run_agent_tool(
             deps,
             state,
             mint,
+            phase,
             window,
             messages,
             reply,
             decision,
             seen,
             peek_state,
+            burn_look=burn_look,
+            steps_if_burn=steps,
         )
 
+    # action-only, or buy/revise + tool (tool runs in apply after the trade)
     _save_think(deps, mint, messages, reply)
-    # blank narrative means the old read still stands. still log the reply.
     prev = (window.summary or "").strip()
     narrative = decision.narrative.strip()
     narrative_updated = bool(narrative) and narrative != prev
     if narrative_updated:
         deps.memory.set_summary(mint, narrative)
+    label = _label_action(action, phase)
     deps.memory.append_event(
         mint,
         "decision",
         {
-            "action": _label_action(decision.action, phase),
+            "action": label,
+            "tool": tool_name,
             "reasoning": decision.reasoning,
             "narrative": narrative if narrative_updated else None,
             "narrative_updated": narrative_updated,
@@ -828,10 +895,16 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             "loss_pct": decision.loss_pct,
         },
     )
-    log.info("THINK %s phase=%s action=%s", mint, phase, decision.action)
+    log.info(
+        "THINK %s phase=%s action=%s tool=%s",
+        mint,
+        phase,
+        label,
+        tool_name or "-",
+    )
     coin = state.get("coin") or {}
     shown_sol = decision.sol
-    if decision.action == "buy":
+    if action == "buy":
         sized = _required_sol(deps, state)
         if sized is not None:
             shown_sol = sized
@@ -841,13 +914,20 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         mint=mint,
         name=coin.get("name") or "",
         symbol=coin.get("symbol") or "",
-        action=_label_action(decision.action, phase),
+        action=label,
+        tool=tool_name or "",
         narrative=narrative if narrative_updated else "",
         reasoning=decision.reasoning,
         sol=shown_sol,
         profit_pct=decision.profit_pct,
         loss_pct=decision.loss_pct,
     )
+    # bare wait/hold → 10s before next think
+    if action == "hold" and not tool_name:
+        deps.next_delay_sec = _PURE_WAIT_SEC
+    # this think did not run a tool → clear prior one-think suppress
+    if not tool_name:
+        deps.suppress_tool = None
     return _with_peek(
         {
             "steps": steps,
@@ -867,11 +947,18 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     decision = ThinkDecision.model_validate(raw)
     phase = state.get("phase") or "searching"
     mint = str(state.get("mint") or "")
+    if decision.action is None:
+        err = "apply needs an action"
+        log.info("SKIP %s %s", mint, err)
+        return {"last_error": err, "last_action": None, "route": "stop"}
     allowed = _LOCKED_ACTIONS if phase == "locked" else _FREE_ACTIONS
     if decision.action not in allowed:
         err = f"{decision.action} not allowed while {phase}"
         log.info("SKIP %s %s", mint, err)
         return {"last_error": err, "last_action": decision.action, "route": "stop"}
+    # reject/sell never keep a tool for a next think
+    if decision.tool and decision.action in _TERMINAL_ACTIONS:
+        decision = decision.model_copy(update={"tool": None})
 
     if (
         decision.action == "hold"
@@ -934,6 +1021,9 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         # kept focus after a vamp alert → vamp was not better
         if phase == "locked":
             _dismiss_seen_vamps(deps, mint)
+        # bare hold pacing (wait/hold + tool already fetched in _think)
+        if not decision.tool:
+            deps.next_delay_sec = _PURE_WAIT_SEC
         return {"last_action": "hold", "route": "stop"}
 
     if decision.action == "reject":
@@ -957,6 +1047,7 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         )
         # drop buffered vamps for this focus; close/release also clears
         _clear_vamp(deps)
+        _clear_tool_focus(deps)
         # same close as a sell: thesis, then the next coin.
         return {"last_action": "reject", "route": "close"}
 
@@ -1026,6 +1117,13 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         _flush_vamp_events(deps, mint)
         coin_now = state.get("coin") if isinstance(state.get("coin"), dict) else None
         _publish_focus(deps, "locked", mint, coin_now)
+        # buy + tool → fetch now so the first locked think already has it
+        if decision.tool:
+            await _fetch_tool_into_memory(
+                deps, mint, decision.tool, decision.reasoning, coin
+            )
+        else:
+            deps.suppress_tool = None
         return {
             "phase": "locked",
             "last_action": "buy",
@@ -1063,6 +1161,17 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         )
         # kept focus after a vamp alert → vamp was not better
         _dismiss_seen_vamps(deps, mint)
+        if decision.tool:
+            coin = state.get("coin") or {}
+            await _fetch_tool_into_memory(
+                deps,
+                mint,
+                decision.tool,
+                decision.reasoning,
+                coin if isinstance(coin, dict) else {},
+            )
+        else:
+            deps.suppress_tool = None
         return {"last_action": "revise_tpsl", "route": "stop"}
 
     # sell
@@ -1121,6 +1230,7 @@ async def _release(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         deps.memory.drop_focus(mint)
     _clear_abort(deps)
     _clear_vamp(deps)
+    _clear_tool_focus(deps)
     _vamp_set_focus(deps, None)
     _publish_focus(deps, "idle", None, None)
     deps.tools.set_focus("free", None)
@@ -1236,6 +1346,7 @@ async def _close(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     _clear_abort(deps)
     # trade/focus over — clear the in-memory vamp backlog (not migration fifo)
     _clear_vamp(deps)
+    _clear_tool_focus(deps)
     _vamp_set_focus(deps, None)
     _publish_focus(deps, "idle", None, None)
     deps.tools.set_focus("free", None)
@@ -1293,77 +1404,141 @@ def _tpsl_kwargs(decision: ThinkDecision) -> dict[str, Any]:
     return out
 
 
-async def _refresh_metrics(
+async def _fetch_tool_into_memory(
     deps: LoopDeps,
-    state: LoopState,
     mint: str,
-    window: Any,
-    messages: list[dict[str, str]],
-    reply: str,
-    decision: ThinkDecision,
-    seen: dict[str, Any],
-    peek_state: dict[str, Any],
-) -> LoopState:
+    kind: str,
+    reasoning: str,
+    coin: dict[str, Any],
+    *,
+    prior_events: list[Any] | None = None,
+) -> dict[str, Any]:
     """
-    agent asked for metrics, safety, dex, or wallets.
+    http fetch for one research tool → focus memory + live feed.
 
-    fetch again. do not trade, and do not burn a search look.
-    dex also stores new links, the image, and the banner on the coin.
+    sets suppress_tool so the next think omits this tool from the catalogue.
+    returns possibly updated coin dict (dex may merge links).
     """
-    kind = (
-        decision.action
-        if decision.action in ("metrics", "safety", "dex", "wallets")
-        else "metrics"
-    )
-    _save_think(deps, mint, messages, reply)
-    prev = (getattr(window, "summary", None) or "").strip()
-    narrative = decision.narrative.strip()
-    narrative_updated = bool(narrative) and narrative != prev
-    if narrative_updated:
-        deps.memory.set_summary(mint, narrative)
-    # notes only the first time this tool shows up in the recent window
-    prior = list(getattr(window, "events", None) or [])
-    explain = kind in ("safety", "dex", "wallets") and not any(
+    prior = list(prior_events or [])
+    if not prior:
+        try:
+            prior = list(deps.memory.prompt_window(mint).events or [])
+        except Exception:  # noqa: BLE001
+            prior = []
+    explain = kind in ("safety", "dex", "wallets", "metrics") and not any(
         getattr(ev, "kind", "") == kind for ev in prior
     )
-    coin = dict(state.get("coin") or {})
+    # metrics explain notes only matter on the first metrics event; keep same
+    # pattern as safety/dex/wallets for the first delivery
+    if kind == "metrics":
+        explain = not any(getattr(ev, "kind", "") == "metrics" for ev in prior)
+    coin_out = dict(coin or {})
     if kind == "dex":
         read = await asyncio.to_thread(fetch_dex, mint)
         text = dex_text(read, explain)
-        coin = merge_dex_links(coin, read)
+        coin_out = merge_dex_links(coin_out, read)
         ledger = getattr(deps.tools, "ledger_path", None)
         if ledger is not None:
-            update_latest_coin_info(ledger, mint, coin)
+            update_latest_coin_info(ledger, mint, coin_out)
     elif kind == "wallets":
         text = await asyncio.to_thread(_wallets, mint, explain)
+    elif kind == "safety":
+        text = await asyncio.to_thread(_safety, mint, explain)
     else:
-        text = await asyncio.to_thread(
-            _safety if kind == "safety" else _onchain_metrics,
-            mint,
-            explain,
-        )
+        text = await asyncio.to_thread(_onchain_metrics, mint, explain)
     deps.memory.append_event(
         mint,
         kind,
-        {"text": text, "reasoning": decision.reasoning},
+        {"text": text, "reasoning": reasoning},
     )
     log.info("%s %s", kind.upper(), mint)
     _emit(
         deps,
         kind,
         mint=mint,
-        name=coin.get("name") or "",
-        symbol=coin.get("symbol") or "",
+        name=coin_out.get("name") or "",
+        symbol=coin_out.get("symbol") or "",
         text=text,
-        reasoning=decision.reasoning,
+        reasoning=reasoning,
+    )
+    deps.suppress_tool = kind
+    deps.next_delay_sec = None
+    return coin_out
+
+
+async def _run_agent_tool(
+    deps: LoopDeps,
+    state: LoopState,
+    mint: str,
+    phase: str,
+    window: Any,
+    messages: list[dict[str, str]],
+    reply: str,
+    decision: ThinkDecision,
+    seen: dict[str, Any],
+    peek_state: dict[str, Any],
+    *,
+    burn_look: bool,
+    steps_if_burn: int,
+) -> LoopState:
+    """
+    tool-only or wait/hold+tool.
+
+    tool-only does not burn a search look. wait/hold+tool burns one look
+    (the wait/hold), then fetches the tool.
+    """
+    kind = decision.tool or "metrics"
+    _save_think(deps, mint, messages, reply)
+    prev = (getattr(window, "summary", None) or "").strip()
+    narrative = decision.narrative.strip()
+    narrative_updated = bool(narrative) and narrative != prev
+    if narrative_updated:
+        deps.memory.set_summary(mint, narrative)
+
+    if burn_look and decision.action == "hold":
+        label = _label_action("hold", phase)
+        deps.memory.append_event(
+            mint,
+            "decision",
+            {
+                "action": label,
+                "tool": kind,
+                "reasoning": decision.reasoning,
+                "narrative": narrative if narrative_updated else None,
+                "narrative_updated": narrative_updated,
+            },
+        )
+        _emit(
+            deps,
+            "hold",
+            mint=mint,
+            phase=phase,
+            narrative=narrative if narrative_updated else "",
+            reasoning=decision.reasoning,
+            tool=kind,
+        )
+        if phase == "locked":
+            _dismiss_seen_vamps(deps, mint)
+
+    coin = dict(state.get("coin") or {})
+    coin = await _fetch_tool_into_memory(
+        deps,
+        mint,
+        kind,
+        decision.reasoning,
+        coin,
+        prior_events=list(getattr(window, "events", None) or []),
     )
     return _with_peek(
         {
-            "steps": int(state.get("steps") or 0),
+            # tool-only keeps prior steps; wait/hold+tool counts as one look
+            "steps": steps_if_burn if burn_look else int(state.get("steps") or 0),
             "coin": coin,
             "last_narrative": narrative if narrative_updated else prev,
             "last_error": None,
-            "last_action": kind,
+            "last_action": f"{_label_action(decision.action, phase)}+{kind}"
+            if decision.action
+            else kind,
             "route": "stop",
             **seen,
         },
