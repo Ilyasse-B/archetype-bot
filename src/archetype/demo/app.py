@@ -1,5 +1,5 @@
 """
-hackathon viewer control plane on :8787.
+demo viewer control plane on :8787.
 
 does NOT live inside the trading daemon. it only:
   - starts/stops ollama, daemon, agent loop
@@ -38,7 +38,7 @@ _daemon_log_handle: Any = None
 
 def create_demo_app() -> FastAPI:
     """build the viewer app. bind only on localhost when serving."""
-    app = FastAPI(title="Archetype hackathon viewer", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Archetype demo viewer", docs_url=None, redoc_url=None)
     settings = get_settings()
 
     @app.middleware("http")
@@ -214,7 +214,7 @@ def run(host: str = DEMO_HOST, port: int = DEMO_PORT, open_browser: bool = False
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    log.info("hackathon viewer on http://%s:%s/ (daemon is separate)", host, port)
+    log.info("demo viewer on http://%s:%s/ (daemon is separate)", host, port)
     uvicorn.run(create_demo_app(), host=host, port=port, log_level="info")
 
 

@@ -872,7 +872,7 @@ def demo_cmd(
     port: int = typer.Option(8787, help="viewer port (daemon stays on its own port)"),
 ) -> None:
     """
-    hackathon live viewer (separate from the trading daemon).
+    demo live viewer (separate from the trading daemon).
 
     starts a small localhost UI that can start/stop ollama, the daemon,
     and the agent loop, and shows live migrations + agent events.
@@ -881,7 +881,7 @@ def demo_cmd(
     from archetype.demo.app import run as run_demo
 
     console.print(
-        f"[cyan]hackathon viewer[/cyan] http://{DEMO_HOST}:{port}/ "
+        f"[cyan]demo viewer[/cyan] http://{DEMO_HOST}:{port}/ "
         "(daemon is separate — not served by this process)"
     )
     run_demo(host=DEMO_HOST, port=port, open_browser=open_browser)

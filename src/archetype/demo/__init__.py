@@ -1,5 +1,5 @@
 """
-hackathon demo viewer — separate from the trading daemon.
+demo viewer — separate from the trading daemon.
 
 starts/stops ollama + daemon + agent loop, and proxies live feeds.
 not part of the core product.
