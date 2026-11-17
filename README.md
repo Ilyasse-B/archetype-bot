@@ -84,3 +84,20 @@ Separate localhost UI for demos / recording (not part of the daemon). Starts Oll
 uv run archetype demo          # http://127.0.0.1:8787/
 ```
 
+## Tools
+
+| Tool | Summary | Status |
+|------|---------|--------|
+| Filter snapshot | Name, symbol, mcap, socials on filter PASS | complete |
+| Coin snapshot | First-think ATH / volume / liquidity / coin type | complete |
+| Price peek | Live vault mcap (+ PnL if holding) | complete |
+| Price change | Mcap move since last peek, every think | complete |
+| metrics | Holders, top10, snipers, bundlers, trades | complete |
+| safety | Rugcheck / locks / Tracker risk lines | complete |
+| dex | Dexscreener paid + active boosts | complete |
+| wallets | Tracked KOL holders + avg rating | complete |
+| vamp | Copycat alert vs focus (interrupt; not callable) | complete |
+| website | Domain age / URLScans / Firecrawl summary | complete |
+| X | Linked account / crowd / X metrics | not yet complete |
+| Gemini | Ask-anything narrative / news lookup | not yet complete |
+
