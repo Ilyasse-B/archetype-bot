@@ -17,7 +17,7 @@ from archetype.llm.tools_catalog import CALLABLE_TOOLS, is_callable_tool, norm_t
 # trade / phase verbs only — never metrics/safety/dex/wallets
 ThinkAction = Literal["reject", "hold", "buy", "revise_tpsl", "sell"]
 
-AgentTool = Literal["metrics", "safety", "dex", "wallets"]
+AgentTool = Literal["metrics", "safety", "dex", "wallets", "website"]
 
 # tool is named set_tpsl; plan action is revise_tpsl. same thing.
 # wait (searching) is stored as hold; the loop labels it wait before buy.

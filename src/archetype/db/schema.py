@@ -186,6 +186,17 @@ CREATE TABLE IF NOT EXISTS pool_cache (
     updated_at REAL NOT NULL
 );
 
+-- permanent urlscans legitimacy lookups (website tool)
+CREATE TABLE IF NOT EXISTS urlscans_cache (
+    url_key TEXT PRIMARY KEY,
+    verdict TEXT,
+    score INTEGER,
+    confidence INTEGER,
+    reasons TEXT,
+    raw_json TEXT,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS blacklist (
     mint TEXT PRIMARY KEY,
     reason TEXT,

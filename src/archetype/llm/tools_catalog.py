@@ -9,7 +9,13 @@ from __future__ import annotations
 from typing import Any
 
 # research tools the model may set on the "tool" field
-CALLABLE_TOOLS: tuple[str, ...] = ("metrics", "safety", "dex", "wallets")
+CALLABLE_TOOLS: tuple[str, ...] = (
+    "metrics",
+    "safety",
+    "dex",
+    "wallets",
+    "website",
+)
 
 _TOOL_ALIASES = {
     "onchain": "metrics",
@@ -18,6 +24,8 @@ _TOOL_ALIASES = {
     "dex_paid": "dex",
     "tracked": "wallets",
     "tracked_wallets": "wallets",
+    "site": "website",
+    "web": "website",
 }
 
 # one-line blurbs + ranks (catalogue text)
@@ -39,6 +47,11 @@ _TOOL_LINES: dict[str, str] = {
         "wallets - 0.4 - how many tracked wallets currently hold this coin, and their "
         "average rating (0-1, the higher better). This means other well performing "
         "traders currently hold this coin."
+    ),
+    "website": (
+        "website - 0.7 - when the linked site looks central to the narrative (URL, name, "
+        "news/blog page, etc.), call for domain age, a light legitimacy scan, and a short "
+        "page summary."
     ),
 }
 
@@ -122,5 +135,9 @@ def build_tools_section(
     elif "dex" in allowed and phase == "locked":
         lines.append(
             '{"action":"hold","tool":"dex","reasoning":"why check boosts while holding"}'
+        )
+    if "website" in allowed:
+        lines.append(
+            '{"tool":"website","reasoning":"why the linked page matters"}'
         )
     return "\n".join(lines)

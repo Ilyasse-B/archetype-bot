@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     solana_tracker_api_key: str = ""
     # birdeye — migrate filter reads global_fees_paid from token_overview
     birdeye_api_key: str = ""
+    # website tool — urlscans legitimacy + firecrawl page summary
+    url_scans_api_key: str = ""
+    firecrawl_api_key: str = ""
 
     # local llm (phase 4) — one model, one call at a time
     ollama_base_url: str = "http://127.0.0.1:11434"
@@ -130,6 +133,8 @@ def get_settings() -> Settings:
         "pumpportal_api_key",
         "solana_tracker_api_key",
         "birdeye_api_key",
+        "url_scans_api_key",
+        "firecrawl_api_key",
         "ollama_base_url",
         "ollama_model",
         "ollama_timeout_sec",

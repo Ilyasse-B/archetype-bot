@@ -39,6 +39,12 @@ from archetype.tools.dex import dex_text, fetch_dex, merge_dex_links
 from archetype.tools.onchain import fetch_onchain_metrics
 from archetype.tools.safety import fetch_safety
 from archetype.tools.wallets import fetch_wallets, wallets_text
+from archetype.tools.website import (
+    fetch_website,
+    prepare_coin_website,
+    showable_website,
+    website_eligible,
+)
 from archetype.tools.price_change import since_last_line, since_last_peek
 from archetype.llm.tools_catalog import CALLABLE_TOOLS
 
@@ -158,10 +164,95 @@ def prompt_for_phase(
     )
 
 
-def _allowed_tools(deps: LoopDeps) -> list[str]:
-    """callable tools minus the one-think suppress."""
+def _allowed_tools(
+    deps: LoopDeps,
+    coin: dict[str, Any] | None = None,
+) -> list[str]:
+    """callable tools minus one-think suppress and coin-gated website."""
     skip = (deps.suppress_tool or "").strip()
-    return [t for t in CALLABLE_TOOLS if t != skip]
+    out = [t for t in CALLABLE_TOOLS if t != skip]
+    if "website" in out and not website_eligible(coin):
+        out = [t for t in out if t != "website"]
+    return out
+
+
+async def _prepare_focus_website(
+    deps: LoopDeps,
+    mint: str,
+    coin: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    expand redirects + gate before the agent sees the coin card.
+
+    short timeout so a hung shortener doesnt stall focus.
+    """
+    if not isinstance(coin, dict):
+        return {}
+    if not str(coin.get("website") or "").strip() and coin.get("website_resolved"):
+        return coin
+    try:
+        prepared = await asyncio.to_thread(prepare_coin_website, coin)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("website prepare failed %s: %s", mint[:8] if mint else "?", exc)
+        prepared = dict(coin)
+        prepared["website_resolved"] = True
+        prepared["website_gate_ok"] = website_eligible(prepared)
+    ledger = getattr(deps.tools, "ledger_path", None)
+    if ledger is not None and mint:
+        try:
+            update_latest_coin_info(ledger, mint, prepared)
+        except Exception:  # noqa: BLE001
+            log.debug("website prepare persist failed", exc_info=True)
+    return prepared
+
+
+def _rewrite_opening_website(deps: LoopDeps, mint: str, coin: dict[str, Any]) -> None:
+    """after dex fills a website mid-focus, patch socials/website on the opening."""
+    if not mint:
+        return
+    try:
+        window = deps.memory.prompt_window(mint)
+        opening = (getattr(window, "opening", None) or "").strip()
+    except Exception:  # noqa: BLE001
+        return
+    if not opening:
+        return
+
+    # drop old socials/website lines, then re-insert gated ones after symbol
+    base = [
+        ln
+        for ln in opening.splitlines()
+        if not ln.startswith("socials:") and not ln.startswith("website:")
+    ]
+    socials = coin.get("socials_present") or []
+    shown: list[str] = []
+    if isinstance(socials, list):
+        shown = [str(s) for s in socials]
+        if not website_eligible(coin):
+            shown = [s for s in shown if s != "website"]
+    site = showable_website(coin)
+    insert: list[str] = []
+    if shown:
+        insert.append(
+            f"socials: {', '.join(shown)} — linked socials we found"
+        )
+    if site:
+        insert.append(f"website: {site} — project website linked in metadata")
+
+    out: list[str] = []
+    placed = False
+    for ln in base:
+        out.append(ln)
+        if not placed and ln.startswith("symbol:") and insert:
+            out.extend(insert)
+            placed = True
+    if not placed and insert:
+        out = insert + out
+
+    try:
+        deps.memory.set_opening(mint, "\n".join(out))
+    except Exception:  # noqa: BLE001
+        log.debug("opening website rewrite failed", exc_info=True)
 
 
 def _label_action(action: str | None, phase: str) -> str:
@@ -641,6 +732,9 @@ async def _pop(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         }
     # a crashed pass may still have turns. keep them before we wipe the coin.
     _flush_transcript(deps, mint, "", "unfinished")
+    # expand website redirects + gate before the agent sees the card
+    if isinstance(coin, dict):
+        coin = await _prepare_focus_website(deps, mint, coin)
     deps.memory.begin_focus(mint)
     deps.tools.set_focus("free", mint)
     _clear_tool_focus(deps)
@@ -730,6 +824,12 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
     opening = (getattr(window, "opening", None) or "").strip()
     onchain = ""
     if not opening:
+        # safety net if focus skipped prepare (or website still unresolved)
+        if isinstance(coin, dict) and str(coin.get("website") or "").strip() and not coin.get(
+            "website_resolved"
+        ):
+            coin = await _prepare_focus_website(deps, mint, coin)
+            state = {**state, "coin": coin}
         is_otc = bool(isinstance(coin, dict) and coin.get("otc"))
         snapshot = await asyncio.to_thread(_coin_snapshot, mint, deps, is_otc)
         opening = render_coin_block(
@@ -741,7 +841,7 @@ async def _think(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         if mint:
             deps.memory.set_opening(mint, opening)
         onchain = await asyncio.to_thread(_onchain_metrics, mint, True)
-    allowed = _allowed_tools(deps)
+    allowed = _allowed_tools(deps, coin if isinstance(coin, dict) else None)
     system_prompt = prompt_for_phase(
         deps.prompt, phase, coin_block=opening, allowed_tools=allowed
     )
@@ -1119,13 +1219,18 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         _publish_focus(deps, "locked", mint, coin_now)
         # buy + tool → fetch now so the first locked think already has it
         if decision.tool:
-            await _fetch_tool_into_memory(
-                deps, mint, decision.tool, decision.reasoning, coin
+            coin = await _fetch_tool_into_memory(
+                deps,
+                mint,
+                decision.tool,
+                decision.reasoning,
+                coin if isinstance(coin, dict) else {},
             )
         else:
             deps.suppress_tool = None
         return {
             "phase": "locked",
+            "coin": coin if isinstance(coin, dict) else state.get("coin"),
             "last_action": "buy",
             "round_id": int(rid) if rid is not None else state.get("round_id"),
             "route": "stop",
@@ -1163,7 +1268,7 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
         _dismiss_seen_vamps(deps, mint)
         if decision.tool:
             coin = state.get("coin") or {}
-            await _fetch_tool_into_memory(
+            coin = await _fetch_tool_into_memory(
                 deps,
                 mint,
                 decision.tool,
@@ -1172,7 +1277,11 @@ async def _apply(state: LoopState, runtime: Runtime[LoopDeps]) -> LoopState:
             )
         else:
             deps.suppress_tool = None
-        return {"last_action": "revise_tpsl", "route": "stop"}
+        return {
+            "coin": coin if isinstance(coin, dict) else state.get("coin"),
+            "last_action": "revise_tpsl",
+            "route": "stop",
+        }
 
     # sell
     result = await deps.tools.call("sell", mint=mint, **decision.sell_fields())
@@ -1425,7 +1534,7 @@ async def _fetch_tool_into_memory(
             prior = list(deps.memory.prompt_window(mint).events or [])
         except Exception:  # noqa: BLE001
             prior = []
-    explain = kind in ("safety", "dex", "wallets", "metrics") and not any(
+    explain = kind in ("safety", "dex", "wallets", "metrics", "website") and not any(
         getattr(ev, "kind", "") == kind for ev in prior
     )
     # metrics explain notes only matter on the first metrics event; keep same
@@ -1437,6 +1546,13 @@ async def _fetch_tool_into_memory(
         read = await asyncio.to_thread(fetch_dex, mint)
         text = dex_text(read, explain)
         coin_out = merge_dex_links(coin_out, read)
+        # dex may fill an empty website — resolve + gate, then patch opening
+        if str(coin_out.get("website") or "").strip():
+            try:
+                coin_out = await asyncio.to_thread(prepare_coin_website, coin_out)
+            except Exception:  # noqa: BLE001
+                log.debug("dex website prepare failed", exc_info=True)
+            _rewrite_opening_website(deps, mint, coin_out)
         ledger = getattr(deps.tools, "ledger_path", None)
         if ledger is not None:
             update_latest_coin_info(ledger, mint, coin_out)
@@ -1444,6 +1560,8 @@ async def _fetch_tool_into_memory(
         text = await asyncio.to_thread(_wallets, mint, explain)
     elif kind == "safety":
         text = await asyncio.to_thread(_safety, mint, explain)
+    elif kind == "website":
+        text = await asyncio.to_thread(_website, coin_out, explain)
     else:
         text = await asyncio.to_thread(_onchain_metrics, mint, explain)
     deps.memory.append_event(
@@ -1550,8 +1668,10 @@ def _event_line(ev: Any) -> str:
     """tool blocks print in full. everything else stays a short json blob."""
     kind = getattr(ev, "kind", "")
     payload = getattr(ev, "payload", None)
-    if kind in ("safety", "dex", "wallets", "vamp") and isinstance(payload, dict):
-        # the block already starts with safety: / dex: / wallets: / vamp:.
+    if kind in ("safety", "dex", "wallets", "vamp", "website") and isinstance(
+        payload, dict
+    ):
+        # the block already starts with safety: / dex: / wallets: / vamp: / website:.
         return str(payload.get("text") or "").strip() or f"{kind}:"
     if kind == "metrics" and isinstance(payload, dict):
         why = str(payload.get("reasoning") or "").strip()
@@ -1602,6 +1722,25 @@ def _wallets(mint: str, explain: bool = False) -> str:
     except Exception as exc:  # noqa: BLE001
         log.warning("wallets failed %s: %s", mint, exc)
         return "wallets: unavailable"
+
+
+def _website(coin: dict[str, Any], explain: bool = False) -> str:
+    """domain age + urlscans + firecrawl summary for the gated website url."""
+    try:
+        from archetype.config import get_settings
+
+        settings = get_settings()
+        return fetch_website(
+            coin,
+            url_scans_key=settings.url_scans_api_key,
+            firecrawl_key=settings.firecrawl_api_key,
+            ledger_path=settings.resolved_trading_ledger_db(),
+            explain=explain,
+            timeout=15.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("website tool failed: %s", exc)
+        return "website: unavailable"
 
 
 def _onchain_metrics(mint: str, explain: bool = False) -> str:

@@ -53,9 +53,19 @@ def render_coin_block(
     add("name", coin.get("name"), "display name")
     add("symbol", coin.get("symbol"), "ticker")
 
+    from archetype.tools.website import showable_website, website_eligible
+
     socials = coin.get("socials_present") or []
     if isinstance(socials, list) and socials:
-        add("socials", ", ".join(str(s) for s in socials), "linked socials we found")
+        # hide "website" in the name list when the url itself is gated out
+        shown = list(socials)
+        if not website_eligible(coin):
+            shown = [s for s in shown if str(s) != "website"]
+        if shown:
+            add("socials", ", ".join(str(s) for s in shown), "linked socials we found")
+    site = showable_website(coin)
+    if site:
+        add("website", site, "project website linked in metadata")
 
     amm = coin.get("amm") or _amm_from_venue(coin.get("venue"))
     add("amm", amm, "graduated AMM (pumpswap, raydium, or meteora)")
