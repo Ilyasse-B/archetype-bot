@@ -84,4 +84,3 @@ Separate localhost UI for demos / recording (not part of the daemon). Starts Oll
 uv run archetype demo          # http://127.0.0.1:8787/
 ```
 
-See [`docs/web-app.md`](docs/web-app.md).
