@@ -227,7 +227,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# local project docs / agent guidance — keep on disk, not on GitHub
-docs/
-AGENTS.md
